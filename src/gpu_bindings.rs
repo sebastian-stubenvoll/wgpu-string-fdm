@@ -5,15 +5,15 @@ use wgpu::util::DeviceExt;
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, encase::ShaderType)]
 pub struct Node {
-    positions: [f32; 4],
-    velocities: [f32; 4],
+    pub positions: [f32; 4],
+    pub velocities: [f32; 4],
 }
 
 impl Node {
-    pub fn new(positions: (f32, f32, f32, f32), velocities: (f32, f32, f32, f32)) -> Self {
+    pub fn new(positions: [f32; 4], velocities: [f32; 4]) -> Self {
         Self {
-            positions: [positions.0, positions.1, positions.2, positions.3],
-            velocities: [velocities.0, velocities.1, velocities.2, velocities.3],
+            positions,
+            velocities,
         }
     }
 }
@@ -88,7 +88,11 @@ pub struct State {
 }
 
 impl State {
-    pub async fn new(nodes_vec: Vec<Node>, chunk_size: usize) -> Result<State, Box<dyn Error>> {
+    pub async fn new(
+        nodes_vec: Vec<Node>,
+        chunk_size: usize,
+        oversampling_factor: usize,
+    ) -> Result<State, Box<dyn Error>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             #[cfg(not(target_arch = "wasm32"))]
             backends: wgpu::Backends::PRIMARY,
@@ -131,7 +135,7 @@ impl State {
 
         //Uniform Buffers
         let fdm_uniform = FDMUniform {
-            output_node: 0u32,
+            output_node: nodes_vec.len().div_euclid(2) as u32,
             node_count: nodes_vec.len() as u32,
             chunk_size: chunk_size as u32,
             dt: 0.000022676,
@@ -167,7 +171,7 @@ impl State {
         // (expensive) buffer copy operation.
         let mut output_vec = Vec::with_capacity(chunk_size);
         for _ in 0..chunk_size {
-            output_vec.push([0.0f32; 2])
+            output_vec.push([0.0f32; 2]);
         }
 
         let output = output_vec.into_boxed_slice();
@@ -179,8 +183,6 @@ impl State {
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
         });
-
-        dbg!(std::mem::size_of_val(&*output));
 
         // Staging
         let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -273,8 +275,6 @@ impl State {
             compilation_options: Default::default(),
         });
 
-        let oversampling_factor = 1024;
-
         Ok(Self {
             device,
             queue,
@@ -294,8 +294,7 @@ impl State {
 
     pub fn compute(&mut self) -> Result<Vec<[f32; 2]>, Box<dyn Error>> {
         // The 64 comes from the @workgroup_size(64) inside the shaders
-        let num_dispatches = self.nodes.len().div_ceil(64) as u32;
-        dbg!(num_dispatches);
+        let num_dispatches = (*self.nodes).len().div_ceil(64) as u32;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -435,6 +434,11 @@ impl State {
         self.set_o(o)?;
         self.set_p(p)?;
         Ok(())
+    }
+
+    pub fn set_output_node(&mut self, id: u32) -> Result<(), Box<dyn Error>> {
+        self.fdm_uniform.output_node = id;
+        self.update_uniforms()
     }
 
     fn update_uniforms(&mut self) -> Result<(), Box<dyn Error>> {

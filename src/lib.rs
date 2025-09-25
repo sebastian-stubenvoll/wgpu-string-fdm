@@ -17,17 +17,19 @@ mod py_wgpu_fdm {
     #[pymethods]
     impl Simulation {
         #[new]
-        fn new(node_count: usize, chunk_size: usize) -> PyResult<Self> {
-            // these must unfortunately be heap allocated since the node_count is not known at compile time
-            let mut nodes = Vec::with_capacity(node_count);
-            for _ in 0..node_count {
-                nodes.push(gpu_bindings::Node::new(
-                    (0.0, 0.0, 0.0, 0.0),
-                    (0.0, 0.0, 0.0, 0.0),
-                ));
-            }
-
-            let state = pollster::block_on(gpu_bindings::State::new(nodes, chunk_size));
+        fn new(
+            nodes: Vec<[[f32; 4]; 2]>,
+            chunk_size: usize,
+            oversampling_factor: usize,
+        ) -> PyResult<Self> {
+            let state = pollster::block_on(gpu_bindings::State::new(
+                nodes
+                    .iter()
+                    .map(|n| gpu_bindings::Node::new(n[0], n[1]))
+                    .collect(),
+                chunk_size,
+                oversampling_factor,
+            ));
 
             if let Ok(state) = state {
                 Ok(Self { state })
@@ -39,8 +41,9 @@ mod py_wgpu_fdm {
         }
 
         fn compute(&mut self) -> PyResult<Vec<[f32; 2]>> {
-            let result = self.state.compute();
-            result.map_err(|_| PyRuntimeError::new_err("error running GPU computation"))
+            self.state
+                .compute()
+                .map_err(|_| PyRuntimeError::new_err("error running GPU computation"))
         }
 
         fn set_dx(&mut self, dx: f32) -> PyResult<()> {
@@ -109,6 +112,12 @@ mod py_wgpu_fdm {
             self.state
                 .set_parameters(j, k, l, m, n, o, p)
                 .map_err(|_| PyRuntimeError::new_err("unable to set parameters"))
+        }
+
+        fn set_output_node(&mut self, id: u32) -> PyResult<()> {
+            self.state
+                .set_output_node(id)
+                .map_err(|_| PyRuntimeError::new_err("unable to output_node"))
         }
     }
 }

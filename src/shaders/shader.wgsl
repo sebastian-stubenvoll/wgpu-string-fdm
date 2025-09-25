@@ -65,8 +65,14 @@ fn fdm_step(index: u32, future: u32, current: u32) {
     let dt = uniforms.dt;
     let dx = uniforms.dx;
 
+    let kAG = uniforms.j;
+    let EI = uniforms.k;
+    let m = uniforms.m;
+    let rhoI = uniforms.l;
 
-    if (index > 1u && index < uniforms.node_count - 1u) {
+
+
+    if (index > 1u && index < uniforms.node_count - 2u) {
 
         // Derivatives
         let w_xx = (nodes[index+1].positions[current] - 2 * nodes[index].positions[current]
@@ -77,13 +83,25 @@ fn fdm_step(index: u32, future: u32, current: u32) {
         let w_x = (nodes[index+1].positions[current] - nodes[index-1].positions[current]) / (2 * dx);
         let phi_x = (nodes[index+1].positions[current+1] - nodes[index-1].positions[current+1]) / (2 * dx);
 
+        let phi = nodes[index].positions[current + 1];
+
         // Accelerations
+        let w_tt = (kAG * (w_xx - phi_x)) / m;
+        let phi_tt = (EI * phi_xx + kAG * (w_x - phi)) / rhoI;
     
-        nodes[index].positions[future] = 1.0;
-        nodes[index].positions[future + 1] = 0.0;
+        // Update velocities
+        nodes[index].velocities[future] = nodes[index].velocities[current] + (w_tt * dt);
+        nodes[index].velocities[future+1] = nodes[index].velocities[current+1] + (phi_tt * dt);
+
+        // Update displacements
+        nodes[index].positions[future] = nodes[index].positions[current] + (nodes[index].velocities[future] * dt);
+        nodes[index].positions[future+1] = nodes[index].positions[current+1] + (nodes[index].velocities[future+1] * dt);
+
     } else {
-        nodes[index].positions[future] = 1.0;
+        nodes[index].positions[future] = 0.0;
         nodes[index].positions[future + 1] = 0.0;
+        nodes[index].velocities[future] = 0.0;
+        nodes[index].velocities[future + 1] = 0.0;
     }
 }
 

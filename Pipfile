@@ -5,6 +5,10 @@ name = "pypi"
 
 [packages]
 maturin = "*"
+ipykernel = "*"
+notebook = "*"
+numpy = "*"
+matplotlib = "*"
 
 [dev-packages]
 
