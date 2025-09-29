@@ -47,7 +47,6 @@ var<storage, read_write> output_buffer: array<vec2<f32>>;
 fn compute_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // This shouldn't be touched as it corresponds with the save logic on the rust side.
     // Modify fdm_step instead.
-
     let idx = global_id.x;
     let current = c.current_index;
     let future = c.future_index;
@@ -69,6 +68,8 @@ fn fdm_step(index: u32, future: u32, current: u32) {
     let EI = uniforms.k;
     let m = uniforms.m;
     let rhoI = uniforms.l;
+    let T = uniforms.n;
+    let dampening = uniforms.o;
 
 
 
@@ -86,12 +87,12 @@ fn fdm_step(index: u32, future: u32, current: u32) {
         let phi = nodes[index].positions[current + 1];
 
         // Accelerations
-        let w_tt = (kAG * (w_xx - phi_x)) / m;
+        let w_tt = (kAG * (w_xx - phi_x) +  T * w_xx) / m;
         let phi_tt = (EI * phi_xx + kAG * (w_x - phi)) / rhoI;
     
         // Update velocities
-        nodes[index].velocities[future] = nodes[index].velocities[current] + (w_tt * dt);
-        nodes[index].velocities[future+1] = nodes[index].velocities[current+1] + (phi_tt * dt);
+        nodes[index].velocities[future] = (nodes[index].velocities[current] + (w_tt * dt) ) * dampening;
+        nodes[index].velocities[future+1] = (nodes[index].velocities[current+1] + (phi_tt * dt) ) * dampening;
 
         // Update displacements
         nodes[index].positions[future] = nodes[index].positions[current] + (nodes[index].velocities[future] * dt);

@@ -9,6 +9,7 @@ ipykernel = "*"
 notebook = "*"
 numpy = "*"
 matplotlib = "*"
+sounddevice = "*"
 
 [dev-packages]
 
