@@ -66,8 +66,16 @@ fn fdm_step(index: u32, future: u32, current: u32) {
 
     let kAG = uniforms.j;
     let EI = uniforms.k;
-    let m = uniforms.m;
-    let rhoI = uniforms.l;
+
+    // These are dt/m and dt/(rho * I) respectively
+    // This effecively calculates delta_v and delta_omega down below
+    // Since these factors are static they can be computed beforehand,
+    // saving a division as well as increasing numeric stability
+    // (these values tend to be quite small, so they tend destabilize the explicit integration).
+    // We still need to store dt since it is needed for updating the displacements.
+    let w_factor = uniforms.m; 
+    let phi_factor = uniforms.l;
+
     let T = uniforms.n;
     let dampening = uniforms.o;
 
@@ -87,12 +95,12 @@ fn fdm_step(index: u32, future: u32, current: u32) {
         let phi = nodes[index].positions[current + 1];
 
         // Accelerations
-        let w_tt = (kAG * (w_xx - phi_x) +  T * w_xx) / m;
-        let phi_tt = (EI * phi_xx + kAG * (w_x - phi)) / rhoI;
+        let w_t = (kAG * (w_xx - phi_x) +  T * w_xx) * w_factor;
+        let phi_t = (EI * phi_xx + kAG * (w_x - phi)) * phi_factor;
     
         // Update velocities
-        nodes[index].velocities[future] = (nodes[index].velocities[current] + (w_tt * dt) ) * dampening;
-        nodes[index].velocities[future+1] = (nodes[index].velocities[current+1] + (phi_tt * dt) ) * dampening;
+        nodes[index].velocities[future] = (nodes[index].velocities[current] + w_t ) * dampening;
+        nodes[index].velocities[future+1] = (nodes[index].velocities[current+1] + phi_t ) * dampening;
 
         // Update displacements
         nodes[index].positions[future] = nodes[index].positions[current] + (nodes[index].velocities[future] * dt);
