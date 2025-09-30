@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::{error::Error, fmt::Display, iter};
 
 use wgpu::util::DeviceExt;
@@ -71,6 +72,7 @@ impl Display for StateError {
 
 impl Error for StateError {}
 
+#[allow(dead_code)]
 pub struct State {
     buffer_size: usize,
     compute_bind_group: wgpu::BindGroup,
@@ -414,26 +416,6 @@ impl State {
     pub fn set_p(&mut self, val: f32) -> Result<(), Box<dyn Error>> {
         self.fdm_uniform.p = val;
         self.update_uniforms()
-    }
-
-    pub fn set_parameters(
-        &mut self,
-        j: f32,
-        k: f32,
-        l: f32,
-        m: f32,
-        n: f32,
-        o: f32,
-        p: f32,
-    ) -> Result<(), Box<dyn Error>> {
-        self.set_j(j)?;
-        self.set_k(k)?;
-        self.set_l(l)?;
-        self.set_m(m)?;
-        self.set_n(n)?;
-        self.set_o(o)?;
-        self.set_p(p)?;
-        Ok(())
     }
 
     pub fn set_output_node(&mut self, id: u32) -> Result<(), Box<dyn Error>> {

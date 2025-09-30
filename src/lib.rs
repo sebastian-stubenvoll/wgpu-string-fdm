@@ -99,20 +99,6 @@ mod py_wgpu_fdm {
                 .set_p(val)
                 .map_err(|_| PyRuntimeError::new_err("unable to set p"))
         }
-        fn set_parameters(
-            &mut self,
-            j: f32,
-            k: f32,
-            l: f32,
-            m: f32,
-            n: f32,
-            o: f32,
-            p: f32,
-        ) -> PyResult<()> {
-            self.state
-                .set_parameters(j, k, l, m, n, o, p)
-                .map_err(|_| PyRuntimeError::new_err("unable to set parameters"))
-        }
 
         fn set_output_node(&mut self, id: u32) -> PyResult<()> {
             self.state

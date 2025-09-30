@@ -67,16 +67,18 @@ fn fdm_step(index: u32, future: u32, current: u32) {
     let kAG = uniforms.j;
     let EI = uniforms.k;
 
-    let m = uniforms.m; 
-    let rhoI = uniforms.l;
+    // These are dt/m and dt/(rho * I) respectively
+    // This effecively calculates delta_v and delta_omega down below
+    // Since these factors are static they can be computed beforehand,
+    // saving a division as well as increasing numeric stability
+    // (these values tend to be quite small, so they tend destabilize the explicit integration).
+    // We still need to store dt since it is needed for updating the displacements.
+    let w_factor = uniforms.m; 
+    let phi_factor = uniforms.l;
 
     let T = uniforms.n;
     let dampening = uniforms.o;
-    let theta = uniforms.p;
 
-    
-    let w_factor = dt / (m + dt * dt * (T + kAG) * theta / (dx * dx));
-    let phi_factor = dt / (rhoI + dt * dt * (EI/(dx*dx) + kAG) );
 
 
     if (index > 1u && index < uniforms.node_count - 2u) {
