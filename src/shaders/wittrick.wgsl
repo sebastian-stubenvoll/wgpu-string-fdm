@@ -22,17 +22,19 @@ struct Uniforms {
     dt: f32, 
     ds: f32,
     node_count: u32,
-    chunk_size: u32,
+    loss: f32,
+
+    tau: f32,
+    kappa: f32,
+    m_coil: f32,
+    c2_core: f32,
+
     beta: vec3<f32>,
     // implicit padding 
     sigma: vec3<f32>,
     // implicit padding 
     k: vec3<f32>,
-    tau: f32,
-    kappa: f32,
-    m_coil: f32,
-    c2_core: f32,
-    loss: f32,
+    // implicit padding 
 }
 
 struct PushConstants { 
@@ -59,10 +61,22 @@ var<storage, read_write> output_buffer: array<Node>;
 
 @compute
 @workgroup_size(64) 
+fn apply_ext_force(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    if global.id.x == 10 {
+        // TODO: make physically accurate
+        let vel = uniforms.dt * 5f;
+        // Add to normal vector velocity
+        nodes[global_id.x][c.current].velocities[1] += vel;
+        
+    }
+}
+
+@compute
+@workgroup_size(64) 
 fn update_moments(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let id = global_id.x;
 
-    if id > 0 && id < uniforms.node_count - 2u {
+    if id > 0u && id < uniforms.node_count - 2u {
         let current = c.current_index;
         let future = c.future_index;
 
@@ -127,8 +141,8 @@ fn update_positions(@builtin(global_invocation_id) global_id: vec3<u32>) {
         )) / uniforms.m_coil;
 
         // Finally integrate the velocities and update the positions
-        nodes[id][future].angles = nodes[id][current].angles + nodes[id][future].angular_velocities * uniforms.dt;
-        nodes[id][future].positions = nodes[id][current].positions + nodes[id][future].velocities * uniforms.dt;
+        nodes[id][future].angles = (nodes[id][current].angles + nodes[id][future].angular_velocities * uniforms.dt) * uniforms.loss;
+        nodes[id][future].positions = (nodes[id][current].positions + nodes[id][future].velocities * uniforms.dt) * uniforms.loss;
     }
 }
 

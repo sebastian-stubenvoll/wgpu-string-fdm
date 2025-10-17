@@ -18,16 +18,30 @@ mod py_wgpu_fdm {
     impl Simulation {
         #[new]
         fn new(
-            nodes: Vec<[[f32; 4]; 2]>,
-            chunk_size: usize,
+            nodes: Vec<[[f32; 3]; 4]>,
             oversampling_factor: usize,
+            dt: f32,
+            ds: f32,
+            loss: f32,
+            tau: f32,
+            kappa: f32,
+            m_coil: f32,
+            c2_core: f32,
+            beta: [f32; 3],
+            sigma: [f32; 3],
+            k: [f32; 3],
         ) -> PyResult<Self> {
+            let nodes: Vec<gpu_bindings::Node> = nodes
+                .iter()
+                .map(|n| gpu_bindings::Node::new(n[0], n[1], n[2], n[3]))
+                .collect();
+
+            let uniforms = gpu_bindings::FDMUniform::new(
+                dt, ds, &nodes, loss, tau, kappa, m_coil, c2_core, beta, sigma, k,
+            );
             let state = pollster::block_on(gpu_bindings::State::new(
-                nodes
-                    .iter()
-                    .map(|n| gpu_bindings::Node::new(n[0], n[1]))
-                    .collect(),
-                chunk_size,
+                nodes,
+                uniforms,
                 oversampling_factor,
             ));
 
@@ -40,70 +54,13 @@ mod py_wgpu_fdm {
             }
         }
 
-        fn compute(&mut self) -> PyResult<Vec<[f32; 2]>> {
-            self.state
+        fn compute(&mut self) -> PyResult<Vec<[[f32; 3]; 6]>> {
+            let nodes = self
+                .state
                 .compute()
-                .map_err(|_| PyRuntimeError::new_err("error running GPU computation"))
-        }
+                .map_err(|_| PyRuntimeError::new_err("error running GPU computation"))?;
 
-        fn set_dx(&mut self, dx: f32) -> PyResult<()> {
-            self.state
-                .set_dx(dx)
-                .map_err(|_| PyRuntimeError::new_err("unable to set dx"))
-        }
-
-        fn set_dt(&mut self, dt: f32) -> PyResult<()> {
-            self.state
-                .set_dt(dt)
-                .map_err(|_| PyRuntimeError::new_err("unable to set dt"))
-        }
-
-        fn set_j(&mut self, val: f32) -> PyResult<()> {
-            self.state
-                .set_j(val)
-                .map_err(|_| PyRuntimeError::new_err("unable to set j"))
-        }
-
-        fn set_k(&mut self, val: f32) -> PyResult<()> {
-            self.state
-                .set_k(val)
-                .map_err(|_| PyRuntimeError::new_err("unable to set k"))
-        }
-
-        fn set_l(&mut self, val: f32) -> PyResult<()> {
-            self.state
-                .set_l(val)
-                .map_err(|_| PyRuntimeError::new_err("unable to set l"))
-        }
-
-        fn set_m(&mut self, val: f32) -> PyResult<()> {
-            self.state
-                .set_m(val)
-                .map_err(|_| PyRuntimeError::new_err("unable to set m"))
-        }
-
-        fn set_n(&mut self, val: f32) -> PyResult<()> {
-            self.state
-                .set_n(val)
-                .map_err(|_| PyRuntimeError::new_err("unable to set n"))
-        }
-
-        fn set_o(&mut self, val: f32) -> PyResult<()> {
-            self.state
-                .set_o(val)
-                .map_err(|_| PyRuntimeError::new_err("unable to set o"))
-        }
-
-        fn set_p(&mut self, val: f32) -> PyResult<()> {
-            self.state
-                .set_p(val)
-                .map_err(|_| PyRuntimeError::new_err("unable to set p"))
-        }
-
-        fn set_output_node(&mut self, id: u32) -> PyResult<()> {
-            self.state
-                .set_output_node(id)
-                .map_err(|_| PyRuntimeError::new_err("unable to output_node"))
+            Ok(nodes.into_iter().map(gpu_bindings::Node::to_raw).collect())
         }
     }
 }
