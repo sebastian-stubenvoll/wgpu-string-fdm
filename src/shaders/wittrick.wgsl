@@ -3,17 +3,21 @@
 // this could be packed more efficiently (TODO)
 struct Node {
     positions: vec3<f32>,
-    // implicit padding 
+    p1: u32,
     velocities: vec3<f32>,
+    p2: u32,
     // implicit padding 
     angles: vec3<f32>,
+    p3: u32,
     // implicit padding 
     angular_velocities: vec3<f32>,
+    p4: u32,
     // implicit padding 
     moments: vec3<f32>,
+    p5: u32,
     // implicit padding 
     forces: vec3<f32>,
-    // implicit padding 
+    p6: u32,
     
 }
 
@@ -40,9 +44,8 @@ struct Uniforms {
 struct PushConstants { 
     current_index: u32,
     future_index: u32,
-    output_index: u32,
-    // implicit padding 
-    
+    _pad1: u32,
+    _pad2: u32,
 }
 
 var <push_constant> c: PushConstants;
@@ -53,7 +56,7 @@ var <uniform> uniforms: Uniforms;
 
 @group(0)
 @binding(1)
-var<storage, read_write> nodes: array<vec2<Node>>;
+var<storage, read_write> nodes: array<Node>;
 
 @group(0)
 @binding(2)
@@ -61,93 +64,88 @@ var<storage, read_write> output_buffer: array<Node>;
 
 @compute
 @workgroup_size(64) 
-fn apply_ext_force(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    if global.id.x == 10 {
+fn setup(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let id = global_id.x;
+    if id == 10 {
         // TODO: make physically accurate
-        let vel = uniforms.dt * 5f;
+        let vel = uniforms.dt * 6.5f;
+        let current = global_id.x + (c.current_index * uniforms.node_count);
         // Add to normal vector velocity
-        nodes[global_id.x][c.current].velocities[1] += vel;
+        nodes[current].velocities[1] += vel;
         
     }
 }
 
 @compute
 @workgroup_size(64) 
-fn update_moments(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn calculate_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let id = global_id.x;
 
     if id > 0u && id < uniforms.node_count - 2u {
-        let current = c.current_index;
-        let future = c.future_index;
-
-        let c_ptr = &nodes[id][current];
+        let current = id + (c.current_index * uniforms.node_count);
+        let future = id + (c.future_index * uniforms.node_count);
 
         // Finite difference approximation of dtheta/ds
-        let theta_s = (nodes[id+1][current].angles - nodes[id-1][current].angles) / uniforms.ds;
+        let theta_s = (nodes[current+1].angles - nodes[current-1].angles) / (2 * uniforms.ds);
 
         // Finite difference approximation of r/ds
-        let uvw_s = (nodes[id+1][current].positions - nodes[id-1][current].positions) / uniforms.ds;
+        let uvw_s = (nodes[current+1].positions - nodes[current-1].positions) / (uniforms.ds * 2);
 
         // Calculate new moments for bending/torque
-        nodes[id][future].moments = (theta_s + vec3(
-            uniforms.tau * (*c_ptr).angles[1],
-            - uniforms.tau * (*c_ptr).angles[0] +  uniforms.kappa + (*c_ptr).angles[2],
-            - uniforms.kappa * (*c_ptr).angles[1]
+        nodes[future].moments = (theta_s + vec3(
+            uniforms.tau * nodes[current].angles[1],
+            -1 * uniforms.tau * nodes[current].angles[0] +  uniforms.kappa * nodes[current].angles[2],
+            -1 * uniforms.kappa * nodes[current].angles[1]
         )) / uniforms.beta;
  
         // Calculate new forces for shearing/tension
-        nodes[id][future].forces = (uvw_s + vec3(
-            - uniforms.tau * (*c_ptr).positions[1] + uniforms.kappa * (*c_ptr).positions[2] - (*c_ptr).angles[0],
-            uniforms.tau * (*c_ptr).positions[0] + (*c_ptr).angles[1],
-            uniforms.kappa * (*c_ptr).positions[0]
+        nodes[future].forces = (uvw_s + vec3(
+            - uniforms.tau * nodes[current].positions[1] + uniforms.kappa * nodes[current].positions[2] - nodes[current].angles[0],
+            uniforms.tau * nodes[current].positions[0] + nodes[current].angles[1],
+            uniforms.kappa * nodes[current].positions[0]
         )) / uniforms.sigma;
-
-
-        // Since we've already computed dr/ds here, it makes sense to update the core contribution now
-        nodes[id][future].velocities = nodes[id][current].velocities + uniforms.c2_core * uvw_s * uniforms.dt;
     }
 }
 
 
 @compute
 @workgroup_size(64) 
-fn update_positions(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn apply_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let id = global_id.x;
 
-    if id > 0 && id < node_count - 2 {
-        let current = c.current_index;
-        let future = c.future_index;
+    if id > 0 && id < uniforms.node_count - 2 {
+        let current = id + (c.current_index * uniforms.node_count);
+        let future = id + (c.future_index * uniforms.node_count);
 
-        // Finite difference approximation of dtheta/ds
-        let M_s = (nodes[id+1][future].moments - nodes[id-1][future].moments) / uniforms.ds;
+       // Finite difference approximation of dtheta/ds
+        let M_s = (nodes[future+1].moments - nodes[future-1].moments) / (2 * uniforms.ds);
 
         // Finite difference approximation of r/ds
-        let QP_s = (nodes[id+1][future].forces - nodes[id-1][future].forces) / uniforms.ds;
+        let QP_s = (nodes[future+1].forces - nodes[future-1].forces) / (2 * uniforms.ds);
 
         // Calculate new moment angular accelerations and integrate them
-        nodes[id][future].angular_velocities = nodes[id][current].angular_velocities + uniforms.dt * (M_s + vec3(
-            nodes[id][future].forces[0] + uniforms.tau + nodes[id][future].moments[1],
-            - nodes[id][future].forces[1] - uniforms.tau * nodes[id][future].moments[0] + uniforms.kappa * nodes[id][future].moments[2]
-            - uniforms.kappa * nodes[id][future].moments[1]
-        )) / ( uniforms.m_coil * uniforms.k);
+        nodes[future].angular_velocities = nodes[current].angular_velocities + uniforms.dt * (M_s + vec3(
+         nodes[future].forces[0] + uniforms.tau * nodes[future].moments[1],
+         -1 * nodes[future].forces[1] - uniforms.tau * nodes[future].moments[0] + uniforms.kappa * nodes[future].moments[2],
+         -1 * uniforms.kappa * nodes[future].moments[1]
+        )) / ( uniforms.m_coil * uniforms.k * uniforms.k);
  
         // Calculate new accelerations and integrate them
-        // Here we must update the future velocity, as that is the most recent one since it already contains
-        // the contribution from the core computed earlier.
-        nodes[id][future].velocities = nodes[id][future].velocities + uniforms.dt * (QP_s + vec3(
-            - uniforms.tau * nodes[id][future].forces[1] + uniforms.kappa * nodes[id][future].forces[2],
-            uniforms.tau * nodes[id][future].forces[0],
-            - uniforms.kappa * nodes[id][future].forces[0]
+        nodes[future].velocities = nodes[current].velocities + uniforms.dt * (QP_s + vec3(
+            -1 *  uniforms.tau * nodes[future].forces[1] + uniforms.kappa * nodes[future].forces[2],
+            uniforms.tau * nodes[future].forces[0],
+            -1 * uniforms.kappa * nodes[future].forces[0]
         )) / uniforms.m_coil;
 
         // Finally integrate the velocities and update the positions
-        nodes[id][future].angles = (nodes[id][current].angles + nodes[id][future].angular_velocities * uniforms.dt) * uniforms.loss;
-        nodes[id][future].positions = (nodes[id][current].positions + nodes[id][future].velocities * uniforms.dt) * uniforms.loss;
+        nodes[future].angles = nodes[current].angles + nodes[future].angular_velocities * uniforms.dt * uniforms.loss;
+        nodes[future].positions = nodes[current].positions + nodes[future].velocities * uniforms.dt * uniforms.loss;
     }
 }
 
 @compute
 @workgroup_size(64) 
-fn save_ouput(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    output_buffer[global_id] = nodes[global_id][c.future_index];
+fn save_output(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let future = global_id.x + (c.future_index * uniforms.node_count);
+    output_buffer[global_id.x] = nodes[future];
 }
