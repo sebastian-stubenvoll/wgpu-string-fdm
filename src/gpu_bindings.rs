@@ -119,7 +119,7 @@ impl FDMUniform {
 struct PushConstants {
     current_index: u32,
     future_index: u32,
-    _pad1: u32,
+    vel: f32,
     _pad2: u32,
 }
 
@@ -149,9 +149,9 @@ impl Error for StateError {}
 pub struct State {
     buffer_size: usize,
     compute_bind_group: wgpu::BindGroup,
-    setup_pipeline: wgpu::ComputePipeline,
+    external_force_pipeline: wgpu::ComputePipeline,
     forces_pipeline: wgpu::ComputePipeline,
-    positions_pipeline: wgpu::ComputePipeline,
+    displacements_pipeline: wgpu::ComputePipeline,
     output_pipeline: wgpu::ComputePipeline,
     device: wgpu::Device,
     fdm_uniform: FDMUniform,
@@ -223,7 +223,6 @@ impl State {
         let nodes_out = nodes_vec.clone().into_boxed_slice();
         nodes_vec.extend_from_within(..);
         let nodes_in = nodes_vec.into_boxed_slice();
-        dbg!(&nodes_in.last());
 
         let nodes_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("node buffer"),
@@ -252,7 +251,7 @@ impl State {
         let push_constants = PushConstants {
             current_index: 0,
             future_index: 1,
-            _pad1: 0,
+            vel: 1.0e-11,
             _pad2: 0,
         };
 
@@ -322,13 +321,14 @@ impl State {
                 }],
             });
 
-        let setup_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Compute Pipeline"),
-            layout: Some(&compute_pipeline_layout),
-            module: &shader,
-            entry_point: "setup",
-            compilation_options: Default::default(),
-        });
+        let external_force_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &shader,
+                entry_point: "external_force",
+                compilation_options: Default::default(),
+            });
 
         let forces_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Compute Pipeline"),
@@ -338,13 +338,14 @@ impl State {
             compilation_options: Default::default(),
         });
 
-        let positions_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Compute Pipeline"),
-            layout: Some(&compute_pipeline_layout),
-            module: &shader,
-            entry_point: "apply_forces",
-            compilation_options: Default::default(),
-        });
+        let displacements_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &shader,
+                entry_point: "calculate_displacements",
+                compilation_options: Default::default(),
+            });
 
         let output_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Compute Pipeline"),
@@ -364,9 +365,9 @@ impl State {
             output_buffer,
             staging_buffer,
             push_constants,
-            setup_pipeline,
+            external_force_pipeline,
             forces_pipeline,
-            positions_pipeline,
+            displacements_pipeline,
             output_pipeline,
             buffer_size: std::mem::size_of_val(&(*nodes_out)),
             oversampling_factor,
@@ -374,7 +375,60 @@ impl State {
         })
     }
 
-    pub fn compute(&mut self) -> Result<Vec<Node>, Box<dyn Error>> {
+    pub fn initialize(&mut self, steps: usize) -> Result<(), Box<dyn Error>> {
+        let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Compute Encoder"),
+            });
+
+        for _ in 0..steps {
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                compute_pass.set_pipeline(&self.external_force_pipeline);
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+            }
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                compute_pass.set_pipeline(&self.forces_pipeline);
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+            }
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                compute_pass.set_pipeline(&self.displacements_pipeline);
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+            }
+            (
+                self.push_constants.current_index,
+                self.push_constants.future_index,
+            ) = (
+                self.push_constants.future_index,
+                self.push_constants.current_index,
+            );
+        }
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        Ok(())
+    }
+
+    pub fn compute(&mut self) -> Result<(), Box<dyn Error>> {
         // The 64 comes from the @workgroup_size(64) inside the shaders
         let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
         let mut encoder = self
@@ -383,66 +437,17 @@ impl State {
                 label: Some("Compute Encoder"),
             });
 
-        if !self.initialized {
-            for _ in 0..100 {
-                {
-                    let mut compute_pass =
-                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("Compute Pass"),
-                            timestamp_writes: None,
-                        });
-                    // Update push constants and calculate forces
-                    compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                    compute_pass.set_pipeline(&self.setup_pipeline);
-                    compute_pass.set_push_constants(0, bytemuck::bytes_of(&self.push_constants));
-                    compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-                }
-                {
-                    let mut compute_pass =
-                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("Compute Pass"),
-                            timestamp_writes: None,
-                        });
-                    // Update push constants and calculate forces
-                    compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                    compute_pass.set_pipeline(&self.forces_pipeline);
-                    compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-                }
-                {
-                    let mut compute_pass =
-                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("Compute Pass"),
-                            timestamp_writes: None,
-                        });
-
-                    // Calcuate new displacements
-                    compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                    compute_pass.set_pipeline(&self.positions_pipeline);
-                    compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-                }
-
-                // Update push constants for next loop
-                (
-                    self.push_constants.current_index,
-                    self.push_constants.future_index,
-                ) = (
-                    self.push_constants.future_index,
-                    self.push_constants.current_index,
-                );
-            }
-
-            self.initialized = true;
-        }
+        // Too many commands break command buffers.
+        assert!(self.oversampling_factor <= 256);
         for _ in 0..self.oversampling_factor {
             {
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Compute Pass"),
                     timestamp_writes: None,
                 });
-                // Update push constants and calculate forces
                 compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
                 compute_pass.set_pipeline(&self.forces_pipeline);
-                compute_pass.set_push_constants(0, bytemuck::bytes_of(&self.push_constants));
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
                 compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
             }
             {
@@ -450,14 +455,11 @@ impl State {
                     label: Some("Compute Pass"),
                     timestamp_writes: None,
                 });
-
-                // Calcuate new displacements
                 compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                compute_pass.set_pipeline(&self.positions_pipeline);
+                compute_pass.set_pipeline(&self.displacements_pipeline);
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
                 compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
             }
-
-            // Update push constants for next loop
             (
                 self.push_constants.current_index,
                 self.push_constants.future_index,
@@ -478,8 +480,10 @@ impl State {
         }
 
         self.queue.submit(iter::once(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Wait);
+        Ok(())
+    }
 
+    pub fn save(&mut self) -> Result<Vec<Node>, Box<dyn Error>> {
         // Begin memory transfer to CPU
         let mut encoder = self
             .device

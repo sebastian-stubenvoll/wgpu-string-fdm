@@ -54,13 +54,23 @@ mod py_wgpu_fdm {
             }
         }
 
-        fn compute(&mut self) -> PyResult<Vec<[[f32; 3]; 6]>> {
+        fn compute(&mut self) {
+            self.state.compute().unwrap();
+        }
+
+        fn save(&mut self) -> PyResult<Vec<[[f32; 3]; 6]>> {
             let nodes = self
                 .state
-                .compute()
+                .save()
                 .map_err(|_| PyRuntimeError::new_err("error running GPU computation"))?;
 
             Ok(nodes.into_iter().map(gpu_bindings::Node::to_raw).collect())
+        }
+
+        fn initialize(&mut self, steps: usize) -> PyResult<()> {
+            self.state.initialize(steps).unwrap();
+
+            Ok(())
         }
     }
 }
