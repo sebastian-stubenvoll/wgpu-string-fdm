@@ -65,7 +65,7 @@ var<storage, read_write> output_buffer: array<Node>;
 @workgroup_size(64) 
 fn external_force(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let id = global_id.x;
-    if id == 10 {
+    if id == 400 {
         let current = id + (c.current_index * uniforms.node_count);
 
         nodes[current].velocities.x += c.vel * uniforms.dt;

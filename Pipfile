@@ -10,6 +10,7 @@ notebook = "*"
 numpy = "*"
 matplotlib = "*"
 sounddevice = "*"
+scipy = "*"
 
 [dev-packages]
 
