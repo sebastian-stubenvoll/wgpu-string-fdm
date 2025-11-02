@@ -13,10 +13,14 @@ pub struct Node {
     _padding2: u32,
     angular_velocites: [f32; 3],
     _padding3: u32,
-    moments: [f32; 3],
+    shell_moments: [f32; 3],
     _padding4: u32,
-    forces: [f32; 3],
+    shell_forces: [f32; 3],
     _padding5: u32,
+    helix_forces: [f32; 3],
+    _padding6: u32,
+    core_forces: [f32; 3],
+    _padding7: u32,
 }
 
 impl Node {
@@ -31,25 +35,31 @@ impl Node {
             velocities,
             angles,
             angular_velocites,
-            forces: [0.0; 3],
-            moments: [0.0; 3],
+            shell_forces: [0.0; 3],
+            shell_moments: [0.0; 3],
+            helix_forces: [0.0; 3],
+            core_forces: [0.0; 3],
             _padding0: 0,
             _padding1: 0,
             _padding2: 0,
             _padding3: 0,
             _padding4: 0,
             _padding5: 0,
+            _padding6: 0,
+            _padding7: 0,
         }
     }
 
-    pub fn to_raw(self) -> [[f32; 3]; 6] {
+    pub fn to_raw(self) -> [[f32; 3]; 8] {
         [
             self.positions,
             self.velocities,
             self.angles,
             self.angular_velocites,
-            self.forces,
-            self.moments,
+            self.shell_forces,
+            self.shell_moments,
+            self.helix_forces,
+            self.core_forces,
         ]
     }
 }
@@ -64,11 +74,11 @@ pub struct FDMUniform {
 
     tau: f32,
     kappa: f32,
-    m_coil: f32,
+    m: f32,
     c2_core: f32,
 
     beta: [f32; 3],
-    _padding3: u32,
+    dx2: f32,
 
     sigma: [f32; 3],
     _padding4: u32,
@@ -85,14 +95,17 @@ impl FDMUniform {
         loss: f32,
         tau: f32,
         kappa: f32,
-        m_coil: f32,
+        m: f32,
         c2_core: f32,
         beta: [f32; 3],
+        dx2: f32,
         sigma: [f32; 3],
         k: [f32; 3],
     ) -> Self {
         assert!(ds != 0.0);
-        assert!(m_coil != 0.0);
+        assert!(m != 0.0);
+        assert!(c2_core != 0.0);
+        assert!(dx2 != 0.0);
         assert!(k.iter().all(|v| *v != 0.0));
         assert!(beta.iter().all(|v| *v != 0.0));
         assert!(sigma.iter().all(|v| *v != 0.0));
@@ -104,9 +117,10 @@ impl FDMUniform {
             loss,
             tau,
             kappa,
-            m_coil,
+            m,
             c2_core,
             beta,
+            dx2,
             sigma,
             k,
             ..Default::default()
@@ -334,7 +348,7 @@ impl State {
             label: Some("Compute Pipeline"),
             layout: Some(&compute_pipeline_layout),
             module: &shader,
-            entry_point: "calculate_forces",
+            entry_point: "calculate_internal_forces",
             compilation_options: Default::default(),
         });
 

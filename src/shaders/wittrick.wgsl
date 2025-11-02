@@ -3,22 +3,21 @@
 // this could be packed more efficiently (TODO)
 struct Node {
     positions: vec3<f32>,
-    p1: u32,
+    // implicit padding 
     velocities: vec3<f32>,
-    p2: u32,
     // implicit padding 
     angles: vec3<f32>,
-    p3: u32,
     // implicit padding 
     angular_velocities: vec3<f32>,
-    p4: u32,
     // implicit padding 
-    moments: vec3<f32>,
-    p5: u32,
+    shell_moments: vec3<f32>,
     // implicit padding 
-    forces: vec3<f32>,
-    p6: u32,
-    
+    shell_forces: vec3<f32>,
+    // implicit padding 
+    helix_forces: vec3<f32>,
+    // implicit padding 
+    core_forces: vec3<f32>,
+    // implicit padding 
 }
 
 // this could be packed more efficiently (TODO)
@@ -30,11 +29,11 @@ struct Uniforms {
 
     tau: f32,
     kappa: f32,
-    m_coil: f32,
+    m: f32,
     c2_core: f32,
 
     beta: vec3<f32>,
-    // implicit padding 
+    dx2: f32,
     sigma: vec3<f32>,
     // implicit padding 
     k: vec3<f32>,
@@ -76,7 +75,7 @@ fn external_force(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
 @compute
 @workgroup_size(64) 
-fn calculate_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn calculate_internal_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let id = global_id.x;
     if id > 0 && id < uniforms.node_count - 1 {
         let current = id + (c.current_index * uniforms.node_count);
@@ -98,13 +97,13 @@ fn calculate_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let q2 = (v_s + (uniforms.tau * nodes[current].positions.x) + nodes[current].angles.y) * uniforms.sigma.y;
         let p = (w_s - (uniforms.kappa * nodes[current].positions.x)) * uniforms.sigma.z;
 
-        nodes[future].moments.x = m1;
-        nodes[future].moments.y = m2;
-        nodes[future].moments.z = m3;
+        nodes[future].shell_moments.x = m1;
+        nodes[future].shell_moments.y = m2;
+        nodes[future].shell_moments.z = m3;
 
-        nodes[future].forces.x = q1;
-        nodes[future].forces.y = q2;
-        nodes[future].forces.z = p;
+        nodes[future].shell_forces.x = q1;
+        nodes[future].shell_forces.y = q2;
+        nodes[future].shell_forces.z = p;
     }
 }
 
@@ -115,23 +114,34 @@ fn calculate_displacements(@builtin(global_invocation_id) global_id: vec3<u32>) 
     if id > 0 && id < uniforms.node_count - 1 {
         let current = id + (c.current_index * uniforms.node_count);
         let future = id + (c.future_index * uniforms.node_count);
-
         
-        let m1_s = ((nodes[future+1].moments.x) - (nodes[future-1].moments.x)) / (2 * uniforms.ds);
-        let m2_s = ((nodes[future+1].moments.y) - (nodes[future-1].moments.y)) / (2 * uniforms.ds);
-        let m3_s = ((nodes[future+1].moments.z) - (nodes[future-1].moments.z)) / (2 * uniforms.ds);
+        let m1_s = ((nodes[future+1].shell_moments.x) - (nodes[future-1].shell_moments.x)) / (2 * uniforms.ds);
+        let m2_s = ((nodes[future+1].shell_moments.y) - (nodes[future-1].shell_moments.y)) / (2 * uniforms.ds);
+        let m3_s = ((nodes[future+1].shell_moments.z) - (nodes[future-1].shell_moments.z)) / (2 * uniforms.ds);
 
-        let q1_s = ((nodes[future+1].forces.x) - (nodes[future-1].forces.x)) / (2 * uniforms.ds);
-        let q2_s = ((nodes[future+1].forces.y) - (nodes[future-1].forces.y)) / (2 * uniforms.ds);
-        let p_s = ((nodes[future+1].forces.z) - (nodes[future-1].forces.z)) / (2 * uniforms.ds);
+        let q1_s = ((nodes[future+1].shell_forces.x) - (nodes[future-1].shell_forces.x)) / (2 * uniforms.ds);
+        let q2_s = ((nodes[future+1].shell_forces.y) - (nodes[future-1].shell_forces.y)) / (2 * uniforms.ds);
+        let p_s = ((nodes[future+1].shell_forces.z) - (nodes[future-1].shell_forces.z)) / (2 * uniforms.ds);
 
-        let theta1_tt = (m1_s + nodes[future].forces.x + (uniforms.tau * nodes[future].moments.y)) / (uniforms.k.x * uniforms.m_coil);
-        let theta2_tt = (m2_s - nodes[future].forces.y - (uniforms.tau * nodes[future].moments.x) + (uniforms.kappa * nodes[future].moments.z)) / (uniforms.k.y * uniforms.m_coil);
-        let theta3_tt = (m3_s - (uniforms.kappa * nodes[future].moments.y)) / (uniforms.k.z * uniforms.m_coil);
+        let theta1_tt = (m1_s + nodes[future].shell_forces.x + (uniforms.tau * nodes[future].shell_moments.y)) / (uniforms.k.x);
+        let theta2_tt = (m2_s - nodes[future].shell_forces.y - (uniforms.tau * nodes[future].shell_moments.x) + (uniforms.kappa * nodes[future].shell_moments.z)) / (uniforms.k.y);
+        let theta3_tt = (m3_s - (uniforms.kappa * nodes[future].shell_moments.y)) / (uniforms.k.z);
 
-        let u_tt = (q1_s - (uniforms.tau * nodes[future].forces.y) + (uniforms.kappa * nodes[future].forces.z)) / uniforms.m_coil;
-        let v_tt = (q2_s + (uniforms.tau * nodes[future].forces.x)) / uniforms.m_coil;
-        let w_tt = (p_s - (uniforms.kappa * nodes[future].forces.x)) / uniforms.m_coil;
+        nodes[future].helix_forces.x = (q1_s - (uniforms.tau * nodes[future].shell_forces.y) + (uniforms.kappa * nodes[future].shell_forces.z));
+        nodes[future].helix_forces.y = (q2_s + (uniforms.tau * nodes[future].shell_forces.x));
+        nodes[future].helix_forces.z = (p_s - (uniforms.kappa * nodes[future].shell_forces.x));
+
+        let u_xx = (nodes[current + 1].positions.x - 2.0 * nodes[current].positions.x - nodes[current - 1].positions.x) / (uniforms.dx2);
+        let v_xx = (nodes[current + 1].positions.y - 2.0 * nodes[current].positions.y - nodes[current - 1].positions.y) / (uniforms.dx2);
+        let w_xx = (nodes[current + 1].positions.z - 2.0 * nodes[current].positions.z - nodes[current - 1].positions.z) / (uniforms.dx2);
+
+        nodes[future].core_forces.x = u_xx * uniforms.c2_core;
+        nodes[future].core_forces.y = v_xx * uniforms.c2_core;
+        nodes[future].core_forces.z = w_xx * uniforms.c2_core;
+
+        let u_tt = (nodes[future].core_forces.x + q1_s - (uniforms.tau * nodes[future].shell_forces.y) + (uniforms.kappa * nodes[future].shell_forces.z)) / uniforms.m;
+        let v_tt = (nodes[future].core_forces.x + q2_s + (uniforms.tau * nodes[future].shell_forces.x)) / uniforms.m;
+        let w_tt = (nodes[future].core_forces.x + p_s - (uniforms.kappa * nodes[future].shell_forces.x)) / uniforms.m;
 
         nodes[future].velocities.x = (nodes[current].velocities.x + (u_tt * uniforms.dt)) * uniforms.loss;
         nodes[future].velocities.y = (nodes[current].velocities.y + (v_tt * uniforms.dt)) * uniforms.loss;
