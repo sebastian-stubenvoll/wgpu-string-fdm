@@ -68,61 +68,63 @@ impl Node {
 #[derive(Default, Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, encase::ShaderType)]
 pub struct FDMUniform {
     dt: f32,
-    ds: f32,
+    two_ds_inv: f32,
     node_count: u32,
     loss: f32,
 
     tau: f32,
     kappa: f32,
-    m: f32,
+    m_inv: f32,
     c2_core: f32,
 
     beta: [f32; 3],
-    dx2: f32,
+    dx2_inv: f32,
 
     sigma: [f32; 3],
-    _padding4: u32,
+    chunk_size: u32,
 
-    k: [f32; 3],
+    k_inv: [f32; 3],
     _padding5: u32,
 }
 
 impl FDMUniform {
     pub fn new(
         dt: f32,
-        ds: f32,
+        two_ds_inv: f32,
         nodes: &[Node],
         loss: f32,
         tau: f32,
         kappa: f32,
-        m: f32,
+        m_inv: f32,
         c2_core: f32,
         beta: [f32; 3],
-        dx2: f32,
+        dx2_inv: f32,
         sigma: [f32; 3],
-        k: [f32; 3],
+        chunk_size: u32,
+        k_inv: [f32; 3],
     ) -> Self {
-        assert!(ds != 0.0);
-        assert!(m != 0.0);
+        assert!(two_ds_inv != 0.0);
+        assert!(m_inv != 0.0);
         assert!(c2_core != 0.0);
-        assert!(dx2 != 0.0);
-        assert!(k.iter().all(|v| *v != 0.0));
+        assert!(dx2_inv != 0.0);
+        assert!(k_inv.iter().all(|v| *v != 0.0));
         assert!(beta.iter().all(|v| *v != 0.0));
         assert!(sigma.iter().all(|v| *v != 0.0));
 
         Self {
             dt,
-            ds,
+            two_ds_inv,
             node_count: nodes.len() as u32,
             loss,
             tau,
             kappa,
-            m,
+            m_inv,
             c2_core,
             beta,
-            dx2,
+            dx2_inv,
+            chunk_size,
             sigma,
-            k,
+            k_inv,
             ..Default::default()
         }
     }
@@ -134,7 +136,7 @@ struct PushConstants {
     current_index: u32,
     future_index: u32,
     vel: f32,
-    _pad2: u32,
+    output_idx: u32,
 }
 
 #[derive(Debug)]
@@ -161,7 +163,7 @@ impl Error for StateError {}
 
 #[allow(dead_code)]
 pub struct State {
-    buffer_size: usize,
+    buffer_size: u64,
     compute_bind_group: wgpu::BindGroup,
     external_force_pipeline: wgpu::ComputePipeline,
     forces_pipeline: wgpu::ComputePipeline,
@@ -234,9 +236,11 @@ impl State {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let nodes_out = nodes_vec.clone().into_boxed_slice();
         nodes_vec.extend_from_within(..);
         let nodes_in = nodes_vec.into_boxed_slice();
+        let buffer_size = (std::mem::size_of::<Node>() as u64
+            * nodes_in.len() as u64
+            * uniforms.chunk_size as u64) as wgpu::BufferAddress;
 
         let nodes_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("node buffer"),
@@ -246,18 +250,18 @@ impl State {
                 | wgpu::BufferUsages::COPY_SRC,
         });
 
-        let output_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("index buffer"),
-            contents: bytemuck::cast_slice(nodes_out.as_ref()),
+            size: buffer_size,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
         });
 
-        // Staging
         let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: std::mem::size_of_val(&*(nodes_out)) as wgpu::BufferAddress,
+            size: buffer_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -265,8 +269,8 @@ impl State {
         let push_constants = PushConstants {
             current_index: 0,
             future_index: 1,
-            vel: 1.0e-11,
-            _pad2: 0,
+            vel: 1.0e-3,
+            output_idx: 0,
         };
 
         let compute_bind_group_layout =
@@ -369,6 +373,8 @@ impl State {
             compilation_options: Default::default(),
         });
 
+        dbg!(&fdm_uniform);
+
         Ok(Self {
             device,
             queue,
@@ -383,21 +389,22 @@ impl State {
             forces_pipeline,
             displacements_pipeline,
             output_pipeline,
-            buffer_size: std::mem::size_of_val(&(*nodes_out)),
+            buffer_size,
             oversampling_factor,
             initialized: false,
         })
     }
 
     pub fn initialize(&mut self, steps: usize) -> Result<(), Box<dyn Error>> {
+        println!("Calling init!");
         let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Compute Encoder"),
-            });
 
         for _ in 0..steps {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Compute Encoder"),
+                });
             {
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Compute Pass"),
@@ -435,8 +442,8 @@ impl State {
                 self.push_constants.future_index,
                 self.push_constants.current_index,
             );
+            self.queue.submit(iter::once(encoder.finish()));
         }
-        self.queue.submit(Some(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait);
 
         Ok(())
@@ -445,59 +452,72 @@ impl State {
     pub fn compute(&mut self) -> Result<(), Box<dyn Error>> {
         // The 64 comes from the @workgroup_size(64) inside the shaders
         let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Compute Encoder"),
-            });
 
         // Too many commands break command buffers.
         assert!(self.oversampling_factor <= 256);
-        for _ in 0..self.oversampling_factor {
+        // Compute CHUNK_SIZE * OVERSAMPLING_FACTOR iterations.
+        // Every OVERSAMPLING_FACTOR generate a new command buffer, to avoid overflow.
+        for _ in 0..self.fdm_uniform.chunk_size {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Compute Encoder"),
+                });
+            // FOR LOOP START
+            for _ in 0..self.oversampling_factor {
+                {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Compute Pass"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                    compute_pass.set_pipeline(&self.forces_pipeline);
+                    compute_pass
+                        .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                    compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+                }
+                {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Compute Pass"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                    compute_pass.set_pipeline(&self.displacements_pipeline);
+                    compute_pass
+                        .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                    compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+                }
+                (
+                    self.push_constants.current_index,
+                    self.push_constants.future_index,
+                ) = (
+                    self.push_constants.future_index,
+                    self.push_constants.current_index,
+                );
+            }
+            // FOR LOOP END
             {
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Compute Pass"),
                     timestamp_writes: None,
                 });
                 compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                compute_pass.set_pipeline(&self.forces_pipeline);
+                compute_pass.set_pipeline(&self.output_pipeline);
                 compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
                 compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-            }
-            {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Compute Pass"),
-                    timestamp_writes: None,
-                });
-                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                compute_pass.set_pipeline(&self.displacements_pipeline);
-                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
-                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-            }
-            (
-                self.push_constants.current_index,
-                self.push_constants.future_index,
-            ) = (
-                self.push_constants.future_index,
-                self.push_constants.current_index,
-            );
-        }
 
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Compute Pass"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-            compute_pass.set_pipeline(&self.output_pipeline);
-            compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+                self.push_constants.output_idx =
+                    (self.push_constants.output_idx + 1) % self.fdm_uniform.chunk_size;
+            }
+            self.queue.submit(iter::once(encoder.finish()));
         }
-
-        self.queue.submit(iter::once(encoder.finish()));
         Ok(())
     }
 
-    pub fn save(&mut self) -> Result<Vec<Node>, Box<dyn Error>> {
+    pub fn save(&mut self) -> Result<Vec<Vec<Node>>, Box<dyn Error>> {
+        assert_eq!(self.push_constants.output_idx, 0);
         // Begin memory transfer to CPU
         let mut encoder = self
             .device
@@ -507,7 +527,7 @@ impl State {
             0,
             &self.staging_buffer,
             0,
-            self.buffer_size as u64,
+            self.buffer_size,
         );
         self.queue.submit(Some(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait);
@@ -517,6 +537,8 @@ impl State {
         buffer_slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
         self.device.poll(wgpu::Maintain::wait()).panic_on_timeout();
 
+        println!("Transferring buffer with size {}", self.buffer_size);
+
         // Awaits until `buffer_future` can be read from
         if let Ok(Ok(())) = rx.recv() {
             let data = buffer_slice.get_mapped_range();
@@ -524,7 +546,11 @@ impl State {
             drop(data);
             self.staging_buffer.unmap(); // Unmaps buffer from memory
 
-            return Ok(result);
+            let vecs: Vec<Vec<Node>> = result
+                .chunks(self.fdm_uniform.node_count as usize)
+                .map(|slice| slice.to_vec())
+                .collect();
+            return Ok(vecs);
         } else {
             eprintln!("Failed to map staging buffer!");
         }

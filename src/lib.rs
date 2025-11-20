@@ -21,16 +21,17 @@ mod py_wgpu_fdm {
             nodes: Vec<[[f32; 3]; 4]>,
             oversampling_factor: usize,
             dt: f32,
-            ds: f32,
+            two_ds_inv: f32,
             loss: f32,
             tau: f32,
             kappa: f32,
-            m: f32,
+            m_inv: f32,
             c2_core: f32,
             beta: [f32; 3],
-            dx2: f32,
+            dx2_inv: f32,
             sigma: [f32; 3],
-            k: [f32; 3],
+            chunk_size: u32,
+            k_inv: [f32; 3],
         ) -> PyResult<Self> {
             let nodes: Vec<gpu_bindings::Node> = nodes
                 .iter()
@@ -38,7 +39,8 @@ mod py_wgpu_fdm {
                 .collect();
 
             let uniforms = gpu_bindings::FDMUniform::new(
-                dt, ds, &nodes, loss, tau, kappa, m, c2_core, beta, dx2, sigma, k,
+                dt, two_ds_inv, &nodes, loss, tau, kappa, m_inv, c2_core, beta, dx2_inv, sigma,
+                chunk_size, k_inv,
             );
             let state = pollster::block_on(gpu_bindings::State::new(
                 nodes,
@@ -59,16 +61,25 @@ mod py_wgpu_fdm {
             self.state.compute().unwrap();
         }
 
-        fn save(&mut self) -> PyResult<Vec<[[f32; 3]; 8]>> {
-            let nodes = self
+        fn save(&mut self) -> PyResult<Vec<Vec<[[f32; 3]; 8]>>> {
+            let frames = self
                 .state
                 .save()
                 .map_err(|_| PyRuntimeError::new_err("error running GPU computation"))?;
 
-            Ok(nodes.into_iter().map(gpu_bindings::Node::to_raw).collect())
+            Ok(frames
+                .into_iter()
+                .map(|nodes| {
+                    nodes
+                        .into_iter()
+                        .map(gpu_bindings::Node::to_raw)
+                        .collect::<Vec<[[f32; 3]; 8]>>()
+                })
+                .collect())
         }
 
         fn initialize(&mut self, steps: usize) -> PyResult<()> {
+            println!("Calling GPU binding");
             self.state.initialize(steps).unwrap();
 
             Ok(())
