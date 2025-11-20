@@ -236,11 +236,12 @@ impl State {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        let buffer_size = (std::mem::size_of::<Node>() as u64
+            * nodes_vec.len() as u64
+            * uniforms.chunk_size as u64) as wgpu::BufferAddress;
+
         nodes_vec.extend_from_within(..);
         let nodes_in = nodes_vec.into_boxed_slice();
-        let buffer_size = (std::mem::size_of::<Node>() as u64
-            * nodes_in.len() as u64
-            * uniforms.chunk_size as u64) as wgpu::BufferAddress;
 
         let nodes_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("node buffer"),
