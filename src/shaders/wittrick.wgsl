@@ -68,7 +68,7 @@ fn external_force(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if id == 200 {
         let current = id + (c.current_index * uniforms.node_count);
 
-        nodes[current].velocities.x += 0.8 * uniforms.m_inv * uniforms.dt;
+        nodes[current].velocities.x += c.vel * uniforms.m_inv * uniforms.dt;
 
     }
 }

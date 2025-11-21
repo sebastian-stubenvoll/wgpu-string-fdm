@@ -78,11 +78,13 @@ mod py_wgpu_fdm {
                 .collect())
         }
 
-        fn initialize(&mut self, steps: usize) -> PyResult<()> {
+        fn initialize(&mut self, force: f32, steps: usize) -> PyResult<Vec<[[f32; 3]; 8]>> {
             println!("Calling GPU binding");
-            self.state.initialize(steps).unwrap();
+            let result = self.state.initialize(force, steps).unwrap();
+            let initial: Vec<[[f32; 3]; 8]> =
+                result.into_iter().map(gpu_bindings::Node::to_raw).collect();
 
-            Ok(())
+            Ok(initial)
         }
     }
 }

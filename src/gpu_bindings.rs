@@ -396,9 +396,11 @@ impl State {
         })
     }
 
-    pub fn initialize(&mut self, steps: usize) -> Result<(), Box<dyn Error>> {
+    pub fn initialize(&mut self, vel: f32, steps: usize) -> Result<Vec<Node>, Box<dyn Error>> {
         println!("Calling init!");
         let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
+
+        self.push_constants.vel = vel;
 
         for _ in 0..steps {
             let mut encoder = self
@@ -445,9 +447,61 @@ impl State {
             );
             self.queue.submit(iter::once(encoder.finish()));
         }
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Compute Encoder"),
+            });
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Compute Pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            compute_pass.set_pipeline(&self.output_pipeline);
+            compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+            compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+        }
+        self.queue.submit(iter::once(encoder.finish()));
+
         self.device.poll(wgpu::Maintain::Wait);
 
-        Ok(())
+        self.initialized = true;
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(
+            &self.output_buffer,
+            0,
+            &self.staging_buffer,
+            0,
+            (self.fdm_uniform.node_count as usize * std::mem::size_of::<Node>()) as u64,
+        );
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let buffer_slice = self.staging_buffer.slice(..);
+        let (tx, rx) = flume::bounded(1);
+        buffer_slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
+        self.device.poll(wgpu::Maintain::wait()).panic_on_timeout();
+
+        println!("Transferring buffer with size {}", self.buffer_size);
+
+        // Awaits until `buffer_future` can be read from
+        if let Ok(Ok(())) = rx.recv() {
+            let data = buffer_slice.get_mapped_range();
+            let result: Vec<Node> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            self.staging_buffer.unmap(); // Unmaps buffer from memory
+
+            return Ok(result[0..self.fdm_uniform.node_count as usize].to_vec());
+        } else {
+            eprintln!("Failed to map staging buffer!");
+        }
+
+        Ok(Vec::new())
     }
 
     pub fn compute(&mut self) -> Result<(), Box<dyn Error>> {
