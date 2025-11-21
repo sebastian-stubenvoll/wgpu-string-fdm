@@ -84,7 +84,7 @@ pub struct FDMUniform {
     chunk_size: u32,
 
     k_inv: [f32; 3],
-    _padding5: u32,
+    f_t: f32,
 }
 
 impl FDMUniform {
@@ -102,6 +102,7 @@ impl FDMUniform {
         sigma: [f32; 3],
         chunk_size: u32,
         k_inv: [f32; 3],
+        f_t: f32,
     ) -> Self {
         assert!(two_ds_inv != 0.0);
         assert!(m_inv != 0.0);
@@ -125,6 +126,7 @@ impl FDMUniform {
             chunk_size,
             sigma,
             k_inv,
+            f_t,
             ..Default::default()
         }
     }

@@ -32,6 +32,7 @@ mod py_wgpu_fdm {
             sigma: [f32; 3],
             chunk_size: u32,
             k_inv: [f32; 3],
+            f_t: f32,
         ) -> PyResult<Self> {
             let nodes: Vec<gpu_bindings::Node> = nodes
                 .iter()
@@ -40,7 +41,7 @@ mod py_wgpu_fdm {
 
             let uniforms = gpu_bindings::FDMUniform::new(
                 dt, two_ds_inv, &nodes, loss, tau, kappa, m_inv, c2_core, beta, dx2_inv, sigma,
-                chunk_size, k_inv,
+                chunk_size, k_inv, f_t,
             );
             let state = pollster::block_on(gpu_bindings::State::new(
                 nodes,

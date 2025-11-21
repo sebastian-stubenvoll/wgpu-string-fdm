@@ -37,7 +37,7 @@ struct Uniforms {
     sigma: vec3<f32>,
     chunk_size: u32,
     k_inv: vec3<f32>,
-    // implicit padding 
+    f_t: f32,
 }
 
 struct PushConstants { 
@@ -141,9 +141,9 @@ fn calculate_displacements(@builtin(global_invocation_id) global_id: vec3<u32>) 
         let v_xx = (nodes[current + 1].positions.y - 2.0 * nodes[current].positions.y + nodes[current - 1].positions.y) * (uniforms.dx2_inv);
         let w_xx = (nodes[current + 1].positions.z - 2.0 * nodes[current].positions.z + nodes[current - 1].positions.z) * (uniforms.dx2_inv);
 
-        let core_forces_x = u_xx * uniforms.c2_core;
-        let core_forces_y = v_xx * uniforms.c2_core;
-        let core_forces_z = w_xx * uniforms.c2_core;
+        let core_forces_x = u_xx * uniforms.f_t;
+        let core_forces_y = v_xx * uniforms.f_t;
+        let core_forces_z = w_xx * uniforms.f_t;
 
         nodes[future].core_forces.x = core_forces_x;
         nodes[future].core_forces.y = core_forces_y;

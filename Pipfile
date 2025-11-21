@@ -5,12 +5,12 @@ name = "pypi"
 
 [packages]
 maturin = "*"
-ipykernel = "*"
 notebook = "*"
 numpy = "*"
 matplotlib = "*"
 sounddevice = "*"
 scipy = "*"
+ipykernel = "*"
 
 [dev-packages]
 
