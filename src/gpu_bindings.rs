@@ -13,9 +13,9 @@ pub struct Node {
     _padding2: u32,
     angular_velocites: [f32; 3],
     _padding3: u32,
-    shell_moments: [f32; 3],
+    internal_moments: [f32; 3],
     _padding4: u32,
-    shell_forces: [f32; 3],
+    internal_forces: [f32; 3],
     _padding5: u32,
     helix_forces: [f32; 3],
     _padding6: u32,
@@ -35,8 +35,8 @@ impl Node {
             velocities,
             angles,
             angular_velocites,
-            shell_forces: [0.0; 3],
-            shell_moments: [0.0; 3],
+            internal_forces: [0.0; 3],
+            internal_moments: [0.0; 3],
             helix_forces: [0.0; 3],
             core_forces: [0.0; 3],
             _padding0: 0,
@@ -56,8 +56,8 @@ impl Node {
             self.velocities,
             self.angles,
             self.angular_velocites,
-            self.shell_forces,
-            self.shell_moments,
+            self.internal_forces,
+            self.internal_moments,
             self.helix_forces,
             self.core_forces,
         ]
@@ -75,7 +75,7 @@ pub struct FDMUniform {
     tau: f32,
     kappa: f32,
     m_inv: f32,
-    c2_core: f32,
+    dxf_t: f32,
 
     beta: [f32; 3],
     dx2_inv: f32,
@@ -83,8 +83,8 @@ pub struct FDMUniform {
     sigma: [f32; 3],
     chunk_size: u32,
 
-    k_inv: [f32; 3],
-    f_t: f32,
+    muk2_inv: [f32; 3],
+    pad: u32,
 }
 
 impl FDMUniform {
@@ -96,19 +96,17 @@ impl FDMUniform {
         tau: f32,
         kappa: f32,
         m_inv: f32,
-        c2_core: f32,
+        dxf_t: f32,
         beta: [f32; 3],
         dx2_inv: f32,
         sigma: [f32; 3],
         chunk_size: u32,
-        k_inv: [f32; 3],
-        f_t: f32,
+        muk2_inv: [f32; 3],
     ) -> Self {
         assert!(two_ds_inv != 0.0);
         assert!(m_inv != 0.0);
-        assert!(c2_core != 0.0);
         assert!(dx2_inv != 0.0);
-        assert!(k_inv.iter().all(|v| *v != 0.0));
+        assert!(muk2_inv.iter().all(|v| *v != 0.0));
         assert!(beta.iter().all(|v| *v != 0.0));
         assert!(sigma.iter().all(|v| *v != 0.0));
 
@@ -120,14 +118,13 @@ impl FDMUniform {
             tau,
             kappa,
             m_inv,
-            c2_core,
+            dxf_t,
             beta,
             dx2_inv,
             chunk_size,
             sigma,
-            k_inv,
-            f_t,
-            ..Default::default()
+            muk2_inv,
+            pad: 0,
         }
     }
 }
@@ -376,8 +373,6 @@ impl State {
             compilation_options: Default::default(),
         });
 
-        dbg!(&fdm_uniform);
-
         Ok(Self {
             device,
             queue,
@@ -511,17 +506,16 @@ impl State {
         let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
 
         // Too many commands break command buffers.
-        assert!(self.oversampling_factor <= 256);
         // Compute CHUNK_SIZE * OVERSAMPLING_FACTOR iterations.
         // Every OVERSAMPLING_FACTOR generate a new command buffer, to avoid overflow.
         for _ in 0..self.fdm_uniform.chunk_size {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Compute Encoder"),
-                });
             // FOR LOOP START
             for _ in 0..self.oversampling_factor {
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Compute Encoder"),
+                        });
                 {
                     let mut compute_pass =
                         encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -546,6 +540,7 @@ impl State {
                         .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
                     compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
                 }
+                self.queue.submit(iter::once(encoder.finish()));
                 (
                     self.push_constants.current_index,
                     self.push_constants.future_index,
@@ -555,6 +550,11 @@ impl State {
                 );
             }
             // FOR LOOP END
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Compute Encoder"),
+                });
             {
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Compute Pass"),
