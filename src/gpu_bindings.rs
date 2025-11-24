@@ -2,43 +2,131 @@
 use std::{error::Error, fmt::Display, iter};
 
 use wgpu::util::DeviceExt;
-
 #[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, encase::ShaderType)]
+#[derive(Default, Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, encase::ShaderType)]
 pub struct Node {
-    pub positions: [f32; 4],
-    pub velocities: [f32; 4],
+    positions: [f32; 3],
+    _padding0: u32,
+    velocities: [f32; 3],
+    _padding1: u32,
+    angles: [f32; 3],
+    _padding2: u32,
+    angular_velocites: [f32; 3],
+    _padding3: u32,
+    internal_moments: [f32; 3],
+    _padding4: u32,
+    internal_forces: [f32; 3],
+    _padding5: u32,
+    helix_forces: [f32; 3],
+    _padding6: u32,
+    core_forces: [f32; 3],
+    _padding7: u32,
 }
 
 impl Node {
-    pub fn new(positions: [f32; 4], velocities: [f32; 4]) -> Self {
+    pub fn new(
+        positions: [f32; 3],
+        velocities: [f32; 3],
+        angles: [f32; 3],
+        angular_velocites: [f32; 3],
+    ) -> Self {
         Self {
             positions,
             velocities,
+            angles,
+            angular_velocites,
+            internal_forces: [0.0; 3],
+            internal_moments: [0.0; 3],
+            helix_forces: [0.0; 3],
+            core_forces: [0.0; 3],
+            _padding0: 0,
+            _padding1: 0,
+            _padding2: 0,
+            _padding3: 0,
+            _padding4: 0,
+            _padding5: 0,
+            _padding6: 0,
+            _padding7: 0,
         }
+    }
+
+    pub fn to_raw(self) -> [[f32; 3]; 8] {
+        [
+            self.positions,
+            self.velocities,
+            self.angles,
+            self.angular_velocites,
+            self.internal_forces,
+            self.internal_moments,
+            self.helix_forces,
+            self.core_forces,
+        ]
     }
 }
 
 #[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, encase::ShaderType)]
-struct FDMUniform {
-    //Alignment is 16 bytes for Uniform buffers :)
-    output_node: u32,
-    node_count: u32,
-    chunk_size: u32,
+#[derive(Default, Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, encase::ShaderType)]
+pub struct FDMUniform {
     dt: f32,
+    two_ds_inv: f32,
+    node_count: u32,
+    loss: f32,
 
-    dx: f32,
-    // j - o  are arbitrary simluation parameters
-    // This is kept generic so the compute pipeline can be reused for different simulations by only exchanging shaders
-    j: f32,
-    k: f32,
-    l: f32,
+    tau: f32,
+    kappa: f32,
+    m_inv: f32,
+    dxf_t: f32,
 
-    m: f32,
-    n: f32,
-    o: f32,
-    p: f32,
+    beta: [f32; 3],
+    dx2_inv: f32,
+
+    sigma: [f32; 3],
+    chunk_size: u32,
+
+    muk2_inv: [f32; 3],
+    pad: u32,
+}
+
+impl FDMUniform {
+    pub fn new(
+        dt: f32,
+        two_ds_inv: f32,
+        nodes: &[Node],
+        loss: f32,
+        tau: f32,
+        kappa: f32,
+        m_inv: f32,
+        dxf_t: f32,
+        beta: [f32; 3],
+        dx2_inv: f32,
+        sigma: [f32; 3],
+        chunk_size: u32,
+        muk2_inv: [f32; 3],
+    ) -> Self {
+        assert!(two_ds_inv != 0.0);
+        assert!(m_inv != 0.0);
+        assert!(dx2_inv != 0.0);
+        assert!(muk2_inv.iter().all(|v| *v != 0.0));
+        assert!(beta.iter().all(|v| *v != 0.0));
+        assert!(sigma.iter().all(|v| *v != 0.0));
+
+        Self {
+            dt,
+            two_ds_inv,
+            node_count: nodes.len() as u32,
+            loss,
+            tau,
+            kappa,
+            m_inv,
+            dxf_t,
+            beta,
+            dx2_inv,
+            chunk_size,
+            sigma,
+            muk2_inv,
+            pad: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -46,8 +134,8 @@ struct FDMUniform {
 struct PushConstants {
     current_index: u32,
     future_index: u32,
-    output_index: u32,
-    save: u32,
+    vel: f32,
+    output_idx: u32,
 }
 
 #[derive(Debug)]
@@ -74,25 +162,28 @@ impl Error for StateError {}
 
 #[allow(dead_code)]
 pub struct State {
-    buffer_size: usize,
+    buffer_size: u64,
     compute_bind_group: wgpu::BindGroup,
-    compute_pipeline: wgpu::ComputePipeline,
+    external_force_pipeline: wgpu::ComputePipeline,
+    forces_pipeline: wgpu::ComputePipeline,
+    displacements_pipeline: wgpu::ComputePipeline,
+    output_pipeline: wgpu::ComputePipeline,
     device: wgpu::Device,
     fdm_uniform: FDMUniform,
     fdm_uniform_buffer: wgpu::Buffer,
-    nodes: Box<[Node]>,
     nodes_buffer: wgpu::Buffer,
     output_buffer: wgpu::Buffer,
     oversampling_factor: usize,
     push_constants: PushConstants,
     queue: wgpu::Queue,
     staging_buffer: wgpu::Buffer,
+    initialized: bool,
 }
 
 impl State {
     pub async fn new(
-        nodes_vec: Vec<Node>,
-        chunk_size: usize,
+        mut nodes_vec: Vec<Node>,
+        uniforms: FDMUniform,
         oversampling_factor: usize,
     ) -> Result<State, Box<dyn Error>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -132,74 +223,54 @@ impl State {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("FDM Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/wittrick.wgsl").into()),
         });
 
         //Uniform Buffers
-        let fdm_uniform = FDMUniform {
-            output_node: nodes_vec.len().div_euclid(2) as u32,
-            node_count: nodes_vec.len() as u32,
-            chunk_size: chunk_size as u32,
-            dt: 0.000022676,
+        let fdm_uniform = uniforms;
 
-            dx: 0.0068125,
-            j: 0.1,
-            k: 0.0001,
-            l: 0.0001,
-
-            m: 0.0,
-            n: 0.0,
-            o: 0.0,
-            p: 0.0,
-        };
         let fdm_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("FDM Uniform Buffer"),
             contents: bytemuck::cast_slice(&[fdm_uniform]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let nodes = nodes_vec.into_boxed_slice();
+        let buffer_size = (std::mem::size_of::<Node>() as u64
+            * nodes_vec.len() as u64
+            * uniforms.chunk_size as u64) as wgpu::BufferAddress;
+
+        nodes_vec.extend_from_within(..);
+        let nodes_in = nodes_vec.into_boxed_slice();
 
         let nodes_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("node buffer"),
-            contents: bytemuck::cast_slice(nodes.as_ref()),
+            contents: bytemuck::cast_slice(nodes_in.as_ref()),
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
         });
 
-        // Buffer whose contents will eventually be copied into the CPU staging buffer
-        // We store this in GPU memory for CHUNK_SIZE passes, to minimize the calls to the
-        // (expensive) buffer copy operation.
-        let mut output_vec = Vec::with_capacity(chunk_size);
-        for _ in 0..chunk_size {
-            output_vec.push([0.0f32; 2]);
-        }
-
-        let output = output_vec.into_boxed_slice();
-
-        let output_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("index buffer"),
-            contents: bytemuck::cast_slice(output.as_ref()),
+            size: buffer_size,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
         });
 
-        // Staging
         let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: std::mem::size_of_val(&*(output)) as wgpu::BufferAddress,
+            size: buffer_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let push_constants = PushConstants {
             current_index: 0,
-            // (u_current, v_current, u_future, v_future)
-            future_index: 2,
-            output_index: 0,
-            save: 0,
+            future_index: 1,
+            vel: 1.0e-3,
+            output_idx: 0,
         };
 
         let compute_bind_group_layout =
@@ -268,12 +339,37 @@ impl State {
                 }],
             });
 
-        //Uses the compute node buffer as storage buffer
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let external_force_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &shader,
+                entry_point: "external_force",
+                compilation_options: Default::default(),
+            });
+
+        let forces_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Compute Pipeline"),
             layout: Some(&compute_pipeline_layout),
             module: &shader,
-            entry_point: "compute_main",
+            entry_point: "calculate_internal_forces",
+            compilation_options: Default::default(),
+        });
+
+        let displacements_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &shader,
+                entry_point: "calculate_displacements",
+                compilation_options: Default::default(),
+            });
+
+        let output_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Compute Pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "save_output",
             compilation_options: Default::default(),
         });
 
@@ -283,20 +379,72 @@ impl State {
             fdm_uniform,
             fdm_uniform_buffer,
             compute_bind_group,
-            nodes,
             nodes_buffer,
             output_buffer,
             staging_buffer,
             push_constants,
-            compute_pipeline,
-            buffer_size: std::mem::size_of_val(&(*output)),
+            external_force_pipeline,
+            forces_pipeline,
+            displacements_pipeline,
+            output_pipeline,
+            buffer_size,
             oversampling_factor,
+            initialized: false,
         })
     }
 
-    pub fn compute(&mut self) -> Result<Vec<[f32; 2]>, Box<dyn Error>> {
-        // The 64 comes from the @workgroup_size(64) inside the shaders
-        let num_dispatches = (*self.nodes).len().div_ceil(64) as u32;
+    pub fn initialize(&mut self, vel: f32, steps: usize) -> Result<Vec<Node>, Box<dyn Error>> {
+        println!("Calling init!");
+        let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
+
+        self.push_constants.vel = vel;
+
+        for _ in 0..steps {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Compute Encoder"),
+                });
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                compute_pass.set_pipeline(&self.external_force_pipeline);
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+            }
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                compute_pass.set_pipeline(&self.forces_pipeline);
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+            }
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                compute_pass.set_pipeline(&self.displacements_pipeline);
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+            }
+            (
+                self.push_constants.current_index,
+                self.push_constants.future_index,
+            ) = (
+                self.push_constants.future_index,
+                self.push_constants.current_index,
+            );
+            self.queue.submit(iter::once(encoder.finish()));
+        }
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -307,40 +455,17 @@ impl State {
                 label: Some("Compute Pass"),
                 timestamp_writes: None,
             });
-
             compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-            compute_pass.set_pipeline(&self.compute_pipeline);
-            for i in 0..self.fdm_uniform.chunk_size as usize * self.oversampling_factor {
-                // Toggle save
-                // self.push_constants.save = (i % self.oversampling_factor) as u32;
-
-                // Compute once
-                compute_pass.set_push_constants(0, bytemuck::bytes_of(&self.push_constants));
-                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-
-                // Update push constants for next loop
-                (
-                    self.push_constants.current_index,
-                    self.push_constants.future_index,
-                ) = (
-                    self.push_constants.future_index,
-                    self.push_constants.current_index,
-                );
-
-                // If previous output was saved, move saveloc pointer
-                // This ordering allows the shader to just write to the output array on each pass
-                // While seemingly wasteful, this avoids a branch
-                if i % self.oversampling_factor == self.oversampling_factor - 1 {
-                    self.push_constants.output_index =
-                        (self.push_constants.output_index + 1) % self.fdm_uniform.chunk_size;
-                }
-            }
+            compute_pass.set_pipeline(&self.output_pipeline);
+            compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+            compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
         }
-
         self.queue.submit(iter::once(encoder.finish()));
+
         self.device.poll(wgpu::Maintain::Wait);
 
-        // Begin memory transfer to CPU
+        self.initialized = true;
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -349,7 +474,7 @@ impl State {
             0,
             &self.staging_buffer,
             0,
-            self.buffer_size as u64,
+            (self.fdm_uniform.node_count as usize * std::mem::size_of::<Node>()) as u64,
         );
         self.queue.submit(Some(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait);
@@ -359,71 +484,139 @@ impl State {
         buffer_slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
         self.device.poll(wgpu::Maintain::wait()).panic_on_timeout();
 
+        println!("Transferring buffer with size {}", self.buffer_size);
+
         // Awaits until `buffer_future` can be read from
         if let Ok(Ok(())) = rx.recv() {
             let data = buffer_slice.get_mapped_range();
-            let result: Vec<[f32; 2]> = bytemuck::cast_slice(&data).to_vec();
+            let result: Vec<Node> = bytemuck::cast_slice(&data).to_vec();
             drop(data);
             self.staging_buffer.unmap(); // Unmaps buffer from memory
 
-            return Ok(result);
+            return Ok(result[0..self.fdm_uniform.node_count as usize].to_vec());
         } else {
             eprintln!("Failed to map staging buffer!");
         }
+
         Ok(Vec::new())
     }
 
-    pub fn set_dx(&mut self, dx: f32) -> Result<(), Box<dyn Error>> {
-        self.fdm_uniform.dx = dx;
-        self.update_uniforms()
+    pub fn compute(&mut self) -> Result<(), Box<dyn Error>> {
+        // The 64 comes from the @workgroup_size(64) inside the shaders
+        let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
+
+        // Too many commands break command buffers.
+        // Compute CHUNK_SIZE * OVERSAMPLING_FACTOR iterations.
+        // Every OVERSAMPLING_FACTOR generate a new command buffer, to avoid overflow.
+        for _ in 0..self.fdm_uniform.chunk_size {
+            // FOR LOOP START
+            for _ in 0..self.oversampling_factor {
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Compute Encoder"),
+                        });
+                {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Compute Pass"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                    compute_pass.set_pipeline(&self.forces_pipeline);
+                    compute_pass
+                        .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                    compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+                }
+                {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Compute Pass"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                    compute_pass.set_pipeline(&self.displacements_pipeline);
+                    compute_pass
+                        .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                    compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+                }
+                self.queue.submit(iter::once(encoder.finish()));
+                (
+                    self.push_constants.current_index,
+                    self.push_constants.future_index,
+                ) = (
+                    self.push_constants.future_index,
+                    self.push_constants.current_index,
+                );
+            }
+            // FOR LOOP END
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Compute Encoder"),
+                });
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                compute_pass.set_pipeline(&self.output_pipeline);
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+
+                self.push_constants.output_idx =
+                    (self.push_constants.output_idx + 1) % self.fdm_uniform.chunk_size;
+            }
+            self.queue.submit(iter::once(encoder.finish()));
+        }
+        Ok(())
     }
 
-    pub fn set_dt(&mut self, dt: f32) -> Result<(), Box<dyn Error>> {
-        self.fdm_uniform.dt = dt;
-        self.update_uniforms()
+    pub fn save(&mut self) -> Result<Vec<Vec<Node>>, Box<dyn Error>> {
+        assert_eq!(self.push_constants.output_idx, 0);
+        // Begin memory transfer to CPU
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(
+            &self.output_buffer,
+            0,
+            &self.staging_buffer,
+            0,
+            self.buffer_size,
+        );
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let buffer_slice = self.staging_buffer.slice(..);
+        let (tx, rx) = flume::bounded(1);
+        buffer_slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
+        self.device.poll(wgpu::Maintain::wait()).panic_on_timeout();
+
+        println!("Transferring buffer with size {}", self.buffer_size);
+
+        // Awaits until `buffer_future` can be read from
+        if let Ok(Ok(())) = rx.recv() {
+            let data = buffer_slice.get_mapped_range();
+            let result: Vec<Node> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            self.staging_buffer.unmap(); // Unmaps buffer from memory
+
+            let vecs: Vec<Vec<Node>> = result
+                .chunks(self.fdm_uniform.node_count as usize)
+                .map(|slice| slice.to_vec())
+                .collect();
+            return Ok(vecs);
+        } else {
+            eprintln!("Failed to map staging buffer!");
+        }
+
+        Ok(Vec::new())
     }
 
-    pub fn set_j(&mut self, val: f32) -> Result<(), Box<dyn Error>> {
-        self.fdm_uniform.j = val;
-        self.update_uniforms()
-    }
-
-    pub fn set_k(&mut self, val: f32) -> Result<(), Box<dyn Error>> {
-        self.fdm_uniform.k = val;
-        self.update_uniforms()
-    }
-
-    pub fn set_l(&mut self, val: f32) -> Result<(), Box<dyn Error>> {
-        self.fdm_uniform.l = val;
-        self.update_uniforms()
-    }
-
-    pub fn set_m(&mut self, val: f32) -> Result<(), Box<dyn Error>> {
-        self.fdm_uniform.m = val;
-        self.update_uniforms()
-    }
-
-    pub fn set_n(&mut self, val: f32) -> Result<(), Box<dyn Error>> {
-        self.fdm_uniform.n = val;
-        self.update_uniforms()
-    }
-
-    pub fn set_o(&mut self, val: f32) -> Result<(), Box<dyn Error>> {
-        self.fdm_uniform.o = val;
-        self.update_uniforms()
-    }
-
-    pub fn set_p(&mut self, val: f32) -> Result<(), Box<dyn Error>> {
-        self.fdm_uniform.p = val;
-        self.update_uniforms()
-    }
-
-    pub fn set_output_node(&mut self, id: u32) -> Result<(), Box<dyn Error>> {
-        self.fdm_uniform.output_node = id;
-        self.update_uniforms()
-    }
-
-    fn update_uniforms(&mut self) -> Result<(), Box<dyn Error>> {
+    fn update_uniforms(&mut self, uniforms: FDMUniform) -> Result<(), Box<dyn Error>> {
+        self.fdm_uniform = uniforms;
         let mut buffer = encase::UniformBuffer::new(Vec::new());
         buffer.write(&self.fdm_uniform)?;
         self.queue
