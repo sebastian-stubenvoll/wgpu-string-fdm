@@ -185,6 +185,7 @@ impl State {
         mut nodes_vec: Vec<Node>,
         uniforms: FDMUniform,
         oversampling_factor: usize,
+        shader_num: usize,
     ) -> Result<State, Box<dyn Error>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             #[cfg(not(target_arch = "wasm32"))]
@@ -221,9 +222,14 @@ impl State {
             )
             .await?;
 
+        let shader = match shader_num {
+            0 => wgpu::ShaderSource::Wgsl(include_str!("shaders/testing_string_x.wgsl").into()),
+            _ => panic!("Invalid shader id!"),
+        };
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("FDM Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/wittrick.wgsl").into()),
+            source: shader,
         });
 
         //Uniform Buffers

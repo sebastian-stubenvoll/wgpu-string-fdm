@@ -18,6 +18,7 @@ mod py_wgpu_fdm {
     impl Simulation {
         #[new]
         fn new(
+            shader_num: usize,
             nodes: Vec<[[f32; 3]; 4]>,
             oversampling_factor: usize,
             dt: f32,
@@ -46,6 +47,7 @@ mod py_wgpu_fdm {
                 nodes,
                 uniforms,
                 oversampling_factor,
+                shader_num,
             ));
 
             if let Ok(state) = state {
