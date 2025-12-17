@@ -119,8 +119,8 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (id == uniforms.node_count - 2) { // only run node code
         // This is in the laboratory frame (LF)
         let d3 = tangent(edges[current].orientation);
-        let sigma = ((nodes[current + 1].position - nodes[current].position) * uniforms.dx_inv) - d3);
-        // Internal force is SE stiffness matrix * effective strain (LF)
+        let sigma = (((nodes[current + 1].position - nodes[current].position) * uniforms.dx_inv) - d3);
+        // Internal force is SE stiffness matrix * effective strain
         // However for the stiffness matrix to be diagonal we need to apply it in the material frame.
         // This effectively does that:
         let sigma_eff = sigma - rotate(edges[current].orientation, nodes[current].reference_strain);
@@ -131,7 +131,7 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
     } else if (id > 0 && id < uniforms.node_count - 3) { // run all interior code
         // This is in the laboratory frame (LF)
         let d3 = tangent(edges[current].orientation);
-        let sigma = ((nodes[current + 1].position - nodes[current].position) * uniforms.dx_inv) - d3);
+        let sigma = (((nodes[current + 1].position - nodes[current].position) * uniforms.dx_inv) - d3);
 
         // Compute strain as r_x * Im(q_i,conj * q_i+1)
         let q_inv = vec4<f32>( -edges[current].orientation.xyz, edges[current].orientation.w);
@@ -151,6 +151,8 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // Compute the moment density for each edges (used for angular momentum calculations later) (MF)
         edges[current].moment_density = cross((kappa - edges[current].reference_strain), edges[current].internal_moments) * uniforms.dx;
     } else { // handle BC
+        nodes[current].resulting_forces = vec3<f32>(0.0);
+        edges[current].resulting_forces = vec3<f32>(0.0);
     }
 }
 
@@ -213,18 +215,22 @@ fn integrate(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + id;
     let future = (c.future * uniforms.node_count) + id;
 
+// Inside integrate function
+let damping = 0.998; // Slightly less than 1.0
+
+
     if (id == uniforms.node_count - 2) { // only run node code
         let linear_acceleration = nodes[current].resulting_forces * uniforms.mass_inv;
-        nodes[future].velocity = nodes[current].velocity + (linear_acceleration * uniforms.dt);
+        nodes[future].velocity = nodes[current].velocity + (linear_acceleration * uniforms.dt) * damping;
         nodes[future].position = nodes[current].position + (nodes[future].velocity * uniforms.dt);
 
     } else if (id > 0 && id < uniforms.node_count - 3) { // run all interior code
         let linear_acceleration = nodes[current].resulting_forces * uniforms.mass_inv;
-        nodes[future].velocity = nodes[current].velocity + (linear_acceleration * uniforms.dt);
+        nodes[future].velocity = (nodes[current].velocity + (linear_acceleration * uniforms.dt) * damping);
         nodes[future].position = nodes[current].position + (nodes[future].velocity * uniforms.dt);
     
         let angular_acceleration = edges[current].resulting_forces * uniforms.inertia_inv;
-        edges[future].angular_velocity = edges[current].angular_velocity + (angular_acceleration * uniforms.dt);
+        edges[future].angular_velocity = (edges[current].angular_velocity + (angular_acceleration * uniforms.dt)) * damping;
 
         let omega_q = vec4<f32>(edges[future].angular_velocity, 0.0);
 
@@ -287,3 +293,4 @@ fn tangent(q: vec4<f32>) -> vec3<f32> {
 fn fast_normalize(q: vec4<f32>) -> vec4<f32> {
     return q * inverseSqrt(dot(q,q));
 }
+
