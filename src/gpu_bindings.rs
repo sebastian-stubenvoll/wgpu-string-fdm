@@ -10,11 +10,11 @@ pub struct Node {
     _pad0: u32,
     velocity: [f32; 3],
     _pad1: u32,
-    reference_strain: [f32; 3],
+    curavture: [f32; 3],
     _pad2: u32,
-    internal_forces: [f32; 3],
+    reference_curvature: [f32; 3],
     _pad3: u32,
-    resulting_forces: [f32; 3],
+    internal_moment: [f32; 3],
     _pad4: u32,
 }
 
@@ -25,22 +25,17 @@ impl Node {
             _pad0: 0,
             velocity: *velocity,
             _pad1: 0,
-            reference_strain: [0.0; 3],
+            curavture: [0.0; 3],
             _pad2: 0,
-            internal_forces: [0.0; 3],
+            reference_curvature: [0.0; 3],
             _pad3: 0,
-            resulting_forces: [0.0; 3],
+            internal_moment: [0.0; 3],
             _pad4: 0,
         }
     }
 
-    pub fn to_raw(self) -> [[f32; 3]; 4] {
-        [
-            self.position,
-            self.velocity,
-            self.internal_forces,
-            self.resulting_forces,
-        ]
+    pub fn to_raw(self) -> [[f32; 3]; 3] {
+        [self.position, self.velocity, self.internal_moment]
     }
 }
 
@@ -50,15 +45,13 @@ impl Node {
 pub struct Edge {
     orientation: [f32; 4],
     angular_velocity: [f32; 3],
-    _pad0: u32,
+    len_inv: f32,
+    strain: [f32; 3],
+    dilation: f32,
     reference_strain: [f32; 3],
+    _pad0: u32,
+    internal_force: [f32; 3],
     _pad1: u32,
-    internal_moments: [f32; 3],
-    _pad2: u32,
-    moment_density: [f32; 3],
-    _pad3: u32,
-    resulting_forces: [f32; 3],
-    _pad4: u32,
 }
 
 impl Edge {
@@ -66,27 +59,20 @@ impl Edge {
         Self {
             orientation: *orientation,
             angular_velocity: *angular_velocity,
-            _pad0: 0,
+            len_inv: 0.0,
+            strain: [0.0; 3],
+            dilation: 0.0,
             reference_strain: [0.0; 3],
+            _pad0: 0,
+            internal_force: [0.0; 3],
             _pad1: 0,
-            internal_moments: [0.0; 3],
-            _pad2: 0,
-            moment_density: [0.0; 3],
-            _pad3: 0,
-            resulting_forces: [0.0; 3],
-            _pad4: 0,
         }
     }
 
-    pub fn to_raw(self) -> ([f32; 4], [[f32; 3]; 4]) {
+    pub fn to_raw(self) -> ([f32; 4], [[f32; 3]; 2]) {
         (
             self.orientation,
-            [
-                self.angular_velocity,
-                self.internal_moments,
-                self.moment_density,
-                self.resulting_forces,
-            ],
+            [self.angular_velocity, self.internal_force],
         )
     }
 }
@@ -98,19 +84,19 @@ pub struct FDMUniform {
     node_count: u32,
     edge_count: u32,
     chunk_size: u32,
-    dt: f32,
-    dx: f32,
-    dx_inv: f32,
     mass_inv: f32,
-    _pad0: u32,
+    dt: f32,
+    dt_inv: f32,
+    dl: f32,
+    dl_inv: f32,
     stiffness_se: [f32; 3],
-    _pad1: u32,
+    _pad0: u32,
     stiffness_bt: [f32; 3],
-    _pad2: u32,
+    _pad1: u32,
     inertia: [f32; 3],
-    _pad3: u32,
+    _pad2: u32,
     inertia_inv: [f32; 3],
-    _pad4: u32,
+    _pad3: u32,
 }
 
 impl FDMUniform {
@@ -119,7 +105,7 @@ impl FDMUniform {
         edges: &[Edge],
         chunk_size: u32,
         dt: f32,
-        dx: f32,
+        dl: f32,
         mass: f32,
         stiffness_se: &[f32; 3],
         stiffness_bt: &[f32; 3],
@@ -143,19 +129,19 @@ impl FDMUniform {
             node_count: nodes.len() as u32,
             edge_count: edges.len() as u32,
             chunk_size,
-            dt,
-            dx,
-            dx_inv: 1.0 / dx,
             mass_inv: 1.0 / mass,
-            _pad0: 0,
+            dt,
+            dt_inv: 1.0 / dt,
+            dl,
+            dl_inv: 1.0 / dl,
             stiffness_se: *stiffness_se,
-            _pad1: 0,
+            _pad0: 0,
             stiffness_bt: *stiffness_bt,
-            _pad2: 0,
+            _pad1: 0,
             inertia: *intertia,
-            _pad3: 0,
+            _pad2: 0,
             inertia_inv: intertia.map(|i| 1.0 / i),
-            _pad4: 0,
+            _pad3: 0,
         }
     }
 }

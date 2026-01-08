@@ -21,13 +21,10 @@ struct Edge {
     orientation: vec4<f32>, // 16 bytes
 
     angular_velocity: vec3<f32>, // 12 bytes
-    // 4 bytes of implicit padding
+    len_inv: f32, // 12 bytes
 
-    len_inv: vec3<f32>, // 12 bytes
-    dilation: f32, // 4 bytes; this is actually the previous dilation.
-      
     strain: vec3<f32>, // 12 bytes
-    // 4 bytes of implicit padding
+    dilation: f32, // 4 bytes; this is actually the previous dilation.
     
     reference_strain: vec3<f32>, // 12 bytes
     // 4 bytes of implicit padding
@@ -90,7 +87,18 @@ var<storage, read_write> output_edges: array<Edge>;
 
 @compute
 @workgroup_size(64) 
-fn create_reference(@builtin(global_invocation_id) global_id: vec3<u32>) {}
+fn create_reference(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let current = (c.current * uniforms.node_count) + global_id.x;
+    let future = (c.future * uniforms.node_count) + global_id.x;
+
+    let reference_strain =  ((nodes[current + 1].position - nodes[current].position) * uniforms.dl_inv) - d3; //  (LF)
+    edges[current].reference_strain = reference_strain;
+    edges[future].reference_strain = reference_strain;
+
+    let reference_curvature = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
+    nodes[current].reference_curvature = reference_curvature;
+    nodes[future].reference_curvature = reference_curvature;
+}
 
 @compute
 @workgroup_size(64) 
@@ -159,10 +167,6 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let dq = 0.5 * qmul(edges[current].orientation, vec4<f32>(edges[future].angular_velocity, 0.0));
     edges[future].orientation = fast_normalize(edges[current].orientation + dq * uniforms.dt);
 }
-
-@compute
-@workgroup_size(64) 
-fn integrate(@builtin(global_invocation_id) global_id: vec3<u32>) {}
 
 @compute
 @workgroup_size(64) 
