@@ -4,6 +4,9 @@ struct Node {
 
     velocity: vec3<f32>, // 12 bytes
     // 4 bytes of implicit padding
+
+    curvature: vec3<f32>, // 12 bytes
+    // 4 bytes of implicit padding
    
     reference_curvature: vec4<f32>, // 12 bytes
     // this is the quaterion encoding the rotation needed to transform
@@ -21,7 +24,7 @@ struct Edge {
     // 4 bytes of implicit padding
 
     len_inv: vec3<f32>, // 12 bytes
-    // 4 bytes of implicit padding
+    dilation: f32, // 4 bytes; this is actually the previous dilation.
       
     strain: vec3<f32>, // 12 bytes
     // 4 bytes of implicit padding
@@ -37,12 +40,13 @@ struct Uniforms {
     node_count: u32,
     edge_count: u32,
     chunk_size: u32,
-    dt: f32,
+    mass_inv: f32,
 
+    dt: f32,
+    dt_inv: f32,
     dl: f32,
     dl_inv: f32,
-    mass_inv: f32,
-    // implicit padding
+    
 
     stiffness_se: vec3<f32>, // 12 bytes - shearing / extension stiffness matrix
     // 4 bytes of implicit padding
@@ -104,9 +108,9 @@ fn compute_length(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @workgroup_size(64) 
 fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + global_id.x;
-    let future = (c.future * uniforms.node_count) + global_id.x;
 
     let dilatation_inv = uniforms.dl * edges[current].len_inv;
+    let future = (c.future * uniforms.node_count) + global_id.x;
     
     let d3 = tangent(edges[current].orientation); // (LF)
     let sigma_eff = (((nodes[current + 1].position - nodes[current].position) * uniforms.dl_inv) - d3) - edges[current].reference_strain; //  (LF)
@@ -115,18 +119,46 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let relative_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
     let effective_orientation = qmul(qinv(nodes[current].reference_curvature), relative_orientation); // (MF)
 
-    nodes[current].internal_moment = uniforms.stiffness_bt * (2.0 * uniforms.dl_inv * effective_orientation.xyz);
-    
-    
-    let kappa; 
-    let sigma;
-    let dilation;
+    let epsilon_inv = (edges[current].len_inv * edges[current+1].len_inv) / (edges[current].len_inv + edges[current+1].len_inv) * uniforms.dl * 2.0;
+    let kappa = 2.0 * uniforms.dl_inv * effective_orientation.xyz;
+    // This is B applied to kappa (MF); here B is diagonal -> pointwise multiplication
+    nodes[current].curvature = kappa;
+    nodes[current].internal_moment = uniforms.stiffness_bt * kappa * epsilon_inv * epsilon_inv * epsilon_inv;
+    edges[future].dilation = 1.0 / dilatation_inv;
 }
 
 
 @compute
 @workgroup_size(64) 
-fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {}
+fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let current = (c.current * uniforms.node_count) + global_id.x;
+    let future = (c.future * uniforms.node_count) + global_id.x;
+
+    let ext_force = vec3<f32>(0.0, 0.0, 0.0);
+    let v_tt = (edges[current].internal_force - edges[current- 1].internal_force + ext_force) * uniforms.mass_inv;
+
+    let average = 0.5 * uniforms.dl * (cross(nodes[current].curvature, nodes[current].internal_moment) + cross(nodes[current+1].curvature, nodes[current+1].internal_moment));
+    let tangent_MF = rotate_inv(edges[current].orientation, (nodes[current+1].position - nodes[current].position) * edges[current].len_inv);
+    let dilatation_inv = uniforms.dl * edges[current].len_inv;
+    let dilation_t = (edges[future].dilation - edges[current].dilation) * uniforms.dt_inv;
+
+    let ext_couple = vec3<f32>(0.0, 0.0, 0.0);
+
+    let phi_tt = ((nodes[current].internal_moment - nodes[current- 1].internal_moment)
+                        + average
+                        + (cross(tangent_MF, edges[current].internal_force) * uniforms.dl)
+                        + cross((uniforms.inertia * edges[current].angular_velocity * dilatation_inv), edges[current].angular_velocity) 
+                        + uniforms.inertia * edges[current].angular_velocity * dilatation_inv * dilation_t
+                        + ext_couple
+                        ) * uniforms.inertia_inv;
+
+    nodes[future].velocity = nodes[current].velocity + (v_tt * uniforms.dt);
+    nodes[future].position = nodes[current].position + (nodes[future].velocity * uniforms.dt);
+
+    edges[future].angular_velocity = edges[current].angular_velocity + (phi_tt * uniforms.dt);
+    let dq = 0.5 * qmul(edges[current].orientation, vec4<f32>(edges[future].angular_velocity, 0.0));
+    edges[future].orientation = fast_normalize(edges[current].orientation + dq * uniforms.dt);
+}
 
 @compute
 @workgroup_size(64) 
@@ -154,6 +186,7 @@ fn qmul(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
     );
 }
 
+// Rotate TO the lab frame
 fn rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
     let u = vec4<f32>(v, 0.0);
 
@@ -163,6 +196,7 @@ fn rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
     return rotated.xyz;
 }
 
+// Rotate TO the material frame cooridinates (this is inv because Q rotates the (0,0,1) to (d1, d2, d3) in lab coordinates)
 fn rotate_inv(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
     let u = vec4<f32>(v, 0.0);
 
