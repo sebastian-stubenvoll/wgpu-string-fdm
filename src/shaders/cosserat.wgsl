@@ -108,7 +108,7 @@ fn compute_length(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // only run this segment on edges
     if (global_id.x < uniforms.node_count - 1) {
         let r = (nodes[current+1].position - nodes[current].position);
-        edges[current].len_inv = inverseSqrt(r.x * r.x + r.y * r.y + r.z * r.z);
+        edges[current].len_inv = inverseSqrt(dot(r,r));
     }
 }
 
@@ -116,16 +116,24 @@ fn compute_length(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @workgroup_size(64) 
 fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + global_id.x;
+    let future = (c.future * uniforms.node_count) + global_id.x;
 
     let dilatation_inv = uniforms.dl * edges[current].len_inv;
-    let future = (c.future * uniforms.node_count) + global_id.x;
     
-    let d3 = tangent(edges[current].orientation); // (LF)
-    let sigma_eff = (((nodes[current + 1].position - nodes[current].position) * uniforms.dl_inv) - d3) - edges[current].reference_strain; //  (LF)
-    edges[current].internal_force = rotate(edges[current].orientation, (uniforms.stiffness_se * rotate_inv(edges[current].orientation, sigma_eff))) * dilatation_inv ; // (MF)
+    // Only run this on vertices that have an edge attached
+    if (global_id.x < uniforms.node_count - 2u) {
+        let d3 = tangent(edges[current].orientation); // (LF)
+        let sigma_eff = (((nodes[current + 1].position - nodes[current].position) * uniforms.dl_inv) - d3) - edges[current].reference_strain; //  (LF)
+        edges[current].internal_force = rotate(edges[current].orientation, (uniforms.stiffness_se * rotate_inv(edges[current].orientation, sigma_eff))) * dilatation_inv ; // (MF)
+    }
     
-    let relative_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
+    var relative_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
+    if (dot(relative_orientation, nodes[current].reference_curvature) < 0.0) {
+        relative_orientation = -relative_orientation;
+    }
+
     let effective_orientation = qmul(qinv(nodes[current].reference_curvature), relative_orientation); // (MF)
+
 
     let epsilon_inv = (edges[current].len_inv * edges[current+1].len_inv) / (edges[current].len_inv + edges[current+1].len_inv) * uniforms.dl * 2.0;
     let kappa = 2.0 * uniforms.dl_inv * effective_orientation.xyz;
@@ -143,6 +151,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let future = (c.future * uniforms.node_count) + global_id.x;
 
     let ext_force = vec3<f32>(0.0, 0.0, 0.0);
+    // Only calculate for interior edges, so naive difference operator is fine here!
     let v_tt = (edges[current].internal_force - edges[current- 1].internal_force + ext_force) * uniforms.mass_inv;
 
     let average = 0.5 * uniforms.dl * (cross(nodes[current].curvature, nodes[current].internal_moment) + cross(nodes[current+1].curvature, nodes[current+1].internal_moment));
@@ -151,8 +160,17 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let dilation_t = (edges[future].dilation - edges[current].dilation) * uniforms.dt_inv;
 
     let ext_couple = vec3<f32>(0.0, 0.0, 0.0);
+    var difference: vec3<f32>;
+    if (global_id.x == 0) {
+        difference = nodes[current].internal_moment;
+    } else if (global_id.x == uniforms.node_count - 2) {
+        difference = - nodes[current].internal_moment;
+    } else {
+        difference = nodes[current].internal_moment - nodes[current- 1].internal_moment;
+    }
 
-    let phi_tt = ((nodes[current].internal_moment - nodes[current- 1].internal_moment)
+    
+    let phi_tt = ( difference
                         + average
                         + (cross(tangent_MF, edges[current].internal_force) * uniforms.dl)
                         + cross((uniforms.inertia * edges[current].angular_velocity * dilatation_inv), edges[current].angular_velocity) 
@@ -165,7 +183,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     edges[future].angular_velocity = edges[current].angular_velocity + (phi_tt * uniforms.dt);
     let dq = 0.5 * qmul(edges[current].orientation, vec4<f32>(edges[future].angular_velocity, 0.0));
-    edges[future].orientation = fast_normalize(edges[current].orientation + dq * uniforms.dt);
+    edges[future].orientation = normalize(edges[current].orientation + dq * uniforms.dt);
 }
 
 @compute
@@ -178,7 +196,7 @@ fn save_output(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 
 fn qinv(q: vec4<f32>) -> vec4<f32> {
-    return vec4<f32>(q.xyz, q.w);
+    return vec4<f32>(-q.xyz, q.w);
 }
 
 fn qmul(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
@@ -217,7 +235,7 @@ fn tangent(q: vec4<f32>) -> vec3<f32> {
         1 - 2 * (q.x * q.x + q.y * q.y)
     );
 
-    return d3;
+    return normalize(d3);
 }
 
 fn fast_normalize(q: vec4<f32>) -> vec4<f32> {
