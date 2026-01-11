@@ -8,7 +8,7 @@ struct Node {
     curvature: vec3<f32>, // 12 bytes
     // 4 bytes of implicit padding
    
-    reference_curvature: vec4<f32>, // 12 bytes
+    reference_orientation: vec4<f32>, // 16 bytes
     // this is the quaterion encoding the rotation needed to transform
     // the one set of adjacent directors to the other adjacent one at rest
         
@@ -91,13 +91,20 @@ fn create_reference(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + global_id.x;
     let future = (c.future * uniforms.node_count) + global_id.x;
 
-    let reference_strain =  ((nodes[current + 1].position - nodes[current].position) * uniforms.dl_inv) - d3; //  (LF)
-    edges[current].reference_strain = reference_strain;
-    edges[future].reference_strain = reference_strain;
+    let d3 = tangent(edges[current].orientation); // (LF)
 
-    let reference_curvature = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
-    nodes[current].reference_curvature = reference_curvature;
-    nodes[future].reference_curvature = reference_curvature;
+    if (global_id.x < uniforms.node_count - 1) {
+        let reference_strain =  rotate_inv(edges[current].orientation, ((nodes[current + 1].position - nodes[current].position) * uniforms.dl_inv) - d3); //  (MF)
+        edges[current].reference_strain = reference_strain;
+        edges[future].reference_strain = reference_strain;
+
+        var reference_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
+        if (reference_orientation.w < 0.0) {
+            reference_orientation = -reference_orientation;
+        }
+        nodes[current].reference_orientation = reference_orientation;
+        nodes[future].reference_orientation = reference_orientation;
+    }
 }
 
 @compute
@@ -105,7 +112,7 @@ fn create_reference(@builtin(global_invocation_id) global_id: vec3<u32>) {
 fn compute_length(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + global_id.x;
 
-    // only run this segment on edges
+    // Only run this segment on edges
     if (global_id.x < uniforms.node_count - 1) {
         let r = (nodes[current+1].position - nodes[current].position);
         edges[current].len_inv = inverseSqrt(dot(r,r));
@@ -118,29 +125,41 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + global_id.x;
     let future = (c.future * uniforms.node_count) + global_id.x;
 
-    let dilatation_inv = uniforms.dl * edges[current].len_inv;
     
-    // Only run this on vertices that have an edge attached
-    if (global_id.x < uniforms.node_count - 2u) {
+    // Only run this segment on edges
+    if (global_id.x < uniforms.node_count - 1) {
+        let dilatation_inv = uniforms.dl * edges[current].len_inv;
         let d3 = tangent(edges[current].orientation); // (LF)
-        let sigma_eff = (((nodes[current + 1].position - nodes[current].position) * uniforms.dl_inv) - d3) - edges[current].reference_strain; //  (LF)
-        edges[current].internal_force = rotate(edges[current].orientation, (uniforms.stiffness_se * rotate_inv(edges[current].orientation, sigma_eff))) * dilatation_inv ; // (MF)
+        let current_strain_LF = ((nodes[current + 1].position - nodes[current].position) * uniforms.dl_inv) - d3;
+        let current_strain_MF = rotate_inv(edges[current].orientation, current_strain_LF);
+
+        let sigma_eff = current_strain_MF - edges[current].reference_strain; // (MF)
+        edges[current].internal_force = rotate(edges[current].orientation, (uniforms.stiffness_se * sigma_eff * dilatation_inv)) ; // (LF)
+        edges[future].dilation = 1.0 / dilatation_inv;
     }
+
+    if (global_id.x < uniforms.node_count - 2) {
+        // NB: The paper chooses its indexing in a way that makes this somewhat weird. nodes[i] stores the average
+        // curvature whose integral is rotation needed to from edges[i].orientation to edges[i+1].orientation.
+        // Therefore this convention causes the i-th region to contain node i+1. This must be accounted for when
+        // defining the descrete difference/average operators (i.e. here one must use backwards differences)!
     
-    var relative_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
-    if (dot(relative_orientation, nodes[current].reference_curvature) < 0.0) {
-        relative_orientation = -relative_orientation;
+        var relative_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
+
+        // Select closest quaternion pole
+        if (dot(relative_orientation, nodes[current].reference_orientation) < 0.0) {
+            relative_orientation = -relative_orientation;
+        }
+
+        let effective_orientation = qmul(qinv(nodes[current].reference_orientation), relative_orientation); // (MF)
+
+        let epsilon_inv = ((edges[current].len_inv * edges[current+1].len_inv) / (edges[current].len_inv + edges[current+1].len_inv)) * uniforms.dl * 2.0;
+
+        // This is B applied to kappa (MF); here B is diagonal -> pointwise multiplication
+        let kappa = 2.0 * uniforms.dl_inv * effective_orientation.xyz;
+        nodes[current].curvature = kappa;
+        nodes[current].internal_moment = uniforms.stiffness_bt * kappa * epsilon_inv * epsilon_inv * epsilon_inv;
     }
-
-    let effective_orientation = qmul(qinv(nodes[current].reference_curvature), relative_orientation); // (MF)
-
-
-    let epsilon_inv = (edges[current].len_inv * edges[current+1].len_inv) / (edges[current].len_inv + edges[current+1].len_inv) * uniforms.dl * 2.0;
-    let kappa = 2.0 * uniforms.dl_inv * effective_orientation.xyz;
-    // This is B applied to kappa (MF); here B is diagonal -> pointwise multiplication
-    nodes[current].curvature = kappa;
-    nodes[current].internal_moment = uniforms.stiffness_bt * kappa * epsilon_inv * epsilon_inv * epsilon_inv;
-    edges[future].dilation = 1.0 / dilatation_inv;
 }
 
 
@@ -150,40 +169,60 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + global_id.x;
     let future = (c.future * uniforms.node_count) + global_id.x;
 
-    let ext_force = vec3<f32>(0.0, 0.0, 0.0);
-    // Only calculate for interior edges, so naive difference operator is fine here!
-    let v_tt = (edges[current].internal_force - edges[current- 1].internal_force + ext_force) * uniforms.mass_inv;
-
-    let average = 0.5 * uniforms.dl * (cross(nodes[current].curvature, nodes[current].internal_moment) + cross(nodes[current+1].curvature, nodes[current+1].internal_moment));
-    let tangent_MF = rotate_inv(edges[current].orientation, (nodes[current+1].position - nodes[current].position) * edges[current].len_inv);
-    let dilatation_inv = uniforms.dl * edges[current].len_inv;
-    let dilation_t = (edges[future].dilation - edges[current].dilation) * uniforms.dt_inv;
-
-    let ext_couple = vec3<f32>(0.0, 0.0, 0.0);
-    var difference: vec3<f32>;
-    if (global_id.x == 0) {
-        difference = nodes[current].internal_moment;
-    } else if (global_id.x == uniforms.node_count - 2) {
-        difference = - nodes[current].internal_moment;
-    } else {
-        difference = nodes[current].internal_moment - nodes[current- 1].internal_moment;
+    // Interior nodes
+    if (global_id.x > 0 && global_id.x < uniforms.node_count - 1) {
+        let ext_force = vec3<f32>(0.0, 0.0, 0.0);
+        let damping_force = - 0.01 * nodes[current].velocity;
+        
+        // Only calculate for interior edges, so naive difference operator is fine here!
+        let v_tt = (edges[current].internal_force - edges[current- 1].internal_force + ext_force + damping_force) * uniforms.mass_inv;
+        nodes[future].velocity = nodes[current].velocity + (v_tt * uniforms.dt);
+        nodes[future].position = nodes[current].position + (nodes[future].velocity * uniforms.dt);
     }
 
     
-    let phi_tt = ( difference
-                        + average
-                        + (cross(tangent_MF, edges[current].internal_force) * uniforms.dl)
-                        + cross((uniforms.inertia * edges[current].angular_velocity * dilatation_inv), edges[current].angular_velocity) 
-                        + uniforms.inertia * edges[current].angular_velocity * dilatation_inv * dilation_t
-                        + ext_couple
-                        ) * uniforms.inertia_inv;
+    if (global_id.x < uniforms.node_count - 1) {
+        
+        let tangent_MF = rotate_inv(edges[current].orientation, (nodes[current+1].position - nodes[current].position) * edges[current].len_inv);
+        let dilatation_inv = uniforms.dl * edges[current].len_inv;
+        let dilation_t = (edges[future].dilation - edges[current].dilation) * uniforms.dt_inv;
 
-    nodes[future].velocity = nodes[current].velocity + (v_tt * uniforms.dt);
-    nodes[future].position = nodes[current].position + (nodes[future].velocity * uniforms.dt);
+        let ext_couple = vec3<f32>(0.0, 0.0, 0.0);
+        let damping_torque = - 0.01 * edges[current].angular_velocity;
 
-    edges[future].angular_velocity = edges[current].angular_velocity + (phi_tt * uniforms.dt);
-    let dq = 0.5 * qmul(edges[current].orientation, vec4<f32>(edges[future].angular_velocity, 0.0));
-    edges[future].orientation = normalize(edges[current].orientation + dq * uniforms.dt);
+        var difference: vec3<f32>;
+        var average: vec3<f32>;
+        if (global_id.x == 0) {
+            difference = nodes[current].internal_moment;
+            average = 0.5 * uniforms.dl * cross(nodes[current].curvature, nodes[current].internal_moment);
+        } else if (global_id.x == uniforms.node_count - 2) {
+            difference = - nodes[current].internal_moment;
+            average = 0.5 * uniforms.dl * cross(nodes[current- 1].curvature, nodes[current- 1].internal_moment);
+        } else {
+            difference = nodes[current].internal_moment - nodes[current- 1].internal_moment;
+            average = 0.5 * uniforms.dl * (cross(nodes[current].curvature, nodes[current].internal_moment) + cross(nodes[current- 1].curvature, nodes[current- 1].internal_moment));
+        }
+
+    
+        let phi_tt = ( difference
+                            + average
+                            + (cross(tangent_MF, edges[current].internal_force) * uniforms.dl)
+                            + cross((uniforms.inertia * edges[current].angular_velocity * dilatation_inv), edges[current].angular_velocity) 
+                            + uniforms.inertia * edges[current].angular_velocity * dilatation_inv * dilation_t
+                            + ext_couple
+                            + damping_torque
+                            ) * uniforms.inertia_inv;
+
+
+        edges[future].angular_velocity = edges[current].angular_velocity + (phi_tt * uniforms.dt);
+        let dq = 0.5 * qmul(edges[current].orientation, vec4<f32>(edges[future].angular_velocity, 0.0));
+        edges[future].orientation = fast_normalize(edges[current].orientation + dq * uniforms.dt);
+        // Safety: make sure future orientation selects pole closest to current orientation
+        if (dot(edges[future].orientation, edges[current].orientation) < 0.0) {
+            edges[future].orientation = -edges[future].orientation;
+        }
+
+    }
 }
 
 @compute

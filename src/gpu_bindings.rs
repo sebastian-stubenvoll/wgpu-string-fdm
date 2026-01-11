@@ -12,10 +12,9 @@ pub struct Node {
     _pad1: u32,
     curavture: [f32; 3],
     _pad2: u32,
-    reference_curvature: [f32; 3],
-    _pad3: u32,
+    reference_curvature: [f32; 4],
     internal_moment: [f32; 3],
-    _pad4: u32,
+    _pad3: u32,
 }
 
 impl Node {
@@ -27,10 +26,9 @@ impl Node {
             _pad1: 0,
             curavture: [0.0; 3],
             _pad2: 0,
-            reference_curvature: [0.0; 3],
-            _pad3: 0,
+            reference_curvature: [0.0; 4],
             internal_moment: [0.0; 3],
-            _pad4: 0,
+            _pad3: 0,
         }
     }
 
@@ -119,7 +117,7 @@ impl FDMUniform {
         );
         assert!(chunk_size > 0);
         assert!(dt > 0.0);
-        assert!(dx > 0.0);
+        assert!(dl > 0.0);
         assert!(mass > 0.0);
         assert!(stiffness_se.iter().any(|s| *s > 0.0));
         assert!(stiffness_bt.iter().any(|s| *s > 0.0));
@@ -183,9 +181,9 @@ pub struct State {
     edges_buffer_size: wgpu::BufferAddress,
     compute_bind_group: wgpu::BindGroup,
     create_reference_pipeline: wgpu::ComputePipeline,
+    compute_length_pipeline: wgpu::ComputePipeline,
     compute_internals_pipeline: wgpu::ComputePipeline,
     compute_forces_pipeline: wgpu::ComputePipeline,
-    integrate_pipeline: wgpu::ComputePipeline,
     output_pipeline: wgpu::ComputePipeline,
     device: wgpu::Device,
     fdm_uniform: FDMUniform,
@@ -418,6 +416,15 @@ impl State {
                 }],
             });
 
+        let compute_length_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &shader,
+                entry_point: "compute_length",
+                compilation_options: Default::default(),
+            });
+
         let create_reference_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Compute Pipeline"),
@@ -445,14 +452,6 @@ impl State {
                 compilation_options: Default::default(),
             });
 
-        let integrate_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Compute Pipeline"),
-            layout: Some(&compute_pipeline_layout),
-            module: &shader,
-            entry_point: "integrate",
-            compilation_options: Default::default(),
-        });
-
         let output_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Compute Pipeline"),
             layout: Some(&compute_pipeline_layout),
@@ -475,9 +474,9 @@ impl State {
             edges_staging_buffer,
             push_constants,
             create_reference_pipeline,
+            compute_length_pipeline,
             compute_internals_pipeline,
             compute_forces_pipeline,
-            integrate_pipeline,
             output_pipeline,
             nodes_buffer_size,
             edges_buffer_size,
@@ -487,7 +486,7 @@ impl State {
     }
 
     pub fn initialize(&mut self, vel: f32, steps: usize) -> Result<(), Box<dyn Error>> {
-        println!("Calling init!");
+        println!("Initializing simulation!");
         let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
 
         for _ in 0..steps {
@@ -535,6 +534,18 @@ impl State {
                             timestamp_writes: None,
                         });
                     compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                    compute_pass.set_pipeline(&self.compute_length_pipeline);
+                    compute_pass
+                        .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                    compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+                }
+                {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Compute Pass"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
                     compute_pass.set_pipeline(&self.compute_internals_pipeline);
                     compute_pass
                         .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
@@ -548,18 +559,6 @@ impl State {
                         });
                     compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
                     compute_pass.set_pipeline(&self.compute_forces_pipeline);
-                    compute_pass
-                        .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
-                    compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-                }
-                {
-                    let mut compute_pass =
-                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("Compute Pass"),
-                            timestamp_writes: None,
-                        });
-                    compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                    compute_pass.set_pipeline(&self.integrate_pipeline);
                     compute_pass
                         .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
                     compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
