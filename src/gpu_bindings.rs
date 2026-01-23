@@ -68,10 +68,7 @@ impl Edge {
     }
 
     pub fn to_raw(self) -> ([f32; 4], [[f32; 3]; 2]) {
-        (
-            self.orientation,
-            [self.angular_velocity, self.internal_force],
-        )
+        (self.orientation, [self.strain, self.internal_force])
     }
 }
 
@@ -181,7 +178,7 @@ pub struct State {
     edges_buffer_size: wgpu::BufferAddress,
     compute_bind_group: wgpu::BindGroup,
     create_reference_pipeline: wgpu::ComputePipeline,
-    compute_length_pipeline: wgpu::ComputePipeline,
+    half_step_pipeline: wgpu::ComputePipeline,
     compute_internals_pipeline: wgpu::ComputePipeline,
     compute_forces_pipeline: wgpu::ComputePipeline,
     output_pipeline: wgpu::ComputePipeline,
@@ -416,15 +413,6 @@ impl State {
                 }],
             });
 
-        let compute_length_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Compute Pipeline"),
-                layout: Some(&compute_pipeline_layout),
-                module: &shader,
-                entry_point: "compute_length",
-                compilation_options: Default::default(),
-            });
-
         let create_reference_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Compute Pipeline"),
@@ -433,6 +421,14 @@ impl State {
                 entry_point: "create_reference",
                 compilation_options: Default::default(),
             });
+
+        let half_step_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Compute Pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "half_step",
+            compilation_options: Default::default(),
+        });
 
         let compute_internals_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -474,7 +470,7 @@ impl State {
             edges_staging_buffer,
             push_constants,
             create_reference_pipeline,
-            compute_length_pipeline,
+            half_step_pipeline,
             compute_internals_pipeline,
             compute_forces_pipeline,
             output_pipeline,
@@ -534,7 +530,7 @@ impl State {
                             timestamp_writes: None,
                         });
                     compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                    compute_pass.set_pipeline(&self.compute_length_pipeline);
+                    compute_pass.set_pipeline(&self.half_step_pipeline);
                     compute_pass
                         .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
                     compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
