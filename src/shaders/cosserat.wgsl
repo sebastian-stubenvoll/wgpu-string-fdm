@@ -93,11 +93,13 @@ fn create_reference(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
 
     if (global_id.x < uniforms.node_count - 1) {
-        // The calculated reference strain is multiplied by (1, 1, 0) (material frame coordinates).
-        // i.e. the reference configuration should not have any axial stress / extension
-        let reference_strain =  (rotate_inv(edges[current].orientation, ((nodes[current + 1].position - nodes[current].position) * uniforms.dl_inv)) - vec3<f32>(0,0,1)); //  (MF)
-        edges[current].reference_strain = reference_strain;
-        edges[future].reference_strain = reference_strain;
+        // This must match the strain calculation performed when calculating internal forces!
+        // Otherwise numerical inaccuracies inject energy into the system!
+        let tangent_LF = (nodes[current + 1].position - nodes[current].position) * uniforms.dl_inv;
+        let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
+        let current_strain_MF = tangent_MF - vec3<f32>(0.0, 0.0, 1.0);
+        edges[current].reference_strain = current_strain_MF;
+        edges[future].reference_strain = current_strain_MF;
 
         var reference_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
         nodes[current].reference_orientation = reference_orientation;
