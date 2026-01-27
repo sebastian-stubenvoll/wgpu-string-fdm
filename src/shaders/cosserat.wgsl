@@ -97,13 +97,16 @@ fn create_reference(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // Otherwise numerical inaccuracies inject energy into the system!
         let tangent_LF = (nodes[current + 1].position - nodes[current].position) * uniforms.dl_inv;
         let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
-        let current_strain_MF = tangent_MF - vec3<f32>(0.0, 0.0, 1.0);
+        var current_strain_MF = tangent_MF - vec3<f32>(0.0, 0.0, 1.0);
+        current_strain_MF.z = 0.0;
         edges[current].reference_strain = current_strain_MF;
         edges[future].reference_strain = current_strain_MF;
 
         var reference_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
-        nodes[current].reference_orientation = reference_orientation;
-        nodes[future].reference_orientation = reference_orientation;
+        // nodes[current].reference_orientation = reference_orientation;
+        // nodes[future].reference_orientation = reference_orientation;
+        nodes[current].reference_orientation = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        nodes[future].reference_orientation = vec4<f32>(0.0, 0.0, 0.0, 1.0);
 
         // Finally initialize the dilatations
         let dilatation = length(nodes[current+1].position - nodes[current].position) * uniforms.dl_inv;
@@ -198,7 +201,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Interior nodes
     if (global_id.x > 0 && global_id.x < uniforms.node_count - 1) {
         let ext_force = vec3<f32>(0.0, 0.0, 0.0);
-        let damping_force = - 0.01 * nodes[current].velocity;
+        let damping_force = - 0.0001 * nodes[current].velocity;
         
         // Only calculate for interior edges, so naive difference operator is fine here!
         let v_tt = (edges[current].internal_force - edges[current- 1].internal_force + ext_force + damping_force) * uniforms.mass_inv;
@@ -212,14 +215,14 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     
-    if (global_id.x < uniforms.node_count - 1) {
+    if (global_id.x > 0 && global_id.x < uniforms.node_count - 2) {
         
         let tangent_MF = rotate_inv(edges[current].orientation, (nodes[current+1].position - nodes[current].position) * edges[current].len_inv);
         let dilatation_inv = uniforms.dl * edges[current].len_inv;
         let dilatation_t= (edges[future].dilatation - edges[current].dilatation) * uniforms.dt_inv;
 
         let ext_couple = vec3<f32>(0.0, 0.0, 0.0);
-        let damping_torque = - 0.01 * edges[current].angular_velocity;
+        let damping_torque = - 0.0001 * edges[current].angular_velocity;
 
         var difference: vec3<f32>;
         var average: vec3<f32>;
