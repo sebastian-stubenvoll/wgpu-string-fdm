@@ -10,7 +10,7 @@ pub struct Node {
     _pad0: u32,
     velocity: [f32; 3],
     _pad1: u32,
-    curavture: [f32; 3],
+    curvature: [f32; 3],
     _pad2: u32,
     reference_curvature: [f32; 4],
     internal_moment: [f32; 3],
@@ -24,7 +24,7 @@ impl Node {
             _pad0: 0,
             velocity: *velocity,
             _pad1: 0,
-            curavture: [0.0; 3],
+            curvature: [0.0; 3],
             _pad2: 0,
             reference_curvature: [0.0; 4],
             internal_moment: [0.0; 3],
@@ -32,8 +32,13 @@ impl Node {
         }
     }
 
-    pub fn to_raw(self) -> [[f32; 3]; 3] {
-        [self.position, self.velocity, self.internal_moment]
+    pub fn to_raw(self) -> [[f32; 3]; 4] {
+        [
+            self.position,
+            self.velocity,
+            self.internal_moment,
+            self.curvature,
+        ]
     }
 }
 
@@ -67,8 +72,11 @@ impl Edge {
         }
     }
 
-    pub fn to_raw(self) -> ([f32; 4], [[f32; 3]; 2]) {
-        (self.orientation, [self.strain, self.internal_force])
+    pub fn to_raw(self) -> ([f32; 4], [[f32; 3]; 3]) {
+        (
+            self.orientation,
+            [self.angular_velocity, self.internal_force, self.strain],
+        )
     }
 }
 
@@ -85,7 +93,7 @@ pub struct FDMUniform {
     dl: f32,
     dl_inv: f32,
     stiffness_se: [f32; 3],
-    _pad0: u32,
+    clamp_offset: u32,
     stiffness_bt: [f32; 3],
     _pad1: u32,
     inertia: [f32; 3],
@@ -105,6 +113,7 @@ impl FDMUniform {
         stiffness_se: &[f32; 3],
         stiffness_bt: &[f32; 3],
         intertia: &[f32; 3],
+        clamp_offset: u32,
     ) -> Self {
         assert!(!edges.is_empty());
         assert_eq!(
@@ -130,7 +139,7 @@ impl FDMUniform {
             dl,
             dl_inv: 1.0 / dl,
             stiffness_se: *stiffness_se,
-            _pad0: 0,
+            clamp_offset: 0,
             stiffness_bt: *stiffness_bt,
             _pad1: 0,
             inertia: *intertia,
@@ -147,7 +156,7 @@ struct PushConstants {
     current_index: u32,
     future_index: u32,
     output_index: u32,
-    _pad1: u32,
+    pad0: u32,
 }
 
 #[derive(Debug)]
@@ -316,7 +325,7 @@ impl State {
             current_index: 0,
             future_index: 1,
             output_index: 0,
-            _pad1: 0,
+            pad0: 0,
         };
 
         let compute_bind_group_layout =

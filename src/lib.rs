@@ -28,6 +28,7 @@ mod py_wgpu_fdm {
             stiffness_se: [f32; 3],
             stiffness_bt: [f32; 3],
             inertia: [f32; 3],
+            clamp_offset: u32,
         ) -> PyResult<Self> {
             let nodes: Vec<gpu_bindings::Node> = nodes
                 .iter()
@@ -49,6 +50,7 @@ mod py_wgpu_fdm {
                 &stiffness_se,
                 &stiffness_bt,
                 &inertia,
+                clamp_offset,
             );
 
             let state = pollster::block_on(gpu_bindings::State::new(
@@ -73,7 +75,7 @@ mod py_wgpu_fdm {
 
         fn save(
             &mut self,
-        ) -> PyResult<(Vec<Vec<[[f32; 3]; 3]>>, Vec<Vec<([f32; 4], [[f32; 3]; 2])>>)> {
+        ) -> PyResult<(Vec<Vec<[[f32; 3]; 4]>>, Vec<Vec<([f32; 4], [[f32; 3]; 3])>>)> {
             let (node_frames, edge_frames) = self
                 .state
                 .save()
@@ -85,7 +87,7 @@ mod py_wgpu_fdm {
                     nodes
                         .into_iter()
                         .map(gpu_bindings::Node::to_raw)
-                        .collect::<Vec<[[f32; 3]; 3]>>()
+                        .collect::<Vec<[[f32; 3]; 4]>>()
                 })
                 .collect();
 
@@ -95,7 +97,7 @@ mod py_wgpu_fdm {
                     edges
                         .into_iter()
                         .map(gpu_bindings::Edge::to_raw)
-                        .collect::<Vec<([f32; 4], [[f32; 3]; 2])>>()
+                        .collect::<Vec<([f32; 4], [[f32; 3]; 3])>>()
                 })
                 .collect();
 
