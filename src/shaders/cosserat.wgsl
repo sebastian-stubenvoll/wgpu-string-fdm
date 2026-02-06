@@ -123,7 +123,7 @@ fn half_step(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Half step position update (drift)
     if (global_id.x > 0 && global_id.x < uniforms.node_count - 2) {
         let dq = 0.5 * qmul(edges[current].orientation, vec4<f32>(edges[current].angular_velocity, 0.0));
-        var update = fast_normalize(edges[current].orientation + dq * uniforms.dt * 0.5);
+        var update = integrate_exponential(edges[current].orientation, edges[current].angular_velocity, uniforms.dt * 0.5);
         // Safety: make sure future orientation selects pole closest to current orientation
         if (dot(update, edges[current].orientation) < 0.0) {
             update = -update;
@@ -252,8 +252,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // Full step velocity update (kick)
         edges[future].angular_velocity = edges[current].angular_velocity + (phi_tt * uniforms.dt);
         // Half step position update (drift)
-        let dq = 0.5 * qmul(edges[current].orientation, vec4<f32>(edges[future].angular_velocity, 0.0));
-        var update = fast_normalize(edges[current].orientation + dq * uniforms.dt * 0.5);
+        var update = integrate_exponential(edges[current].orientation, edges[future].angular_velocity, uniforms.dt * 0.5);
         // Safety: make sure future orientation selects pole closest to current orientation
         if (dot(update, edges[current].orientation) < 0.0) {
             update = -update;
@@ -319,3 +318,21 @@ fn fast_normalize(q: vec4<f32>) -> vec4<f32> {
     return q * inverseSqrt(dot(q,q));
 }
 
+fn integrate_exponential(q: vec4<f32>, omega: vec3<f32>, dt: f32) -> vec4<f32> {
+    let theta_vec = omega * dt;
+    let theta_mag = length(theta_vec);
+    
+    var dq: vec4<f32>;
+    
+    if (theta_mag < 0.0001) {
+        dq = vec4<f32>(theta_vec * 0.5, 1.0);
+    } else {
+        let half_theta = theta_mag * 0.5;
+        let s = sin(half_theta) / theta_mag; // Pre-divide by mag to normalize theta_vec
+        dq = vec4<f32>(theta_vec * s, cos(half_theta));
+    }
+    
+    var next_q = qmul(q, dq);
+    
+    return fast_normalize(next_q);
+}
