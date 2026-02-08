@@ -19,7 +19,8 @@ mod py_wgpu_fdm {
         #[new]
         fn new(
             nodes: Vec<[[f32; 3]; 2]>,
-            edges: Vec<([f32; 4], [f32; 3])>,
+            edges: Vec<([f32; 4], [f32; 3], [f32; 3])>,
+            hammer_weights: Vec<[f32; 4]>,
             oversampling_factor: usize,
             chunk_size: u32,
             dt: f32,
@@ -37,7 +38,7 @@ mod py_wgpu_fdm {
 
             let edges: Vec<gpu_bindings::Edge> = edges
                 .iter()
-                .map(|e| gpu_bindings::Edge::new(&e.0, &e.1))
+                .map(|e| gpu_bindings::Edge::new(&e.0, &e.1, &e.2))
                 .collect();
 
             let uniforms = gpu_bindings::FDMUniform::new(
@@ -56,6 +57,7 @@ mod py_wgpu_fdm {
             let state = pollster::block_on(gpu_bindings::State::new(
                 nodes,
                 edges,
+                hammer_weights,
                 uniforms,
                 oversampling_factor,
             ));
@@ -104,8 +106,13 @@ mod py_wgpu_fdm {
             Ok((n, e))
         }
 
-        fn initialize(&mut self, force: f32, steps: usize) -> PyResult<()> {
-            _ = self.state.initialize(0.0, 1);
+        fn initialize(&mut self) -> PyResult<()> {
+            _ = self.state.initialize();
+            Ok(())
+        }
+
+        fn hammer(&mut self, steps: usize, force: f32) -> PyResult<()> {
+            _ = self.state.hammer(steps, force);
             Ok(())
         }
     }

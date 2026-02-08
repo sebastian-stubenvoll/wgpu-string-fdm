@@ -1,5 +1,5 @@
 struct Node {
-    position: vec3<f32>, // 12 bytes
+    displacement: vec3<f32>, // 12 bytes
     // 4 bytes of implicit padding
 
     velocity: vec3<f32>, // 12 bytes
@@ -21,7 +21,7 @@ struct Edge {
     orientation: vec4<f32>, // 16 bytes
 
     angular_velocity: vec3<f32>, // 12 bytes
-    len_inv: f32, // 12 bytes
+    len_inv: f32, // 4 bytes
 
     strain: vec3<f32>, // 12 bytes
     dilatation: f32, // 4 bytes; this is actually the previous dilatation.
@@ -30,6 +30,9 @@ struct Edge {
     // 4 bytes of implicit padding
 
     internal_force: vec3<f32>, // 12 bytes
+    // 4 bytes of implicit padding
+
+    reference_vector: vec3<f32>,
     // 4 bytes of implicit padding
 }
 
@@ -60,7 +63,7 @@ struct PushConstants {
     current: u32, // either 0 or 1
     future: u32,  // current == 0 ? 1 : 0
     output_index: u32,
-    pad0: u32,
+    force: f32,
 }
 
 var <push_constant> c: PushConstants;
@@ -85,6 +88,10 @@ var<storage, read_write> output_nodes: array<Node>;
 @binding(4)
 var<storage, read_write> output_edges: array<Edge>;
 
+@group(0)
+@binding(5)
+var<storage, read> hammer_weights: array<vec4<f32>>;
+
 @compute
 @workgroup_size(64) 
 fn create_reference(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -95,7 +102,8 @@ fn create_reference(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (global_id.x < uniforms.node_count - 1) {
         // This must match the strain calculation performed when calculating internal forces!
         // Otherwise numerical inaccuracies inject energy into the system!
-        let tangent_LF = (nodes[current + 1].position - nodes[current].position) * uniforms.dl_inv;
+        let r = edges[current].reference_vector + (nodes[current + 1].displacement - nodes[current].displacement);
+        let tangent_LF = r * uniforms.dl_inv;
         let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
         var current_strain_MF = tangent_MF - vec3<f32>(0.0, 0.0, 1.0);
         current_strain_MF.z = 0.0;
@@ -109,11 +117,12 @@ fn create_reference(@builtin(global_invocation_id) global_id: vec3<u32>) {
         nodes[future].reference_orientation = vec4<f32>(0.0, 0.0, 0.0, 1.0);
 
         // Finally initialize the dilatations
-        let dilatation = length(nodes[current+1].position - nodes[current].position) * uniforms.dl_inv;
+        let dilatation = length(r) * uniforms.dl_inv;
         edges[current].dilatation = dilatation;
         edges[future].dilatation = dilatation;
     }
 }
+
 
 @compute
 @workgroup_size(64) 
@@ -133,7 +142,7 @@ fn half_step(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     if (global_id.x > 0 && global_id.x < uniforms.node_count - 1) {
-        nodes[current].position = nodes[current].position + (nodes[current].velocity * uniforms.dt * 0.5);
+        nodes[current].displacement = nodes[current].displacement + (nodes[current].velocity * uniforms.dt * 0.5);
     }
 }
 
@@ -144,34 +153,32 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let future = (c.future * uniforms.node_count) + global_id.x;
     var len_inv: f32;
 
-    // Only run this segment on edges
     if (global_id.x < uniforms.node_count - 1) {
-        let r = (nodes[current+1].position - nodes[current].position);
-        len_inv = inverseSqrt(dot(r,r));
+
+        let r = edges[current].reference_vector + (nodes[current + 1].displacement - nodes[current].displacement);
+        let tangent_LF = r * uniforms.dl_inv;
+        let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
+
+        var current_strain_MF = tangent_MF - vec3<f32>(0.0, 0.0, 1.0);
+        len_inv = 1.0 / length(r);
         edges[current].len_inv = len_inv;
 
         let dilatation_inv = uniforms.dl * len_inv;
 
-
-        let tangent_LF = (nodes[current + 1].position - nodes[current].position) * uniforms.dl_inv;
-        let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
-        let current_strain_MF = tangent_MF - vec3<f32>(0.0, 0.0, 1.0);
-
-        
         let sigma_eff = current_strain_MF - edges[current].reference_strain; // (MF)
         edges[future].strain = sigma_eff;
         edges[current].internal_force = rotate(edges[current].orientation, (uniforms.stiffness_se * sigma_eff * dilatation_inv)) ; // (LF)
         edges[future].dilatation = 1.0 / dilatation_inv;
     }
 
-    if (global_id.x < uniforms.node_count - 2) {
+    if ( global_id.x < uniforms.node_count - 2) {
         // NB: The paper chooses its indexing in a way that makes this somewhat weird. nodes[i] stores the average
         // curvature whose integral is rotation needed to from edges[i].orientation to edges[i+1].orientation.
         // Therefore this convention causes the i-th region to contain node i+1. This must be accounted for when
         // defining the descrete difference/average operators (i.e. here one must use backwards differences)!
         
-        let r = nodes[current+2].position - nodes[current+1].position;
-        let next_len_inv = inverseSqrt(dot(r,r));
+        let r = edges[current+1].reference_vector + (nodes[current + 2].displacement - nodes[current + 1].displacement);
+        let next_len_inv = 1.0 / length(r);
     
         var relative_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
 
@@ -180,7 +187,8 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
             relative_orientation = -relative_orientation;
         }
 
-        let effective_orientation = qmul(qinv(nodes[current].reference_orientation), relative_orientation); // (MF)
+        var effective_orientation = qmul(qinv(nodes[current].reference_orientation), relative_orientation); // (MF)
+        // if (effective_orientation.w < 0.0) { effective_orientation = -effective_orientation; }
 
         let epsilon_inv = ((len_inv * next_len_inv) / (len_inv + next_len_inv)) * uniforms.dl * 2.0;
 
@@ -200,16 +208,16 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Interior nodes
     if (global_id.x > 0 && global_id.x < uniforms.node_count - 1) {
-        let ext_force = vec3<f32>(0.0, 0.0, 0.0);
-        let damping_force = - 0.0001 * nodes[current].velocity;
+        let ext_force = hammer_weights[global_id.x].xyz * c.force;
+        let damping_force = - 0.000000001* nodes[current].velocity;
         
         // Only calculate for interior edges, so naive difference operator is fine here!
-        let v_tt = (edges[current].internal_force - edges[current- 1].internal_force + ext_force + damping_force) * uniforms.mass_inv;
+        let v_tt = (edges[current].internal_force - edges[current- 1].internal_force + ext_force + damping_force) * vec3<f32>(0.1, 1.0, 1.0) * uniforms.mass_inv;
 
         // Full step velocity update (kick)
         nodes[future].velocity = nodes[current].velocity + (v_tt * uniforms.dt);
         // Half step position update (drift)
-        nodes[future].position = nodes[current].position + (nodes[future].velocity * uniforms.dt * 0.5);
+        nodes[future].displacement = nodes[current].displacement + (nodes[future].velocity * uniforms.dt * 0.5);
     } else {
         nodes[future].velocity = vec3<f32>(0.0);
     }
@@ -217,12 +225,14 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     
     if (global_id.x > 0 && global_id.x < uniforms.node_count - 2) {
         
-        let tangent_MF = rotate_inv(edges[current].orientation, (nodes[current+1].position - nodes[current].position) * edges[current].len_inv);
+        let r = edges[current].reference_vector + (nodes[current + 1].displacement - nodes[current].displacement);
+        let tangent_LF = r * uniforms.dl_inv;
+        let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
         let dilatation_inv = uniforms.dl * edges[current].len_inv;
         let dilatation_t= (edges[future].dilatation - edges[current].dilatation) * uniforms.dt_inv;
 
         let ext_couple = vec3<f32>(0.0, 0.0, 0.0);
-        let damping_torque = - 0.0001 * edges[current].angular_velocity;
+        let damping_torque = - 0.000000001 * edges[current].angular_velocity;
 
         var difference: vec3<f32>;
         var average: vec3<f32>;
@@ -304,20 +314,6 @@ fn rotate_inv(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
     return rotated.xyz;
 }
 
-fn tangent(q: vec4<f32>) -> vec3<f32> {
-    let d3 = vec3<f32>(
-        2 * (q.x * q.z + q.w * q.y),
-        2 * (q.y * q.z - q.w * q.x),
-        1 - 2 * (q.x * q.x + q.y * q.y)
-    );
-
-    return normalize(d3);
-}
-
-fn fast_normalize(q: vec4<f32>) -> vec4<f32> {
-    return q * inverseSqrt(dot(q,q));
-}
-
 fn integrate_exponential(q: vec4<f32>, omega: vec3<f32>, dt: f32) -> vec4<f32> {
     let theta_vec = omega * dt;
     let theta_mag = length(theta_vec);
@@ -334,5 +330,5 @@ fn integrate_exponential(q: vec4<f32>, omega: vec3<f32>, dt: f32) -> vec4<f32> {
     
     var next_q = qmul(q, dq);
     
-    return fast_normalize(next_q);
+    return normalize(next_q);
 }
