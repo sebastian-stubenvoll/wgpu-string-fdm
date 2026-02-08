@@ -18,7 +18,7 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new(position: &[f32; 3], velocity: &[f32; 3]) -> Self {
+    pub fn new(position: &[f32; 3], velocity: &[f32; 3], reference_curvature: &[f32; 4]) -> Self {
         Self {
             position: *position,
             _pad0: 0,
@@ -26,7 +26,7 @@ impl Node {
             _pad1: 0,
             curvature: [0.0; 3],
             _pad2: 0,
-            reference_curvature: [0.0; 4],
+            reference_curvature: *reference_curvature,
             internal_moment: [0.0; 3],
             _pad3: 0,
         }
@@ -64,6 +64,7 @@ impl Edge {
         orientation: &[f32; 4],
         reference_vector: &[f32; 3],
         angular_velocity: &[f32; 3],
+        reference_strain: &[f32; 3],
     ) -> Self {
         Self {
             orientation: *orientation,
@@ -71,7 +72,7 @@ impl Edge {
             len_inv: 0.0,
             strain: [0.0; 3],
             dilation: 0.0,
-            reference_strain: [0.0; 3],
+            reference_strain: *reference_strain,
             _pad0: 0,
             internal_force: [0.0; 3],
             _pad1: 0,

@@ -97,26 +97,9 @@ var<storage, read> hammer_weights: array<vec4<f32>>;
 fn create_reference(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + global_id.x;
     let future = (c.future * uniforms.node_count) + global_id.x;
-
-
     if (global_id.x < uniforms.node_count - 1) {
-        // This must match the strain calculation performed when calculating internal forces!
-        // Otherwise numerical inaccuracies inject energy into the system!
         let r = edges[current].reference_vector + (nodes[current + 1].displacement - nodes[current].displacement);
-        let tangent_LF = r * uniforms.dl_inv;
-        let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
-        var current_strain_MF = tangent_MF - vec3<f32>(0.0, 0.0, 1.0);
-        current_strain_MF.z = 0.0;
-        edges[current].reference_strain = current_strain_MF;
-        edges[future].reference_strain = current_strain_MF;
 
-        var reference_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
-        // nodes[current].reference_orientation = reference_orientation;
-        // nodes[future].reference_orientation = reference_orientation;
-        nodes[current].reference_orientation = vec4<f32>(0.0, 0.0, 0.0, 1.0);
-        nodes[future].reference_orientation = vec4<f32>(0.0, 0.0, 0.0, 1.0);
-
-        // Finally initialize the dilatations
         let dilatation = length(r) * uniforms.dl_inv;
         edges[current].dilatation = dilatation;
         edges[future].dilatation = dilatation;
