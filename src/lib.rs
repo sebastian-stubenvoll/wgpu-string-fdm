@@ -18,32 +18,46 @@ mod py_wgpu_fdm {
     impl Simulation {
         #[new]
         fn new(
-            nodes: Vec<[[f32; 3]; 4]>,
+            nodes: Vec<([f32; 3], [f32; 3], [f32; 4])>,
+            edges: Vec<([f32; 4], [f32; 3], [f32; 3], [f32; 3])>,
+            hammer_weights: Vec<[f32; 4]>,
             oversampling_factor: usize,
-            dt: f32,
-            two_ds_inv: f32,
-            loss: f32,
-            tau: f32,
-            kappa: f32,
-            m_inv: f32,
-            dxf_t: f32,
-            beta: [f32; 3],
-            dx2_inv: f32,
-            sigma: [f32; 3],
             chunk_size: u32,
-            muk2_inv: [f32; 3],
+            dt: f32,
+            dx: f32,
+            mass: f32,
+            stiffness_se: [f32; 3],
+            stiffness_bt: [f32; 3],
+            inertia: [f32; 3],
+            clamp_offset: u32,
         ) -> PyResult<Self> {
             let nodes: Vec<gpu_bindings::Node> = nodes
                 .iter()
-                .map(|n| gpu_bindings::Node::new(n[0], n[1], n[2], n[3]))
+                .map(|n| gpu_bindings::Node::new(&n.0, &n.1, &n.2))
+                .collect();
+
+            let edges: Vec<gpu_bindings::Edge> = edges
+                .iter()
+                .map(|e| gpu_bindings::Edge::new(&e.0, &e.1, &e.2, &e.3))
                 .collect();
 
             let uniforms = gpu_bindings::FDMUniform::new(
-                dt, two_ds_inv, &nodes, loss, tau, kappa, m_inv, dxf_t, beta, dx2_inv, sigma,
-                chunk_size, muk2_inv,
+                nodes.as_slice(),
+                edges.as_slice(),
+                chunk_size,
+                dt,
+                dx,
+                mass,
+                &stiffness_se,
+                &stiffness_bt,
+                &inertia,
+                clamp_offset,
             );
+
             let state = pollster::block_on(gpu_bindings::State::new(
                 nodes,
+                edges,
+                hammer_weights,
                 uniforms,
                 oversampling_factor,
             ));
@@ -61,30 +75,45 @@ mod py_wgpu_fdm {
             self.state.compute().unwrap();
         }
 
-        fn save(&mut self) -> PyResult<Vec<Vec<[[f32; 3]; 8]>>> {
-            let frames = self
+        fn save(
+            &mut self,
+        ) -> PyResult<(Vec<Vec<[[f32; 3]; 4]>>, Vec<Vec<([f32; 4], [[f32; 3]; 3])>>)> {
+            let (node_frames, edge_frames) = self
                 .state
                 .save()
                 .map_err(|_| PyRuntimeError::new_err("error running GPU computation"))?;
 
-            Ok(frames
+            let n = node_frames
                 .into_iter()
                 .map(|nodes| {
                     nodes
                         .into_iter()
                         .map(gpu_bindings::Node::to_raw)
-                        .collect::<Vec<[[f32; 3]; 8]>>()
+                        .collect::<Vec<[[f32; 3]; 4]>>()
                 })
-                .collect())
+                .collect();
+
+            let e = edge_frames
+                .into_iter()
+                .map(|edges| {
+                    edges
+                        .into_iter()
+                        .map(gpu_bindings::Edge::to_raw)
+                        .collect::<Vec<([f32; 4], [[f32; 3]; 3])>>()
+                })
+                .collect();
+
+            Ok((n, e))
         }
 
-        fn initialize(&mut self, force: f32, steps: usize) -> PyResult<Vec<[[f32; 3]; 8]>> {
-            println!("Calling GPU binding");
-            let result = self.state.initialize(force, steps).unwrap();
-            let initial: Vec<[[f32; 3]; 8]> =
-                result.into_iter().map(gpu_bindings::Node::to_raw).collect();
+        fn initialize(&mut self) -> PyResult<()> {
+            _ = self.state.initialize();
+            Ok(())
+        }
 
-            Ok(initial)
+        fn hammer(&mut self, steps: usize, force: f32) -> PyResult<()> {
+            _ = self.state.hammer(steps, force);
+            Ok(())
         }
     }
 }

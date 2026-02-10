@@ -1,130 +1,160 @@
 #![allow(dead_code)]
 use std::{error::Error, fmt::Display, iter};
-
 use wgpu::util::DeviceExt;
+
 #[repr(C)]
-#[derive(Default, Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, encase::ShaderType)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, encase::ShaderType)]
+// Don't derive Default on purpose! Implicit initialization via Default::default() can be a footgun here!
 pub struct Node {
-    positions: [f32; 3],
-    _padding0: u32,
-    velocities: [f32; 3],
-    _padding1: u32,
-    angles: [f32; 3],
-    _padding2: u32,
-    angular_velocites: [f32; 3],
-    _padding3: u32,
-    internal_moments: [f32; 3],
-    _padding4: u32,
-    internal_forces: [f32; 3],
-    _padding5: u32,
-    helix_forces: [f32; 3],
-    _padding6: u32,
-    core_forces: [f32; 3],
-    _padding7: u32,
+    position: [f32; 3],
+    _pad0: u32,
+    velocity: [f32; 3],
+    _pad1: u32,
+    curvature: [f32; 3],
+    _pad2: u32,
+    reference_curvature: [f32; 4],
+    internal_moment: [f32; 3],
+    _pad3: u32,
 }
 
 impl Node {
-    pub fn new(
-        positions: [f32; 3],
-        velocities: [f32; 3],
-        angles: [f32; 3],
-        angular_velocites: [f32; 3],
-    ) -> Self {
+    pub fn new(position: &[f32; 3], velocity: &[f32; 3], reference_curvature: &[f32; 4]) -> Self {
         Self {
-            positions,
-            velocities,
-            angles,
-            angular_velocites,
-            internal_forces: [0.0; 3],
-            internal_moments: [0.0; 3],
-            helix_forces: [0.0; 3],
-            core_forces: [0.0; 3],
-            _padding0: 0,
-            _padding1: 0,
-            _padding2: 0,
-            _padding3: 0,
-            _padding4: 0,
-            _padding5: 0,
-            _padding6: 0,
-            _padding7: 0,
+            position: *position,
+            _pad0: 0,
+            velocity: *velocity,
+            _pad1: 0,
+            curvature: [0.0; 3],
+            _pad2: 0,
+            reference_curvature: *reference_curvature,
+            internal_moment: [0.0; 3],
+            _pad3: 0,
         }
     }
 
-    pub fn to_raw(self) -> [[f32; 3]; 8] {
+    pub fn to_raw(self) -> [[f32; 3]; 4] {
         [
-            self.positions,
-            self.velocities,
-            self.angles,
-            self.angular_velocites,
-            self.internal_forces,
-            self.internal_moments,
-            self.helix_forces,
-            self.core_forces,
+            self.position,
+            self.velocity,
+            self.internal_moment,
+            self.curvature,
         ]
     }
 }
 
 #[repr(C)]
-#[derive(Default, Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, encase::ShaderType)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, encase::ShaderType)]
+// Don't derive Default on purpose! Implicit initialization via Default::default() can be a footgun here!
+pub struct Edge {
+    orientation: [f32; 4],
+    angular_velocity: [f32; 3],
+    len_inv: f32,
+    strain: [f32; 3],
+    dilation: f32,
+    reference_strain: [f32; 3],
+    _pad0: u32,
+    internal_force: [f32; 3],
+    _pad1: u32,
+    reference_vector: [f32; 3],
+    _pad2: u32,
+}
+
+impl Edge {
+    pub fn new(
+        orientation: &[f32; 4],
+        reference_vector: &[f32; 3],
+        angular_velocity: &[f32; 3],
+        reference_strain: &[f32; 3],
+    ) -> Self {
+        Self {
+            orientation: *orientation,
+            angular_velocity: *angular_velocity,
+            len_inv: 0.0,
+            strain: [0.0; 3],
+            dilation: 0.0,
+            reference_strain: *reference_strain,
+            _pad0: 0,
+            internal_force: [0.0; 3],
+            _pad1: 0,
+            reference_vector: *reference_vector,
+            _pad2: 0,
+        }
+    }
+
+    pub fn to_raw(self) -> ([f32; 4], [[f32; 3]; 3]) {
+        (
+            self.orientation,
+            [self.angular_velocity, self.internal_force, self.strain],
+        )
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, encase::ShaderType)]
+// Don't derive Default on purpose! Implicit initialization via Default::default() can be a footgun here!
 pub struct FDMUniform {
-    dt: f32,
-    two_ds_inv: f32,
     node_count: u32,
-    loss: f32,
-
-    tau: f32,
-    kappa: f32,
-    m_inv: f32,
-    dxf_t: f32,
-
-    beta: [f32; 3],
-    dx2_inv: f32,
-
-    sigma: [f32; 3],
+    edge_count: u32,
     chunk_size: u32,
-
-    muk2_inv: [f32; 3],
-    pad: u32,
+    mass_inv: f32,
+    dt: f32,
+    dt_inv: f32,
+    dl: f32,
+    dl_inv: f32,
+    stiffness_se: [f32; 3],
+    clamp_offset: u32,
+    stiffness_bt: [f32; 3],
+    dampening: f32,
+    inertia: [f32; 3],
+    _pad2: u32,
+    inertia_inv: [f32; 3],
+    _pad3: u32,
 }
 
 impl FDMUniform {
     pub fn new(
-        dt: f32,
-        two_ds_inv: f32,
         nodes: &[Node],
-        loss: f32,
-        tau: f32,
-        kappa: f32,
-        m_inv: f32,
-        dxf_t: f32,
-        beta: [f32; 3],
-        dx2_inv: f32,
-        sigma: [f32; 3],
+        edges: &[Edge],
         chunk_size: u32,
-        muk2_inv: [f32; 3],
+        dt: f32,
+        dl: f32,
+        mass: f32,
+        stiffness_se: &[f32; 3],
+        stiffness_bt: &[f32; 3],
+        intertia: &[f32; 3],
+        clamp_offset: u32,
     ) -> Self {
-        assert!(two_ds_inv != 0.0);
-        assert!(m_inv != 0.0);
-        assert!(dx2_inv != 0.0);
-        assert!(muk2_inv.iter().all(|v| *v != 0.0));
-        assert!(beta.iter().all(|v| *v != 0.0));
-        assert!(sigma.iter().all(|v| *v != 0.0));
+        assert!(!edges.is_empty());
+        assert_eq!(
+            nodes.len(),
+            edges.len(),
+            "To simplify indexing a ghost edge must be provided!"
+        );
+        assert!(chunk_size > 0);
+        assert!(dt > 0.0);
+        assert!(dl > 0.0);
+        assert!(mass > 0.0);
+        assert!(stiffness_se.iter().any(|s| *s > 0.0));
+        assert!(stiffness_bt.iter().any(|s| *s > 0.0));
+        assert!(intertia.iter().any(|s| *s > 0.0));
 
         Self {
-            dt,
-            two_ds_inv,
             node_count: nodes.len() as u32,
-            loss,
-            tau,
-            kappa,
-            m_inv,
-            dxf_t,
-            beta,
-            dx2_inv,
+            edge_count: edges.len() as u32,
             chunk_size,
-            sigma,
-            muk2_inv,
-            pad: 0,
+            mass_inv: 1.0 / mass,
+            dt,
+            dt_inv: 1.0 / dt,
+            dl,
+            dl_inv: 1.0 / dl,
+            stiffness_se: *stiffness_se,
+            clamp_offset,
+            stiffness_bt: *stiffness_bt,
+            dampening: 0.0,
+            inertia: *intertia,
+            _pad2: 0,
+            inertia_inv: intertia.map(|i| 1.0 / i),
+            _pad3: 0,
         }
     }
 }
@@ -134,8 +164,8 @@ impl FDMUniform {
 struct PushConstants {
     current_index: u32,
     future_index: u32,
-    vel: f32,
-    output_idx: u32,
+    output_index: u32,
+    force: f32,
 }
 
 #[derive(Debug)]
@@ -162,27 +192,34 @@ impl Error for StateError {}
 
 #[allow(dead_code)]
 pub struct State {
-    buffer_size: u64,
+    nodes_buffer_size: wgpu::BufferAddress,
+    edges_buffer_size: wgpu::BufferAddress,
     compute_bind_group: wgpu::BindGroup,
-    external_force_pipeline: wgpu::ComputePipeline,
-    forces_pipeline: wgpu::ComputePipeline,
-    displacements_pipeline: wgpu::ComputePipeline,
+    create_reference_pipeline: wgpu::ComputePipeline,
+    half_step_pipeline: wgpu::ComputePipeline,
+    compute_internals_pipeline: wgpu::ComputePipeline,
+    compute_forces_pipeline: wgpu::ComputePipeline,
     output_pipeline: wgpu::ComputePipeline,
     device: wgpu::Device,
     fdm_uniform: FDMUniform,
     fdm_uniform_buffer: wgpu::Buffer,
     nodes_buffer: wgpu::Buffer,
-    output_buffer: wgpu::Buffer,
+    nodes_output_buffer: wgpu::Buffer,
+    edges_buffer: wgpu::Buffer,
+    edges_output_buffer: wgpu::Buffer,
     oversampling_factor: usize,
     push_constants: PushConstants,
     queue: wgpu::Queue,
-    staging_buffer: wgpu::Buffer,
+    nodes_staging_buffer: wgpu::Buffer,
+    edges_staging_buffer: wgpu::Buffer,
     initialized: bool,
 }
 
 impl State {
     pub async fn new(
         mut nodes_vec: Vec<Node>,
+        mut edges_vec: Vec<Edge>,
+        hammer_weights: Vec<[f32; 4]>,
         uniforms: FDMUniform,
         oversampling_factor: usize,
     ) -> Result<State, Box<dyn Error>> {
@@ -223,24 +260,30 @@ impl State {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("FDM Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/wittrick.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cosserat.wgsl").into()),
         });
-
-        //Uniform Buffers
-        let fdm_uniform = uniforms;
 
         let fdm_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("FDM Uniform Buffer"),
-            contents: bytemuck::cast_slice(&[fdm_uniform]),
+            contents: bytemuck::cast_slice(&[uniforms]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let buffer_size = (std::mem::size_of::<Node>() as u64
+        let nodes_buffer_size = (std::mem::size_of::<Node>() as u64
             * nodes_vec.len() as u64
+            * uniforms.chunk_size as u64) as wgpu::BufferAddress;
+
+        let edges_buffer_size = (std::mem::size_of::<Edge>() as u64
+            * edges_vec.len() as u64
             * uniforms.chunk_size as u64) as wgpu::BufferAddress;
 
         nodes_vec.extend_from_within(..);
         let nodes_in = nodes_vec.into_boxed_slice();
+
+        edges_vec.extend_from_within(..);
+        let edges_in = edges_vec.into_boxed_slice();
+
+        let hammer_weights_in = hammer_weights.into_boxed_slice();
 
         let nodes_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("node buffer"),
@@ -250,27 +293,57 @@ impl State {
                 | wgpu::BufferUsages::COPY_SRC,
         });
 
-        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let edges_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("edge buffer"),
+            contents: bytemuck::cast_slice(edges_in.as_ref()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let nodes_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("index buffer"),
-            size: buffer_size,
+            size: nodes_buffer_size,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
-        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let edges_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("index buffer"),
+            size: edges_buffer_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let nodes_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: buffer_size,
+            size: nodes_buffer_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
+        });
+
+        let edges_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: edges_buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let hammer_weights_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("hammer weights buffer"),
+            contents: bytemuck::cast_slice(hammer_weights_in.as_ref()),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         let push_constants = PushConstants {
             current_index: 0,
             future_index: 1,
-            vel: 1.0e-3,
-            output_idx: 0,
+            output_index: 0,
+            force: 0.0,
         };
 
         let compute_bind_group_layout =
@@ -306,6 +379,36 @@ impl State {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
                 label: Some("Compute Bind Group Layout"),
             });
@@ -323,7 +426,19 @@ impl State {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: output_buffer.as_entire_binding(),
+                    resource: edges_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: nodes_output_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: edges_output_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: hammer_weights_buffer.as_entire_binding(),
                 },
             ],
             label: Some("Compute Bind Group Layout"),
@@ -339,29 +454,38 @@ impl State {
                 }],
             });
 
-        let external_force_pipeline =
+        let create_reference_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Compute Pipeline"),
                 layout: Some(&compute_pipeline_layout),
                 module: &shader,
-                entry_point: "external_force",
+                entry_point: "create_reference",
                 compilation_options: Default::default(),
             });
 
-        let forces_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let half_step_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Compute Pipeline"),
             layout: Some(&compute_pipeline_layout),
             module: &shader,
-            entry_point: "calculate_internal_forces",
+            entry_point: "half_step",
             compilation_options: Default::default(),
         });
 
-        let displacements_pipeline =
+        let compute_internals_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Compute Pipeline"),
                 layout: Some(&compute_pipeline_layout),
                 module: &shader,
-                entry_point: "calculate_displacements",
+                entry_point: "compute_internals",
+                compilation_options: Default::default(),
+            });
+
+        let compute_forces_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &shader,
+                entry_point: "compute_forces",
                 compilation_options: Default::default(),
             });
 
@@ -376,74 +500,31 @@ impl State {
         Ok(Self {
             device,
             queue,
-            fdm_uniform,
+            fdm_uniform: uniforms,
             fdm_uniform_buffer,
             compute_bind_group,
             nodes_buffer,
-            output_buffer,
-            staging_buffer,
+            edges_buffer,
+            edges_output_buffer,
+            nodes_output_buffer,
+            nodes_staging_buffer,
+            edges_staging_buffer,
             push_constants,
-            external_force_pipeline,
-            forces_pipeline,
-            displacements_pipeline,
+            create_reference_pipeline,
+            half_step_pipeline,
+            compute_internals_pipeline,
+            compute_forces_pipeline,
             output_pipeline,
-            buffer_size,
+            nodes_buffer_size,
+            edges_buffer_size,
             oversampling_factor,
             initialized: false,
         })
     }
 
-    pub fn initialize(&mut self, vel: f32, steps: usize) -> Result<Vec<Node>, Box<dyn Error>> {
-        println!("Calling init!");
+    pub fn initialize(&mut self) -> Result<(), Box<dyn Error>> {
+        println!("Initializing simulation!");
         let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
-
-        self.push_constants.vel = vel;
-
-        for _ in 0..steps {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Compute Encoder"),
-                });
-            {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Compute Pass"),
-                    timestamp_writes: None,
-                });
-                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                compute_pass.set_pipeline(&self.external_force_pipeline);
-                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
-                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-            }
-            {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Compute Pass"),
-                    timestamp_writes: None,
-                });
-                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                compute_pass.set_pipeline(&self.forces_pipeline);
-                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
-                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-            }
-            {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Compute Pass"),
-                    timestamp_writes: None,
-                });
-                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                compute_pass.set_pipeline(&self.displacements_pipeline);
-                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
-                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-            }
-            (
-                self.push_constants.current_index,
-                self.push_constants.future_index,
-            ) = (
-                self.push_constants.future_index,
-                self.push_constants.current_index,
-            );
-            self.queue.submit(iter::once(encoder.finish()));
-        }
 
         let mut encoder = self
             .device
@@ -456,49 +537,69 @@ impl State {
                 timestamp_writes: None,
             });
             compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-            compute_pass.set_pipeline(&self.output_pipeline);
+            compute_pass.set_pipeline(&self.create_reference_pipeline);
             compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
             compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
         }
         self.queue.submit(iter::once(encoder.finish()));
 
-        self.device.poll(wgpu::Maintain::Wait);
-
         self.initialized = true;
+        Ok(())
+    }
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.copy_buffer_to_buffer(
-            &self.output_buffer,
-            0,
-            &self.staging_buffer,
-            0,
-            (self.fdm_uniform.node_count as usize * std::mem::size_of::<Node>()) as u64,
-        );
-        self.queue.submit(Some(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Wait);
-
-        let buffer_slice = self.staging_buffer.slice(..);
-        let (tx, rx) = flume::bounded(1);
-        buffer_slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
-        self.device.poll(wgpu::Maintain::wait()).panic_on_timeout();
-
-        println!("Transferring buffer with size {}", self.buffer_size);
-
-        // Awaits until `buffer_future` can be read from
-        if let Ok(Ok(())) = rx.recv() {
-            let data = buffer_slice.get_mapped_range();
-            let result: Vec<Node> = bytemuck::cast_slice(&data).to_vec();
-            drop(data);
-            self.staging_buffer.unmap(); // Unmaps buffer from memory
-
-            return Ok(result[0..self.fdm_uniform.node_count as usize].to_vec());
-        } else {
-            eprintln!("Failed to map staging buffer!");
+    pub fn hammer(&mut self, steps: usize, force: f32) -> Result<(), Box<dyn Error>> {
+        // This is basically a normal simulation pass, except we are setting the external force to >0.0 for this many steps
+        // The 64 comes from the @workgroup_size(64) inside the shaders
+        let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
+        self.push_constants.force = force;
+        for _ in 0..steps {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Compute Encoder"),
+                });
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                compute_pass.set_pipeline(&self.half_step_pipeline);
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+            }
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                compute_pass.set_pipeline(&self.compute_internals_pipeline);
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+            }
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                compute_pass.set_pipeline(&self.compute_forces_pipeline);
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+            }
+            self.queue.submit(iter::once(encoder.finish()));
+            (
+                self.push_constants.current_index,
+                self.push_constants.future_index,
+            ) = (
+                self.push_constants.future_index,
+                self.push_constants.current_index,
+            );
         }
-
-        Ok(Vec::new())
+        // Remove external force
+        self.push_constants.force = 0.0;
+        Ok(())
     }
 
     pub fn compute(&mut self) -> Result<(), Box<dyn Error>> {
@@ -523,7 +624,7 @@ impl State {
                             timestamp_writes: None,
                         });
                     compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                    compute_pass.set_pipeline(&self.forces_pipeline);
+                    compute_pass.set_pipeline(&self.half_step_pipeline);
                     compute_pass
                         .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
                     compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
@@ -535,7 +636,19 @@ impl State {
                             timestamp_writes: None,
                         });
                     compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                    compute_pass.set_pipeline(&self.displacements_pipeline);
+                    compute_pass.set_pipeline(&self.compute_internals_pipeline);
+                    compute_pass
+                        .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                    compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+                }
+                {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Compute Pass"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                    compute_pass.set_pipeline(&self.compute_forces_pipeline);
                     compute_pass
                         .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
                     compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
@@ -565,54 +678,88 @@ impl State {
                 compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
                 compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
 
-                self.push_constants.output_idx =
-                    (self.push_constants.output_idx + 1) % self.fdm_uniform.chunk_size;
+                self.push_constants.output_index =
+                    (self.push_constants.output_index + 1) % self.fdm_uniform.chunk_size;
             }
             self.queue.submit(iter::once(encoder.finish()));
         }
         Ok(())
     }
 
-    pub fn save(&mut self) -> Result<Vec<Vec<Node>>, Box<dyn Error>> {
-        assert_eq!(self.push_constants.output_idx, 0);
+    pub fn save(&mut self) -> Result<(Vec<Vec<Node>>, Vec<Vec<Edge>>), Box<dyn Error>> {
+        assert_eq!(self.push_constants.output_index, 0);
         // Begin memory transfer to CPU
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         encoder.copy_buffer_to_buffer(
-            &self.output_buffer,
+            &self.nodes_output_buffer,
             0,
-            &self.staging_buffer,
+            &self.nodes_staging_buffer,
             0,
-            self.buffer_size,
+            self.nodes_buffer_size,
         );
         self.queue.submit(Some(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait);
 
-        let buffer_slice = self.staging_buffer.slice(..);
+        let nodes_buffer_slice = self.nodes_staging_buffer.slice(..);
         let (tx, rx) = flume::bounded(1);
-        buffer_slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
+        nodes_buffer_slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
         self.device.poll(wgpu::Maintain::wait()).panic_on_timeout();
 
-        println!("Transferring buffer with size {}", self.buffer_size);
-
         // Awaits until `buffer_future` can be read from
-        if let Ok(Ok(())) = rx.recv() {
-            let data = buffer_slice.get_mapped_range();
+        let nodes = if let Ok(Ok(())) = rx.recv() {
+            let data = nodes_buffer_slice.get_mapped_range();
             let result: Vec<Node> = bytemuck::cast_slice(&data).to_vec();
             drop(data);
-            self.staging_buffer.unmap(); // Unmaps buffer from memory
+            self.nodes_staging_buffer.unmap(); // Unmaps buffer from memory
 
             let vecs: Vec<Vec<Node>> = result
                 .chunks(self.fdm_uniform.node_count as usize)
                 .map(|slice| slice.to_vec())
                 .collect();
-            return Ok(vecs);
+            Some(vecs)
         } else {
-            eprintln!("Failed to map staging buffer!");
+            None
+        };
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(
+            &self.edges_output_buffer,
+            0,
+            &self.edges_staging_buffer,
+            0,
+            self.edges_buffer_size,
+        );
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let edges_buffer_slice = self.edges_staging_buffer.slice(..);
+        let (tx, rx) = flume::bounded(1);
+        edges_buffer_slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
+        self.device.poll(wgpu::Maintain::wait()).panic_on_timeout();
+
+        let edges = if let Ok(Ok(())) = rx.recv() {
+            let data = edges_buffer_slice.get_mapped_range();
+            let result: Vec<Edge> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            self.edges_staging_buffer.unmap(); // Unmaps buffer from memory
+
+            let vecs: Vec<Vec<Edge>> = result
+                .chunks(self.fdm_uniform.node_count as usize)
+                .map(|slice| slice.to_vec())
+                .collect();
+            Some(vecs)
+        } else {
+            None
+        };
+        if let (Some(n), Some(e)) = (nodes, edges) {
+            return Ok((n, e));
         }
 
-        Ok(Vec::new())
+        Ok((Vec::new(), Vec::new()))
     }
 
     fn update_uniforms(&mut self, uniforms: FDMUniform) -> Result<(), Box<dyn Error>> {
