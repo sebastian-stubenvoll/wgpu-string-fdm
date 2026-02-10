@@ -113,7 +113,7 @@ fn half_step(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + global_id.x;
 
     // Half step position update (drift)
-    if (global_id.x > 0 && global_id.x < uniforms.node_count - 2) {
+    if (global_id.x > (0 + uniforms.clamp_offset) && global_id.x < (uniforms.node_count - 2 - uniforms.clamp_offset)) {
         let dq = 0.5 * qmul(edges[current].orientation, vec4<f32>(edges[current].angular_velocity, 0.0));
         var update = integrate_exponential(edges[current].orientation, edges[current].angular_velocity, uniforms.dt * 0.5);
         // Safety: make sure future orientation selects pole closest to current orientation
@@ -206,7 +206,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     
-    if (global_id.x > 0 && global_id.x < uniforms.node_count - 2) {
+    if (global_id.x > (0 + uniforms.clamp_offset) && global_id.x < (uniforms.node_count - 2 - uniforms.clamp_offset)) {
         
         let r = edges[current].reference_vector + (nodes[current + 1].displacement - nodes[current].displacement);
         let tangent_LF = r * uniforms.dl_inv;

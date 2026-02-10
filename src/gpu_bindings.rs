@@ -148,7 +148,7 @@ impl FDMUniform {
             dl,
             dl_inv: 1.0 / dl,
             stiffness_se: *stiffness_se,
-            clamp_offset: 0,
+            clamp_offset,
             stiffness_bt: *stiffness_bt,
             dampening: 0.0,
             inertia: *intertia,
