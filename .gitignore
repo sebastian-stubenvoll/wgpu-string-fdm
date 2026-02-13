@@ -1,4 +1,6 @@
 /target
+./.ipynb_checkpoints
+*.png
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

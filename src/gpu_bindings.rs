@@ -166,6 +166,11 @@ struct PushConstants {
     future_index: u32,
     output_index: u32,
     force: f32,
+
+    linear_dampening: f32,
+    angular_dampening: f32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 #[derive(Debug)]
@@ -195,6 +200,7 @@ pub struct State {
     nodes_buffer_size: wgpu::BufferAddress,
     edges_buffer_size: wgpu::BufferAddress,
     compute_bind_group: wgpu::BindGroup,
+    init_pipeline: wgpu::ComputePipeline,
     create_reference_pipeline: wgpu::ComputePipeline,
     half_step_pipeline: wgpu::ComputePipeline,
     compute_internals_pipeline: wgpu::ComputePipeline,
@@ -222,6 +228,7 @@ impl State {
         hammer_weights: Vec<[f32; 4]>,
         uniforms: FDMUniform,
         oversampling_factor: usize,
+        dampening: [f32; 2],
     ) -> Result<State, Box<dyn Error>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             #[cfg(not(target_arch = "wasm32"))]
@@ -248,7 +255,7 @@ impl State {
                         wgpu::Limits::downlevel_webgl2_defaults()
                     } else {
                         wgpu::Limits {
-                            max_push_constant_size: 16,
+                            max_push_constant_size: 32,
                             ..wgpu::Limits::default()
                         }
                     },
@@ -344,6 +351,11 @@ impl State {
             future_index: 1,
             output_index: 0,
             force: 0.0,
+
+            linear_dampening: dampening[0],
+            angular_dampening: dampening[1],
+            _pad0: 0,
+            _pad1: 0,
         };
 
         let compute_bind_group_layout =
@@ -450,16 +462,24 @@ impl State {
                 bind_group_layouts: &[&compute_bind_group_layout],
                 push_constant_ranges: &[wgpu::PushConstantRange {
                     stages: wgpu::ShaderStages::COMPUTE,
-                    range: 0..16,
+                    range: 0..32,
                 }],
             });
+
+        let init_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Compute Pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "init",
+            compilation_options: Default::default(),
+        });
 
         let create_reference_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Compute Pipeline"),
                 layout: Some(&compute_pipeline_layout),
                 module: &shader,
-                entry_point: "create_reference",
+                entry_point: "create_references",
                 compilation_options: Default::default(),
             });
 
@@ -510,6 +530,7 @@ impl State {
             nodes_staging_buffer,
             edges_staging_buffer,
             push_constants,
+            init_pipeline,
             create_reference_pipeline,
             half_step_pipeline,
             compute_internals_pipeline,
@@ -524,6 +545,31 @@ impl State {
 
     pub fn initialize(&mut self) -> Result<(), Box<dyn Error>> {
         println!("Initializing simulation!");
+        let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Compute Encoder"),
+            });
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Compute Pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            compute_pass.set_pipeline(&self.init_pipeline);
+            compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+            compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+        }
+        self.queue.submit(iter::once(encoder.finish()));
+
+        self.initialized = true;
+        Ok(())
+    }
+
+    pub fn create_references(&mut self) -> Result<(), Box<dyn Error>> {
+        println!("Considering current configuration as stress free.");
         let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
 
         let mut encoder = self
@@ -762,12 +808,26 @@ impl State {
         Ok((Vec::new(), Vec::new()))
     }
 
-    fn update_uniforms(&mut self, uniforms: FDMUniform) -> Result<(), Box<dyn Error>> {
-        self.fdm_uniform = uniforms;
+    fn write_uniforms(&mut self) -> Result<(), Box<dyn Error>> {
         let mut buffer = encase::UniformBuffer::new(Vec::new());
         buffer.write(&self.fdm_uniform)?;
         self.queue
             .write_buffer(&self.fdm_uniform_buffer, 0, &buffer.into_inner());
+        Ok(())
+    }
+
+    pub fn set_dt(&mut self, dt: f32) -> Result<(), Box<dyn Error>> {
+        self.fdm_uniform.dt = dt;
+        self.fdm_uniform.dt_inv = dt.recip();
+
+        self.write_uniforms()
+    }
+
+    pub fn set_dampening(&mut self, dampening: [f32; 2]) -> Result<(), Box<dyn Error>> {
+        [
+            self.push_constants.linear_dampening,
+            self.push_constants.angular_dampening,
+        ] = dampening;
         Ok(())
     }
 }

@@ -64,6 +64,11 @@ struct PushConstants {
     future: u32,  // current == 0 ? 1 : 0
     output_index: u32,
     force: f32,
+
+    linear_dampening: f32,
+    angular_dampening: f32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 var <push_constant> c: PushConstants;
@@ -94,7 +99,7 @@ var<storage, read> hammer_weights: array<vec4<f32>>;
 
 @compute
 @workgroup_size(64) 
-fn create_reference(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn init(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + global_id.x;
     let future = (c.future * uniforms.node_count) + global_id.x;
     if (global_id.x < uniforms.node_count - 1) {
@@ -105,6 +110,30 @@ fn create_reference(@builtin(global_invocation_id) global_id: vec3<u32>) {
         edges[future].dilatation = dilatation;
     }
 }
+
+@compute
+@workgroup_size(64) 
+fn create_references(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let current = (c.current * uniforms.node_count) + global_id.x;
+    let future = (c.future * uniforms.node_count) + global_id.x;
+    if (global_id.x < uniforms.node_count - 1) {
+        let r = edges[current].reference_vector + (nodes[current + 1].displacement - nodes[current].displacement);
+        let tangent_LF = r * uniforms.dl_inv;
+        let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
+        let current_strain_MF = tangent_MF - vec3<f32>(0.0, 0.0, 1.0);
+        
+        edges[current].strain = current_strain_MF;
+        edges[future].strain = current_strain_MF;
+    }
+
+    if (global_id.x < uniforms.node_count - 2) {
+        let relative_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
+
+        nodes[current].reference_orientation = relative_orientation;
+        nodes[future].reference_orientation = relative_orientation;
+    }
+}
+
 
 
 @compute
@@ -142,7 +171,7 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let tangent_LF = r * uniforms.dl_inv;
         let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
 
-        var current_strain_MF = tangent_MF - vec3<f32>(0.0, 0.0, 1.0);
+        let current_strain_MF = tangent_MF - vec3<f32>(0.0, 0.0, 1.0);
         len_inv = 1.0 / length(r);
         edges[current].len_inv = len_inv;
 
@@ -192,7 +221,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Interior nodes
     if (global_id.x > 0 && global_id.x < uniforms.node_count - 1) {
         let ext_force = hammer_weights[global_id.x].xyz * c.force;
-        let damping_force = - 0.000000001* nodes[current].velocity;
+        let damping_force = - c.linear_dampening * nodes[current].velocity;
         
         // Only calculate for interior edges, so naive difference operator is fine here!
         let v_tt = (edges[current].internal_force - edges[current- 1].internal_force + ext_force + damping_force) * vec3<f32>(0.1, 1.0, 1.0) * uniforms.mass_inv;
@@ -215,7 +244,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let dilatation_t= (edges[future].dilatation - edges[current].dilatation) * uniforms.dt_inv;
 
         let ext_couple = vec3<f32>(0.0, 0.0, 0.0);
-        let damping_torque = - 0.000000001 * edges[current].angular_velocity;
+        let damping_torque = - c.angular_dampening * edges[current].angular_velocity;
 
         var difference: vec3<f32>;
         var average: vec3<f32>;

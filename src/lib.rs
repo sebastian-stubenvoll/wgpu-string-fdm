@@ -30,6 +30,7 @@ mod py_wgpu_fdm {
             stiffness_bt: [f32; 3],
             inertia: [f32; 3],
             clamp_offset: u32,
+            dampening: [f32; 2],
         ) -> PyResult<Self> {
             let nodes: Vec<gpu_bindings::Node> = nodes
                 .iter()
@@ -60,6 +61,7 @@ mod py_wgpu_fdm {
                 hammer_weights,
                 uniforms,
                 oversampling_factor,
+                dampening,
             ));
 
             if let Ok(state) = state {
@@ -111,8 +113,23 @@ mod py_wgpu_fdm {
             Ok(())
         }
 
+        fn create_references(&mut self) -> PyResult<()> {
+            _ = self.state.create_references();
+            Ok(())
+        }
+
         fn hammer(&mut self, steps: usize, force: f32) -> PyResult<()> {
             _ = self.state.hammer(steps, force);
+            Ok(())
+        }
+
+        fn set_dt(&mut self, dt: f32) -> PyResult<()> {
+            _ = self.state.set_dt(dt);
+            Ok(())
+        }
+
+        fn set_dampening(&mut self, dampening: [f32; 2]) -> PyResult<()> {
+            _ = self.state.set_dampening(dampening);
             Ok(())
         }
     }
