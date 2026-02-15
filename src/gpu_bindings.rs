@@ -2,31 +2,45 @@
 use std::{error::Error, fmt::Display, iter};
 use wgpu::util::DeviceExt;
 
+trait WgslPad<T> {
+    fn pad(self) -> T;
+}
+
+impl WgslPad<[f32; 4]> for [f32; 3] {
+    fn pad(self) -> [f32; 4] {
+        [self[0], self[1], self[2], 0.0]
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, encase::ShaderType)]
 // Don't derive Default on purpose! Implicit initialization via Default::default() can be a footgun here!
 pub struct Node {
-    position: [f32; 3],
+    displacement: [f32; 3],
     _pad0: u32,
     velocity: [f32; 3],
     _pad1: u32,
     curvature: [f32; 3],
     _pad2: u32,
-    reference_curvature: [f32; 4],
+    reference_rotation: [f32; 4],
     internal_moment: [f32; 3],
     _pad3: u32,
 }
 
 impl Node {
-    pub fn new(position: &[f32; 3], velocity: &[f32; 3], reference_curvature: &[f32; 4]) -> Self {
+    pub fn new(
+        displacement: &[f32; 3],
+        velocity: &[f32; 3],
+        reference_rotation: &[f32; 4],
+    ) -> Self {
         Self {
-            position: *position,
+            displacement: *displacement,
             _pad0: 0,
             velocity: *velocity,
             _pad1: 0,
             curvature: [0.0; 3],
             _pad2: 0,
-            reference_curvature: *reference_curvature,
+            reference_rotation: *reference_rotation,
             internal_moment: [0.0; 3],
             _pad3: 0,
         }
@@ -34,7 +48,7 @@ impl Node {
 
     pub fn to_raw(self) -> [[f32; 3]; 4] {
         [
-            self.position,
+            self.displacement,
             self.velocity,
             self.internal_moment,
             self.curvature,
@@ -48,15 +62,15 @@ impl Node {
 pub struct Edge {
     orientation: [f32; 4],
     angular_velocity: [f32; 3],
-    len_inv: f32,
+    len: f32,
     strain: [f32; 3],
-    dilation: f32,
-    reference_strain: [f32; 3],
     _pad0: u32,
-    internal_force: [f32; 3],
+    reference_strain: [f32; 3],
     _pad1: u32,
-    reference_vector: [f32; 3],
+    internal_force: [f32; 3],
     _pad2: u32,
+    reference_vector: [f32; 3],
+    _pad3: u32,
 }
 
 impl Edge {
@@ -69,15 +83,15 @@ impl Edge {
         Self {
             orientation: *orientation,
             angular_velocity: *angular_velocity,
-            len_inv: 0.0,
+            len: 0.0,
             strain: [0.0; 3],
-            dilation: 0.0,
-            reference_strain: *reference_strain,
             _pad0: 0,
-            internal_force: [0.0; 3],
+            reference_strain: *reference_strain,
             _pad1: 0,
-            reference_vector: *reference_vector,
+            internal_force: [0.0; 3],
             _pad2: 0,
+            reference_vector: *reference_vector,
+            _pad3: 0,
         }
     }
 
@@ -195,10 +209,295 @@ impl Display for StateError {
 
 impl Error for StateError {}
 
+struct NodeBuffers {
+    displacements: wgpu::Buffer,
+    velocities: wgpu::Buffer,
+    curvatures: wgpu::Buffer,
+    reference_rotations: wgpu::Buffer,
+    internal_moments: wgpu::Buffer,
+}
+
+impl NodeBuffers {
+    fn new(device: &wgpu::Device, nodes_vec: &[Node]) -> Self {
+        let displacement_vals = nodes_vec
+            .iter()
+            .map(|n| n.displacement.pad())
+            .collect::<Vec<[f32; 4]>>();
+
+        let displacements = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("displacements buffer"),
+            contents: bytemuck::cast_slice(displacement_vals.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let velocity_vals = nodes_vec
+            .iter()
+            .map(|n| n.velocity.pad())
+            .collect::<Vec<[f32; 4]>>();
+
+        let velocities = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("velocities buffer"),
+            contents: bytemuck::cast_slice(velocity_vals.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let curvature_vals = nodes_vec
+            .iter()
+            .map(|n| n.curvature.pad())
+            .collect::<Vec<[f32; 4]>>();
+
+        let curvatures = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("curvatures buffer"),
+            contents: bytemuck::cast_slice(curvature_vals.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let reference_rotation_vals = nodes_vec
+            .iter()
+            .map(|n| n.reference_rotation)
+            .collect::<Vec<[f32; 4]>>();
+
+        let reference_rotations = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("reference rotations buffer"),
+            contents: bytemuck::cast_slice(reference_rotation_vals.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let internal_moment_vals = nodes_vec
+            .iter()
+            .map(|n| n.internal_moment.pad())
+            .collect::<Vec<[f32; 4]>>();
+
+        let internal_moments = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("internal_moments buffer"),
+            contents: bytemuck::cast_slice(internal_moment_vals.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        Self {
+            displacements,
+            velocities,
+            curvatures,
+            reference_rotations,
+            internal_moments,
+        }
+    }
+}
+
+struct EdgeBuffers {
+    orientations: wgpu::Buffer,
+    angular_velocities: wgpu::Buffer,
+    strains: wgpu::Buffer,
+    reference_strains: wgpu::Buffer,
+    internal_forces: wgpu::Buffer,
+    reference_vectors: wgpu::Buffer,
+    inverse_lengths: wgpu::Buffer,
+    dilatations: wgpu::Buffer,
+}
+
+impl EdgeBuffers {
+    fn new(device: &wgpu::Device, edges_vec: &[Edge]) -> Self {
+        let orientation_vals = edges_vec
+            .iter()
+            .map(|e| e.orientation)
+            .collect::<Vec<[f32; 4]>>();
+
+        let orientations = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("orientations buffer"),
+            contents: bytemuck::cast_slice(orientation_vals.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let angular_velocity_vals = edges_vec
+            .iter()
+            .map(|e| e.angular_velocity.pad())
+            .collect::<Vec<[f32; 4]>>();
+
+        let angular_velocities = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("angular_velocitys buffer"),
+            contents: bytemuck::cast_slice(angular_velocity_vals.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let strain_vals = edges_vec
+            .iter()
+            .map(|e| e.strain.pad())
+            .collect::<Vec<[f32; 4]>>();
+
+        let strains = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("strains buffer"),
+            contents: bytemuck::cast_slice(strain_vals.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let reference_strain_vals = edges_vec
+            .iter()
+            .map(|e| e.reference_strain.pad())
+            .collect::<Vec<[f32; 4]>>();
+
+        let reference_strains = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("reference_strains buffer"),
+            contents: bytemuck::cast_slice(reference_strain_vals.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let internal_force_vals = edges_vec
+            .iter()
+            .map(|e| e.internal_force.pad())
+            .collect::<Vec<[f32; 4]>>();
+
+        let internal_forces = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("internal_forces buffer"),
+            contents: bytemuck::cast_slice(internal_force_vals.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let reference_vector_vals = edges_vec
+            .iter()
+            .map(|e| e.reference_vector.pad())
+            .collect::<Vec<[f32; 4]>>();
+
+        let reference_vectors = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("reference_vectors buffer"),
+            contents: bytemuck::cast_slice(reference_vector_vals.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let inverse_length_vals = edges_vec
+            .iter()
+            .map(|e| e.len.recip())
+            .collect::<Vec<f32>>();
+
+        let inverse_lengths = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("inverse_lengths buffer"),
+            contents: bytemuck::cast_slice(inverse_length_vals.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let dilatation_vals = edges_vec.iter().map(|_| 1.0).collect::<Vec<f32>>();
+
+        let dilatations = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dilatations buffer"),
+            contents: bytemuck::cast_slice(dilatation_vals.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        Self {
+            orientations,
+            angular_velocities,
+            strains,
+            reference_strains,
+            internal_forces,
+            reference_vectors,
+            inverse_lengths,
+            dilatations,
+        }
+    }
+}
+
+struct OutputBuffers {
+    nodes: wgpu::Buffer,
+    edges: wgpu::Buffer,
+}
+
+impl OutputBuffers {
+    fn new(device: &wgpu::Device, nodes_in: &[Node], edges_in: &[Edge], chunk_size: u64) -> Self {
+        let nodes_buffer_size = (std::mem::size_of::<Node>() as u64
+            * nodes_in.len() as u64
+            * chunk_size) as wgpu::BufferAddress;
+        let edges_buffer_size = (std::mem::size_of::<Edge>() as u64
+            * edges_in.len() as u64
+            * chunk_size) as wgpu::BufferAddress;
+
+        let nodes = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("nodes output buffer"),
+            size: nodes_buffer_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let edges = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("edges output buffer"),
+            size: edges_buffer_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        Self { nodes, edges }
+    }
+}
+
+struct StagingBuffers {
+    nodes: wgpu::Buffer,
+    edges: wgpu::Buffer,
+    nodes_buffer_size: u64,
+    edges_buffer_size: u64,
+}
+
+impl StagingBuffers {
+    fn new(device: &wgpu::Device, nodes_in: &[Node], edges_in: &[Edge], chunk_size: u64) -> Self {
+        let nodes_buffer_size = (std::mem::size_of::<Node>() as u64
+            * nodes_in.len() as u64
+            * chunk_size) as wgpu::BufferAddress;
+        let edges_buffer_size = (std::mem::size_of::<Edge>() as u64
+            * edges_in.len() as u64
+            * chunk_size) as wgpu::BufferAddress;
+
+        let nodes = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("nodes staging buffer"),
+            size: nodes_buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let edges = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("edges staging buffer"),
+            size: edges_buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            nodes,
+            edges,
+            nodes_buffer_size,
+            edges_buffer_size,
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub struct State {
-    nodes_buffer_size: wgpu::BufferAddress,
-    edges_buffer_size: wgpu::BufferAddress,
     compute_bind_group: wgpu::BindGroup,
     init_pipeline: wgpu::ComputePipeline,
     create_reference_pipeline: wgpu::ComputePipeline,
@@ -209,15 +508,14 @@ pub struct State {
     device: wgpu::Device,
     fdm_uniform: FDMUniform,
     fdm_uniform_buffer: wgpu::Buffer,
-    nodes_buffer: wgpu::Buffer,
-    nodes_output_buffer: wgpu::Buffer,
-    edges_buffer: wgpu::Buffer,
-    edges_output_buffer: wgpu::Buffer,
+    hammer_weights_buffer: wgpu::Buffer,
+    node_buffers: NodeBuffers,
+    edge_buffers: EdgeBuffers,
+    output_buffers: OutputBuffers,
+    staging_buffers: StagingBuffers,
     oversampling_factor: usize,
     push_constants: PushConstants,
     queue: wgpu::Queue,
-    nodes_staging_buffer: wgpu::Buffer,
-    edges_staging_buffer: wgpu::Buffer,
     initialized: bool,
 }
 
@@ -256,6 +554,7 @@ impl State {
                     } else {
                         wgpu::Limits {
                             max_push_constant_size: 32,
+                            max_storage_buffers_per_shader_stage: 16,
                             ..wgpu::Limits::default()
                         }
                     },
@@ -267,7 +566,7 @@ impl State {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("FDM Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cosserat.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cosserat_improved.wgsl").into()),
         });
 
         let fdm_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -276,73 +575,21 @@ impl State {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let nodes_buffer_size = (std::mem::size_of::<Node>() as u64
-            * nodes_vec.len() as u64
-            * uniforms.chunk_size as u64) as wgpu::BufferAddress;
+        let output_buffers =
+            OutputBuffers::new(&device, &nodes_vec, &edges_vec, uniforms.chunk_size as u64);
 
-        let edges_buffer_size = (std::mem::size_of::<Edge>() as u64
-            * edges_vec.len() as u64
-            * uniforms.chunk_size as u64) as wgpu::BufferAddress;
+        let staging_buffers =
+            StagingBuffers::new(&device, &nodes_vec, &edges_vec, uniforms.chunk_size as u64);
 
         nodes_vec.extend_from_within(..);
-        let nodes_in = nodes_vec.into_boxed_slice();
-
         edges_vec.extend_from_within(..);
-        let edges_in = edges_vec.into_boxed_slice();
 
-        let hammer_weights_in = hammer_weights.into_boxed_slice();
-
-        let nodes_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("node buffer"),
-            contents: bytemuck::cast_slice(nodes_in.as_ref()),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-        });
-
-        let edges_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("edge buffer"),
-            contents: bytemuck::cast_slice(edges_in.as_ref()),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-        });
-
-        let nodes_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("index buffer"),
-            size: nodes_buffer_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let edges_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("index buffer"),
-            size: edges_buffer_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let nodes_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: nodes_buffer_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let edges_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: edges_buffer_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let node_buffers = NodeBuffers::new(&device, &nodes_vec);
+        let edge_buffers = EdgeBuffers::new(&device, &edges_vec);
 
         let hammer_weights_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("hammer weights buffer"),
-            contents: bytemuck::cast_slice(hammer_weights_in.as_ref()),
+            contents: bytemuck::cast_slice(hammer_weights.as_slice()),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -375,7 +622,7 @@ impl State {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -415,14 +662,124 @@ impl State {
                         binding: 5,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 10,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 11,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 12,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 13,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 14,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 15,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 16,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
                         count: None,
                     },
                 ],
-                label: Some("Compute Bind Group Layout"),
+                label: Some("compute bind group layout"),
             });
 
         let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -434,26 +791,70 @@ impl State {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: nodes_buffer.as_entire_binding(),
+                    resource: hammer_weights_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: edges_buffer.as_entire_binding(),
+                    resource: node_buffers.displacements.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: nodes_output_buffer.as_entire_binding(),
+                    resource: node_buffers.velocities.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: edges_output_buffer.as_entire_binding(),
+                    resource: node_buffers.curvatures.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: hammer_weights_buffer.as_entire_binding(),
+                    resource: node_buffers.reference_rotations.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: node_buffers.internal_moments.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: edge_buffers.orientations.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: edge_buffers.angular_velocities.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: edge_buffers.strains.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: edge_buffers.reference_strains.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: edge_buffers.internal_forces.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: edge_buffers.reference_vectors.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: edge_buffers.inverse_lengths.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: edge_buffers.dilatations.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: output_buffers.nodes.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: output_buffers.edges.as_entire_binding(),
                 },
             ],
-            label: Some("Compute Bind Group Layout"),
+            label: Some("compute bind group"),
         });
 
         let compute_pipeline_layout =
@@ -523,12 +924,11 @@ impl State {
             fdm_uniform: uniforms,
             fdm_uniform_buffer,
             compute_bind_group,
-            nodes_buffer,
-            edges_buffer,
-            edges_output_buffer,
-            nodes_output_buffer,
-            nodes_staging_buffer,
-            edges_staging_buffer,
+            hammer_weights_buffer,
+            node_buffers,
+            edge_buffers,
+            output_buffers,
+            staging_buffers,
             push_constants,
             init_pipeline,
             create_reference_pipeline,
@@ -536,8 +936,6 @@ impl State {
             compute_internals_pipeline,
             compute_forces_pipeline,
             output_pipeline,
-            nodes_buffer_size,
-            edges_buffer_size,
             oversampling_factor,
             initialized: false,
         })
@@ -739,16 +1137,16 @@ impl State {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         encoder.copy_buffer_to_buffer(
-            &self.nodes_output_buffer,
+            &self.output_buffers.nodes,
             0,
-            &self.nodes_staging_buffer,
+            &self.staging_buffers.nodes,
             0,
-            self.nodes_buffer_size,
+            self.staging_buffers.nodes_buffer_size,
         );
         self.queue.submit(Some(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait);
 
-        let nodes_buffer_slice = self.nodes_staging_buffer.slice(..);
+        let nodes_buffer_slice = self.staging_buffers.nodes.slice(..);
         let (tx, rx) = flume::bounded(1);
         nodes_buffer_slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
         self.device.poll(wgpu::Maintain::wait()).panic_on_timeout();
@@ -758,7 +1156,7 @@ impl State {
             let data = nodes_buffer_slice.get_mapped_range();
             let result: Vec<Node> = bytemuck::cast_slice(&data).to_vec();
             drop(data);
-            self.nodes_staging_buffer.unmap(); // Unmaps buffer from memory
+            self.staging_buffers.nodes.unmap(); // Unmaps buffer from memory
 
             let vecs: Vec<Vec<Node>> = result
                 .chunks(self.fdm_uniform.node_count as usize)
@@ -773,16 +1171,16 @@ impl State {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         encoder.copy_buffer_to_buffer(
-            &self.edges_output_buffer,
+            &self.output_buffers.edges,
             0,
-            &self.edges_staging_buffer,
+            &self.staging_buffers.edges,
             0,
-            self.edges_buffer_size,
+            self.staging_buffers.edges_buffer_size,
         );
         self.queue.submit(Some(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait);
 
-        let edges_buffer_slice = self.edges_staging_buffer.slice(..);
+        let edges_buffer_slice = self.staging_buffers.edges.slice(..);
         let (tx, rx) = flume::bounded(1);
         edges_buffer_slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
         self.device.poll(wgpu::Maintain::wait()).panic_on_timeout();
@@ -791,7 +1189,7 @@ impl State {
             let data = edges_buffer_slice.get_mapped_range();
             let result: Vec<Edge> = bytemuck::cast_slice(&data).to_vec();
             drop(data);
-            self.edges_staging_buffer.unmap(); // Unmaps buffer from memory
+            self.staging_buffers.edges.unmap(); // Unmaps buffer from memory
 
             let vecs: Vec<Vec<Edge>> = result
                 .chunks(self.fdm_uniform.node_count as usize)
