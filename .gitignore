@@ -75,3 +75,5 @@ docs/_build/
 .python-version
 
 old/
+
+simulation_results/
