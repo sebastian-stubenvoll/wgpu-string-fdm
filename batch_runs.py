@@ -34,7 +34,7 @@ class SimulationRun:
             exist_ok=True,
         )
 
-        self.write_queue = queue.Queue(maxsize=4)
+        self.write_queue = queue.Queue(maxsize=128)
         self.writer_thread = threading.Thread(
             target=self._writer_loop,
             daemon=True,
@@ -195,7 +195,9 @@ class SimulationRun:
         return t, force
 
     def _writer_loop(self):
-
+        """
+        Threaded writer: write each dispatch immediately to disk.
+        """
         while True:
             item = self.write_queue.get()
             if item is None:
@@ -204,11 +206,9 @@ class SimulationRun:
 
             dispatch, nodes, edges = item
 
-            with open(self.sim_dir / f"n_{dispatch:06d}.pkl","wb") as f:
-                pickle.dump(nodes, f, protocol=pickle.HIGHEST_PROTOCOL,)
-            
-            with open(self.sim_dir / f"e_{dispatch:06d}.pkl", "wb") as f:
-                pickle.dump(edges, f, protocol=pickle.HIGHEST_PROTOCOL,)
+            # Save nodes and edges as .npy object arrays
+            np.save(self.sim_dir / f"n_{dispatch:06d}.npy", np.array(nodes, dtype=object))
+            np.save(self.sim_dir / f"e_{dispatch:06d}.npy", np.array(edges, dtype=object))
 
             self.write_queue.task_done()
 
@@ -271,58 +271,88 @@ class SimulationRun:
         )
 
         self.sim.initialize()
+          
 
+    def run(self):
+        print(f"[{datetime.now()}] Starting run {self.run_id:03d}")
 
-    
-    def excite(self):
+        self.save_metadata()
+        self.build()
+        self.writer_thread.start()
 
+        chunk_size = self.config["chunk_size"]
+        dispatches = self.config["dispatches"]
+        oversampling_factor = self.config["oversampling_factor"]
+
+        dispatch_counter = 0  # global counter, excite is dispatch 0
+
+        # --- Excitation phase ---
         _, force = SimulationRun.make_force_curve(
             self.config["dt"],
             0.004,
         )
 
-        for f in force[::10]:
-            self.sim.hammer(
-                self.config["hammer_node"],
-                f,
-            )
+        hn = list()
+        he = list()
 
+        for i, f in enumerate(force):
+            self.sim.hammer(1, f)
 
+            if (i + 1) % (chunk_size * oversampling_factor) == 0:
+                print(f"[{datetime.now()}] Saving hammer chunk")
+                n, e = self.sim.save()
+                hn.extend(n)
+                he.extend(e)
 
-    def run(self):
+                
 
-        print(
-            f"[{datetime.now()}] "
-            f"Starting run {self.run_id:03d}"
-        )
+        n, e = self.sim.save_hammer()
+        hn.extend(n)
+        he.extend(e)
+        self.write_queue.put((dispatch_counter, n, e))
+        dispatch_counter += 1
 
-        self.save_metadata()
-        self.build()
-        self.excite()
-        self.writer_thread.start()
-        dispatches = self.config[
-            "dispatches"
-        ]
-
+        # --- Main simulation phase ---
         for dispatch in range(dispatches):
             self.sim.compute()
             n, e = self.sim.save()
-
-            n = copy.deepcopy(n)
-            e = copy.deepcopy(e)
-
-            self.write_queue.put((dispatch, n, e,))
+            self.write_queue.put((dispatch_counter, n, e))
+            dispatch_counter += 1
 
             if dispatch % 10 == 0:
-                print(
-                    f"run {self.run_id:03d} "
-                    f"{dispatch}/{dispatches}"
-                )
+                print(f"run {self.run_id:03d} {dispatch_counter}/{dispatches+1}")
 
+        # --- Finalize ---
         self.write_queue.join()
         self.write_queue.put(None)
         self.writer_thread.join()
+        
+        # Consolidate all files
+        self.consolidate_run()
         print(f"Run {self.run_id:03d} complete.")
+
+    def consolidate_run(self):
+        """
+        After the run finishes, combine all individual .npy files
+        into a single compressed .npz file.
+        """
+        node_files = sorted(self.sim_dir.glob("n_*.npy"))
+        edge_files = sorted(self.sim_dir.glob("e_*.npy"))
+
+        all_nodes = [np.load(f, allow_pickle=True) for f in node_files]
+        all_edges = [np.load(f, allow_pickle=True) for f in edge_files]
+
+        np.save(
+            self.sim_dir / f"simulation_run_{self.run_id:03d}_nodes.npy",
+            np.array(all_nodes, dtype=object),
+        )
+
+        np.save(
+            self.sim_dir / f"simulation_run_{self.run_id:03d}_edges.npy",
+            np.array(all_edges, dtype=object),
+        )
+        print(f"Consolidated {len(node_files)} dispatches into .npy files")
+
 
 
 config = {

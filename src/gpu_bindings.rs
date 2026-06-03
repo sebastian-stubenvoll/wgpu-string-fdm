@@ -219,6 +219,7 @@ pub struct State {
     nodes_staging_buffer: wgpu::Buffer,
     edges_staging_buffer: wgpu::Buffer,
     initialized: bool,
+    hammer_frames: usize,
 }
 
 impl State {
@@ -540,6 +541,7 @@ impl State {
             edges_buffer_size,
             oversampling_factor,
             initialized: false,
+            hammer_frames: 0,
         })
     }
 
@@ -634,7 +636,6 @@ impl State {
                 compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
                 compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
             }
-            self.queue.submit(iter::once(encoder.finish()));
             (
                 self.push_constants.current_index,
                 self.push_constants.future_index,
@@ -642,9 +643,27 @@ impl State {
                 self.push_constants.future_index,
                 self.push_constants.current_index,
             );
+            self.hammer_frames += 1;
+            // Save snapshot to output every oversampling_factor frames
+            if self.hammer_frames % self.oversampling_factor == 0 {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                compute_pass.set_pipeline(&self.output_pipeline);
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+
+                self.push_constants.output_index =
+                    (self.push_constants.output_index + 1) % self.fdm_uniform.chunk_size;
+            }
+            self.queue.submit(iter::once(encoder.finish()));
         }
+
         // Remove external force
         self.push_constants.force = 0.0;
+
         Ok(())
     }
 
@@ -806,6 +825,23 @@ impl State {
         }
 
         Ok((Vec::new(), Vec::new()))
+    }
+
+    pub fn save_hammer(&mut self) -> Result<(Vec<Vec<Node>>, Vec<Vec<Edge>>), Box<dyn Error>> {
+        // Reset output index!
+        self.push_constants.output_index = 0;
+        let mut res = self.save();
+
+        let tail = self.hammer_frames % self.fdm_uniform.chunk_size as usize;
+
+        if let Ok((n, e)) = res.as_mut() {
+            n.truncate(tail);
+            e.truncate(tail);
+        }
+
+        //Reset hammer frames
+        self.hammer_frames = 0;
+        res
     }
 
     fn write_uniforms(&mut self) -> Result<(), Box<dyn Error>> {

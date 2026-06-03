@@ -108,6 +108,40 @@ mod py_wgpu_fdm {
             Ok((n, e))
         }
 
+        // used to export the hammer frames
+        // identical to save except it does not panic on chunk_size-frame_count-mismatch
+        // it does however assert that the frames
+        fn save_hammer(
+            &mut self,
+        ) -> PyResult<(Vec<Vec<[[f32; 3]; 4]>>, Vec<Vec<([f32; 4], [[f32; 3]; 3])>>)> {
+            let (node_frames, edge_frames) = self
+                .state
+                .save_hammer()
+                .map_err(|_| PyRuntimeError::new_err("error running GPU computation"))?;
+
+            let n = node_frames
+                .into_iter()
+                .map(|nodes| {
+                    nodes
+                        .into_iter()
+                        .map(gpu_bindings::Node::to_raw)
+                        .collect::<Vec<[[f32; 3]; 4]>>()
+                })
+                .collect();
+
+            let e = edge_frames
+                .into_iter()
+                .map(|edges| {
+                    edges
+                        .into_iter()
+                        .map(gpu_bindings::Edge::to_raw)
+                        .collect::<Vec<([f32; 4], [[f32; 3]; 3])>>()
+                })
+                .collect();
+
+            Ok((n, e))
+        }
+
         fn initialize(&mut self) -> PyResult<()> {
             _ = self.state.initialize();
             Ok(())

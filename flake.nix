@@ -66,6 +66,7 @@
 
             source ${venvDir}/bin/activate
 
+            export LD_LIBRARY_PATH=${pkgs.zlib}/lib:$LD_LIBRARY_PATH
             export LD_LIBRARY_PATH=${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH
             export LD_LIBRARY_PATH=/run/opengl-driver/lib:${pkgs.vulkan-loader}/lib:$LD_LIBRARY_PATH
             export VK_LAYER_PATH=/run/opengl-driver/share/vulkan/explicit_layer.d
