@@ -309,7 +309,7 @@ class SimulationRun:
         n, e = self.sim.save_hammer()
         hn.extend(n)
         he.extend(e)
-        self.write_queue.put((dispatch_counter, n, e))
+        self.write_queue.put((dispatch_counter, hn, e))
         dispatch_counter += 1
 
         # --- Main simulation phase ---
@@ -328,7 +328,7 @@ class SimulationRun:
         self.writer_thread.join()
         
         # Consolidate all files
-        self.consolidate_run()
+        # self.consolidate_run()
         print(f"Run {self.run_id:03d} complete.")
 
     def consolidate_run(self):
