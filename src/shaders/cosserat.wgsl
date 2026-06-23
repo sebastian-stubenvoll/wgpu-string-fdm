@@ -59,11 +59,23 @@ struct Uniforms {
     
 }
 
+struct HammerState {
+    displacement: f32,
+    velocity: f32,
+    mass_inv: f32,
+    stiffness: f32,
+
+    exponent: f32,
+    hysteresis_factor: f32,
+    relaxation_time: f32,
+    force_accumulator: atomic<i32>,
+}
+
 struct PushConstants { 
     current: u32, // either 0 or 1
     future: u32,  // current == 0 ? 1 : 0
     output_index: u32,
-    force: f32,
+    hammering: u32, // 0 == false
 
     linear_dampening: f32,
     angular_dampening: f32,
@@ -95,7 +107,15 @@ var<storage, read_write> output_edges: array<Edge>;
 
 @group(0)
 @binding(5)
-var<storage, read> hammer_weights: array<vec4<f32>>;
+var<storage, read> hammer_weights: array<f32>;
+
+@group(0)
+@binding(6)
+var<storage, read_write> hammer: HammerState;
+
+@group(0)
+@binding(7)
+var<storage, read_write> integral_memory: array<f32>;
 
 @compute
 @workgroup_size(64) 
@@ -156,6 +176,12 @@ fn half_step(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (global_id.x > 0 && global_id.x < uniforms.node_count - 1) {
         nodes[current].displacement = nodes[current].displacement + (nodes[current].velocity * uniforms.dt * 0.5);
     }
+}
+
+@compute
+@workgroup_size(1) 
+fn hammer_half_step() {
+    hammer.displacement = hammer.displacement + (hammer.velocity * uniforms.dt * 0.5);
 }
 
 @compute
@@ -220,7 +246,32 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Interior nodes
     if (global_id.x > 0 && global_id.x < uniforms.node_count - 1) {
-        let ext_force = hammer_weights[global_id.x].xyz * c.force;
+
+        var ext_force = vec3<f32>(0.0);
+        // Hammer collision
+        if (c.hammering == 1) {
+            let weight = hammer_weights[global_id.x];
+            let compression = hammer.displacement - nodes[current].displacement.z;
+
+            if (compression > 0.0) {
+                let hereditary_term = (hammer.hysteresis_factor / hammer.relaxation_time) * integral_memory[global_id.x];
+                let u_p = pow(compression, hammer.exponent);
+                let dZ_dt = u_p - (integral_memory[global_id.x] / hammer.relaxation_time);
+                integral_memory[global_id.x] += dZ_dt * uniforms.dt;
+
+                let local_force = max(0.0, hammer.stiffness *  (u_p - hereditary_term));
+
+                let weighted_force = local_force * weight;
+                ext_force = vec3<f32>(0.0, 0.0, weighted_force);
+                let fixed_point_force = i32(weighted_force * 10000.0);
+                atomicAdd(&hammer.force_accumulator, fixed_point_force);
+            } else {
+                let decay = -(integral_memory[global_id.x] / hammer.relaxation_time);
+                integral_memory[global_id.x] = max(0.0, integral_memory[global_id.x] + decay * uniforms.dt);
+            }
+        }
+
+        
         let damping_force = - c.linear_dampening * nodes[current].velocity;
         
         // Only calculate for interior edges, so naive difference operator is fine here!
@@ -282,6 +333,16 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         
         edges[future].orientation = update;
     }
+}
+
+@compute
+@workgroup_size(1) 
+fn hammer_update() {
+    let total_force = f32(atomicLoad(&hammer.force_accumulator)) / 10000.0;
+    let hammer_acceleration = - total_force * hammer.mass_inv;
+    hammer.velocity = hammer.velocity + (hammer_acceleration * uniforms.dt);
+    hammer.displacement= hammer.displacement + (hammer.velocity * uniforms.dt * 0.5);
+    atomicStore(&hammer.force_accumulator, 0);
 }
 
 @compute

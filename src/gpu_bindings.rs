@@ -165,12 +165,57 @@ struct PushConstants {
     current_index: u32,
     future_index: u32,
     output_index: u32,
-    force: f32,
+    hammering: u32,
 
     linear_dampening: f32,
     angular_dampening: f32,
     _pad0: u32,
     _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, encase::ShaderType)]
+// Don't derive Default on purpose! Implicit initialization via Default::default() can be a footgun here!
+pub struct Hammer {
+    displacement: f32,
+    velocity: f32,
+    mass_inv: f32,
+    stiffness: f32,
+
+    exponent: f32,
+    hysteresis_factor: f32,
+    relaxation_time: f32,
+    force_accumulator: i32,
+}
+
+impl Hammer {
+    pub fn new(
+        displacement: f32,
+        velocity: f32,
+        mass: f32,
+        stiffness: f32,
+        exponent: f32,
+        hysteresis_factor: f32,
+        relaxation_time: f32,
+    ) -> Self {
+        assert!(mass > 0.0);
+        assert!(stiffness > 0.0);
+        assert!(exponent > 0.0);
+        assert!(hysteresis_factor > 0.0);
+        assert!(relaxation_time > 0.0);
+
+        Self {
+            displacement,
+            velocity,
+            mass_inv: mass.recip(),
+            stiffness,
+
+            exponent,
+            hysteresis_factor,
+            relaxation_time,
+            force_accumulator: 0i32,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -203,8 +248,10 @@ pub struct State {
     init_pipeline: wgpu::ComputePipeline,
     create_reference_pipeline: wgpu::ComputePipeline,
     half_step_pipeline: wgpu::ComputePipeline,
+    hammer_half_step_pipeline: wgpu::ComputePipeline,
     compute_internals_pipeline: wgpu::ComputePipeline,
     compute_forces_pipeline: wgpu::ComputePipeline,
+    hammer_update_pipeline: wgpu::ComputePipeline,
     output_pipeline: wgpu::ComputePipeline,
     device: wgpu::Device,
     fdm_uniform: FDMUniform,
@@ -226,7 +273,8 @@ impl State {
     pub async fn new(
         mut nodes_vec: Vec<Node>,
         mut edges_vec: Vec<Edge>,
-        hammer_weights: Vec<[f32; 4]>,
+        hammer_weights: Vec<f32>,
+        hammer: Hammer,
         uniforms: FDMUniform,
         oversampling_factor: usize,
         dampening: [f32; 2],
@@ -284,6 +332,8 @@ impl State {
         let edges_buffer_size = (std::mem::size_of::<Edge>() as u64
             * edges_vec.len() as u64
             * uniforms.chunk_size as u64) as wgpu::BufferAddress;
+
+        let memory_integral = vec![0.0; nodes_vec.len()];
 
         nodes_vec.extend_from_within(..);
         let nodes_in = nodes_vec.into_boxed_slice();
@@ -347,11 +397,23 @@ impl State {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        let hammer_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("hammer buffer"),
+            contents: bytemuck::cast_slice(&[hammer]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let memory_integral_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("felt memory buffer"),
+            contents: bytemuck::cast_slice(&memory_integral),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         let push_constants = PushConstants {
             current_index: 0,
             future_index: 1,
             output_index: 0,
-            force: 0.0,
+            hammering: 0,
 
             linear_dampening: dampening[0],
             angular_dampening: dampening[1],
@@ -422,6 +484,26 @@ impl State {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
                 label: Some("Compute Bind Group Layout"),
             });
@@ -452,6 +534,14 @@ impl State {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: hammer_weights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: hammer_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: memory_integral_buffer.as_entire_binding(),
                 },
             ],
             label: Some("Compute Bind Group Layout"),
@@ -492,6 +582,15 @@ impl State {
             compilation_options: Default::default(),
         });
 
+        let hammer_half_step_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &shader,
+                entry_point: "hammer_half_step",
+                compilation_options: Default::default(),
+            });
+
         let compute_internals_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Compute Pipeline"),
@@ -507,6 +606,15 @@ impl State {
                 layout: Some(&compute_pipeline_layout),
                 module: &shader,
                 entry_point: "compute_forces",
+                compilation_options: Default::default(),
+            });
+
+        let hammer_update_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &shader,
+                entry_point: "hammer_update",
                 compilation_options: Default::default(),
             });
 
@@ -534,8 +642,10 @@ impl State {
             init_pipeline,
             create_reference_pipeline,
             half_step_pipeline,
+            hammer_half_step_pipeline,
             compute_internals_pipeline,
             compute_forces_pipeline,
+            hammer_update_pipeline,
             output_pipeline,
             nodes_buffer_size,
             edges_buffer_size,
@@ -595,75 +705,12 @@ impl State {
         Ok(())
     }
 
-    pub fn hammer(&mut self, steps: usize, force: f32) -> Result<(), Box<dyn Error>> {
-        // This is basically a normal simulation pass, except we are setting the external force to >0.0 for this many steps
-        // The 64 comes from the @workgroup_size(64) inside the shaders
-        let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
-        self.push_constants.force = force;
-        for _ in 0..steps {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Compute Encoder"),
-                });
-            {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Compute Pass"),
-                    timestamp_writes: None,
-                });
-                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                compute_pass.set_pipeline(&self.half_step_pipeline);
-                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
-                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-            }
-            {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Compute Pass"),
-                    timestamp_writes: None,
-                });
-                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                compute_pass.set_pipeline(&self.compute_internals_pipeline);
-                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
-                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-            }
-            {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Compute Pass"),
-                    timestamp_writes: None,
-                });
-                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                compute_pass.set_pipeline(&self.compute_forces_pipeline);
-                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
-                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-            }
-            (
-                self.push_constants.current_index,
-                self.push_constants.future_index,
-            ) = (
-                self.push_constants.future_index,
-                self.push_constants.current_index,
-            );
-            self.hammer_frames += 1;
-            // Save snapshot to output every oversampling_factor frames
-            if self.hammer_frames % self.oversampling_factor == 0 {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Compute Pass"),
-                    timestamp_writes: None,
-                });
-                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-                compute_pass.set_pipeline(&self.output_pipeline);
-                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
-                compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
-
-                self.push_constants.output_index =
-                    (self.push_constants.output_index + 1) % self.fdm_uniform.chunk_size;
-            }
-            self.queue.submit(iter::once(encoder.finish()));
+    pub fn enable_hammer(&mut self, enable: bool) -> Result<(), Box<dyn Error>> {
+        if enable {
+            self.push_constants.hammering = 1;
+        } else {
+            self.push_constants.hammering = 0;
         }
-
-        // Remove external force
-        self.push_constants.force = 0.0;
-
         Ok(())
     }
 
@@ -675,13 +722,13 @@ impl State {
         // Compute CHUNK_SIZE * OVERSAMPLING_FACTOR iterations.
         // Every OVERSAMPLING_FACTOR generate a new command buffer, to avoid overflow.
         for _ in 0..self.fdm_uniform.chunk_size {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Compute Encoder"),
+                });
             // FOR LOOP START
             for _ in 0..self.oversampling_factor {
-                let mut encoder =
-                    self.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("Compute Encoder"),
-                        });
                 {
                     let mut compute_pass =
                         encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -693,6 +740,18 @@ impl State {
                     compute_pass
                         .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
                     compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
+                }
+                {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Compute Pass"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                    compute_pass.set_pipeline(&self.hammer_half_step_pipeline);
+                    compute_pass
+                        .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                    compute_pass.dispatch_workgroups(1, 1, 1);
                 }
                 {
                     let mut compute_pass =
@@ -718,7 +777,18 @@ impl State {
                         .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
                     compute_pass.dispatch_workgroups(num_dispatches, 1, 1);
                 }
-                self.queue.submit(iter::once(encoder.finish()));
+                {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Compute Pass"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                    compute_pass.set_pipeline(&self.hammer_update_pipeline);
+                    compute_pass
+                        .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                    compute_pass.dispatch_workgroups(1, 1, 1);
+                }
                 (
                     self.push_constants.current_index,
                     self.push_constants.future_index,
@@ -728,6 +798,7 @@ impl State {
                 );
             }
             // FOR LOOP END
+            self.queue.submit(iter::once(encoder.finish()));
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -825,23 +896,6 @@ impl State {
         }
 
         Ok((Vec::new(), Vec::new()))
-    }
-
-    pub fn save_hammer(&mut self) -> Result<(Vec<Vec<Node>>, Vec<Vec<Edge>>), Box<dyn Error>> {
-        // Reset output index!
-        self.push_constants.output_index = 0;
-        let mut res = self.save();
-
-        let tail = self.hammer_frames % self.fdm_uniform.chunk_size as usize;
-
-        if let Ok((n, e)) = res.as_mut() {
-            n.truncate(tail);
-            e.truncate(tail);
-        }
-
-        //Reset hammer frames
-        self.hammer_frames = 0;
-        res
     }
 
     fn write_uniforms(&mut self) -> Result<(), Box<dyn Error>> {

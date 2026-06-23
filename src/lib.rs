@@ -20,7 +20,7 @@ mod py_wgpu_fdm {
         fn new(
             nodes: Vec<([f32; 3], [f32; 3], [f32; 4])>,
             edges: Vec<([f32; 4], [f32; 3], [f32; 3], [f32; 3])>,
-            hammer_weights: Vec<[f32; 4]>,
+            hammer_weights: Vec<f32>,
             oversampling_factor: usize,
             chunk_size: u32,
             dt: f32,
@@ -31,6 +31,13 @@ mod py_wgpu_fdm {
             inertia: [f32; 3],
             clamp_offset: u32,
             dampening: [f32; 2],
+            hammer_displacement: f32,
+            hammer_velocity: f32,
+            hammer_mass: f32,
+            hammer_stiffness: f32,
+            hammer_exponent: f32,
+            hammer_hysteresis_factor: f32,
+            hammer_relaxation_time: f32,
         ) -> PyResult<Self> {
             let nodes: Vec<gpu_bindings::Node> = nodes
                 .iter()
@@ -55,10 +62,21 @@ mod py_wgpu_fdm {
                 clamp_offset,
             );
 
+            let hammer = gpu_bindings::Hammer::new(
+                hammer_displacement,
+                hammer_velocity,
+                hammer_mass,
+                hammer_stiffness,
+                hammer_exponent,
+                hammer_hysteresis_factor,
+                hammer_relaxation_time,
+            );
+
             let state = pollster::block_on(gpu_bindings::State::new(
                 nodes,
                 edges,
                 hammer_weights,
+                hammer,
                 uniforms,
                 oversampling_factor,
                 dampening,
@@ -108,40 +126,6 @@ mod py_wgpu_fdm {
             Ok((n, e))
         }
 
-        // used to export the hammer frames
-        // identical to save except it does not panic on chunk_size-frame_count-mismatch
-        // it does however assert that the frames
-        fn save_hammer(
-            &mut self,
-        ) -> PyResult<(Vec<Vec<[[f32; 3]; 4]>>, Vec<Vec<([f32; 4], [[f32; 3]; 3])>>)> {
-            let (node_frames, edge_frames) = self
-                .state
-                .save_hammer()
-                .map_err(|_| PyRuntimeError::new_err("error running GPU computation"))?;
-
-            let n = node_frames
-                .into_iter()
-                .map(|nodes| {
-                    nodes
-                        .into_iter()
-                        .map(gpu_bindings::Node::to_raw)
-                        .collect::<Vec<[[f32; 3]; 4]>>()
-                })
-                .collect();
-
-            let e = edge_frames
-                .into_iter()
-                .map(|edges| {
-                    edges
-                        .into_iter()
-                        .map(gpu_bindings::Edge::to_raw)
-                        .collect::<Vec<([f32; 4], [[f32; 3]; 3])>>()
-                })
-                .collect();
-
-            Ok((n, e))
-        }
-
         fn initialize(&mut self) -> PyResult<()> {
             _ = self.state.initialize();
             Ok(())
@@ -152,8 +136,8 @@ mod py_wgpu_fdm {
             Ok(())
         }
 
-        fn hammer(&mut self, steps: usize, force: f32) -> PyResult<()> {
-            _ = self.state.hammer(steps, force);
+        fn enable_hammer(&mut self, enable: bool) -> PyResult<()> {
+            _ = self.state.enable_hammer(enable);
             Ok(())
         }
 
