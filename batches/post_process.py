@@ -372,15 +372,15 @@ def process_and_email(sim_dir, run_id, config, email_config, m_node, inertia, K_
             p1 = plot_node_pos_vel_moment_fft(pos_all[hammer_limit:], vel_all[hammer_limit:], mom_all[hammer_limit:], config["dt"], config["oversampling_factor"], save_output=True, prefix=str(free_dir))
             p2 = plot_axis_angle_over_time(quat_all[hammer_limit:], node_idx, save_output=True, prefix=str(free_dir))
             p3 = plot_energies(t_ke_all[hammer_limit:], r_ke_all[hammer_limit:], bt_pe_all[hammer_limit:], ss_pe_all[hammer_limit:], dl, save_output=True, prefix=str(free_dir))
-            p4 = plot_energies(t_ke_all, r_ke_all, bt_pe_all, ss_pe_all, dl, save_output=True, show_totals=True, prefix=str(full_dir))
+            p4 = plot_energies(t_ke_all[hammer_limit:], r_ke_all[hammer_limit:], bt_pe_all[hammer_limit:], ss_pe_all[hammer_limit:], dl, save_output=True, show_totals=True, prefix=str(free_dir))
             free_files = p1 + ([p2] if p2 else []) + ([p3] if p3 else []) + ([p4] if p4 else [])
         else:
             free_files = []
 
-        s1 = plot_node_pos_vel_moment_fft(pos_all, vel_all, mom_all, config["dt"], config["oversampling_factor"], save_output=True, prefix=str(full_dir))
-        s2 = plot_axis_angle_over_time(quat_all, node_idx, save_output=True, prefix=str(full_dir))
-        s3 = plot_energies(t_ke_all, r_ke_all, bt_pe_all, ss_pe_all, dl, save_output=True, prefix=str(full_dir))
-        s4 = plot_energies(t_ke_all, r_ke_all, bt_pe_all, ss_pe_all, dl, save_output=True, show_totals=True, prefix=str(full_dir))
+        s1 = plot_node_pos_vel_moment_fft(pos_all[:hammer_limit], vel_all[:hammer_limit], mom_all[:hammer_limit], config["dt"], config["oversampling_factor"], save_output=True, prefix=str(free_dir))
+        s2 = plot_axis_angle_over_time(quat_all[:hammer_limit], node_idx, save_output=True, prefix=str(free_dir))
+        s3 = plot_energies(t_ke_all[:hammer_limit], r_ke_all[:hammer_limit], bt_pe_all[:hammer_limit], ss_pe_all[:hammer_limit], dl, save_output=True, prefix=str(free_dir))
+        s4 = plot_energies(t_ke_all[:hammer_limit], r_ke_all[:hammer_limit], bt_pe_all[:hammer_limit], ss_pe_all[:hammer_limit], dl, save_output=True, show_totals=True, prefix=str(free_dir))
         short_files = s1 + ([s2] if s2 else []) + ([s3] if s3 else []) + ([s4] if s4 else [])
 
 
