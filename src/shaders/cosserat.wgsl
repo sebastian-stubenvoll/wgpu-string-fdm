@@ -24,8 +24,8 @@ struct Edge {
     len_inv: f32, // 4 bytes
 
     strain: vec3<f32>, // 12 bytes
-    dilatation: f32, // 4 bytes; this is actually the previous dilatation.
-    
+    // 4 bytes of implicit padding
+        
     reference_strain: vec3<f32>, // 12 bytes
     // 4 bytes of implicit padding
 
@@ -124,10 +124,6 @@ fn init(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let future = (c.future * uniforms.node_count) + global_id.x;
     if (global_id.x < uniforms.node_count - 1) {
         let r = edges[current].reference_vector + (nodes[current + 1].displacement - nodes[current].displacement);
-
-        let dilatation = length(r) * uniforms.dl_inv;
-        edges[current].dilatation = dilatation;
-        edges[future].dilatation = dilatation;
     }
 }
 
@@ -206,7 +202,6 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let sigma_eff = current_strain_MF - edges[current].reference_strain; // (MF)
         edges[future].strain = sigma_eff;
         edges[current].internal_force = rotate(edges[current].orientation, (uniforms.stiffness_se * sigma_eff * dilatation_inv)) ; // (LF)
-        edges[future].dilatation = 1.0 / dilatation_inv;
     }
 
     if ( global_id.x < uniforms.node_count - 2) {
@@ -228,12 +223,10 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
         var effective_orientation = qmul(qinv(nodes[current].reference_orientation), relative_orientation); // (MF)
         // if (effective_orientation.w < 0.0) { effective_orientation = -effective_orientation; }
 
-        let epsilon_inv = ((len_inv * next_len_inv) / (len_inv + next_len_inv)) * uniforms.dl * 2.0;
-
         // This is B applied to kappa (MF); here B is diagonal -> pointwise multiplication
         let kappa = 2.0 * uniforms.dl_inv * effective_orientation.xyz;
         nodes[current].curvature = kappa;
-        nodes[current].internal_moment = uniforms.stiffness_bt * kappa * epsilon_inv * epsilon_inv * epsilon_inv;
+        nodes[current].internal_moment = uniforms.stiffness_bt * kappa;
     }
 }
 
@@ -291,8 +284,6 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let r = edges[current].reference_vector + (nodes[current + 1].displacement - nodes[current].displacement);
         let tangent_LF = r * uniforms.dl_inv;
         let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
-        let dilatation_inv = uniforms.dl * edges[current].len_inv;
-        let dilatation_t= (edges[future].dilatation - edges[current].dilatation) * uniforms.dt_inv;
 
         let ext_couple = vec3<f32>(0.0, 0.0, 0.0);
         let damping_torque = - c.angular_dampening * edges[current].angular_velocity;
@@ -311,14 +302,12 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
 
     
-        let phi_tt =( ( difference
+        let phi_tt =( difference
                             + average
                             + (cross(tangent_MF, rotate_inv(edges[current].orientation, edges[current].internal_force)) * uniforms.dl)
                             + ext_couple
                             + damping_torque
-                            ) * edges[current].dilatation
                             + cross((uniforms.inertia * edges[current].angular_velocity), edges[current].angular_velocity) 
-                            + uniforms.inertia * edges[current].angular_velocity * dilatation_inv * dilatation_t
                             ) * uniforms.inertia_inv;
 
 

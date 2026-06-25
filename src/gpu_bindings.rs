@@ -50,13 +50,13 @@ pub struct Edge {
     angular_velocity: [f32; 3],
     len_inv: f32,
     strain: [f32; 3],
-    dilation: f32,
-    reference_strain: [f32; 3],
     _pad0: u32,
-    internal_force: [f32; 3],
+    reference_strain: [f32; 3],
     _pad1: u32,
-    reference_vector: [f32; 3],
+    internal_force: [f32; 3],
     _pad2: u32,
+    reference_vector: [f32; 3],
+    _pad3: u32,
 }
 
 impl Edge {
@@ -71,13 +71,13 @@ impl Edge {
             angular_velocity: *angular_velocity,
             len_inv: 0.0,
             strain: [0.0; 3],
-            dilation: 0.0,
-            reference_strain: *reference_strain,
             _pad0: 0,
-            internal_force: [0.0; 3],
+            reference_strain: *reference_strain,
             _pad1: 0,
-            reference_vector: *reference_vector,
+            internal_force: [0.0; 3],
             _pad2: 0,
+            reference_vector: *reference_vector,
+            _pad3: 0,
         }
     }
 
