@@ -315,7 +315,7 @@ def process_and_email(sim_dir, run_id, config, email_config, m_node, inertia, K_
     node_files = sorted(sim_path.glob("n_*.npy"))
     edge_files = sorted(sim_path.glob("e_*.npy"))
     
-    node_idx = config.get("inspected", 10)
+    node_idx = config.get("inspect_node", 10)
     
     pos_all, vel_all, mom_all, quat_all = [], [], [], []
     t_ke_all, r_ke_all, bt_pe_all, ss_pe_all = [], [], [], []
