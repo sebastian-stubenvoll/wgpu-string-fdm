@@ -74,19 +74,14 @@ def generate_straight_rod(
         for _ in reference_positions
     ]
 
-    return reference_positions, nodes, edges, dl, mass, inertia, K_se, K_bt
+    return nodes, edges, dl, mass, inertia, K_se, K_bt
 
-def make_weights(node_count, node_index=None, width_count=4):
-    data = np.zeros((node_count, 4), dtype=np.float32)
+def make_weights(node_count, node_index=None, width_count=4, order=10):
     x = np.arange(node_count, dtype=np.float32)
-    if node_index is None:
-        node_index = node_count // 2
 
-    sigma = width_count / 2.355
-    if sigma == 0:
-        sigma = 1e-5
+    sigma = width_count / 2.0
+    data = np.exp(-((np.abs(x - node_index) / sigma) ** order))
 
-    gauss_vals = np.exp(-((x - node_index) ** 2) / (2 * sigma ** 2))
-    mask = np.abs(x - node_index) <= width_count
-    data[:, 2] = gauss_vals * mask
+    data[data < 1e-4] = 0.0
+
     return data

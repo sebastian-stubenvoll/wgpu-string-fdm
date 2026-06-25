@@ -76,4 +76,6 @@ docs/_build/
 
 old/
 
-simulation_results/
+batches/simulation_results/
+
+.env

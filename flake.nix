@@ -82,7 +82,8 @@
               matplotlib \
               notebook \
               jupyter \
-              sounddevice
+              sounddevice \
+              python-dotenv
 
             export PYO3_PYTHON=$(pwd)/${venvDir}/bin/python
             python -m ipykernel install --user \
