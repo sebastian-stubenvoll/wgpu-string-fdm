@@ -106,6 +106,7 @@ class SimulationRun:
 
         dispatches = self.config["dispatches"]
 
+        self.sim.enable_hammer(True)
         for dispatch in range(dispatches):
             self.sim.compute()
             n, e = self.sim.save()
@@ -113,10 +114,7 @@ class SimulationRun:
 
             if dispatch == 1:
                 print(f"[{datetime.now()}] Run {self.run_id:03d}: Disabling hammer.")
-                if hasattr(self.sim, 'disable_hammer'):
-                    self.sim.disable_hammer()
-                else:
-                    self.sim.hammer_mass = 0.0 
+                self.sim.enable_hammer(False)
 
             if dispatch % 10 == 0 or dispatch == dispatches - 1:
                 print(f"run {self.run_id:03d} {dispatch + 1}/{dispatches}")
