@@ -5,13 +5,13 @@ load_dotenv()
 
 SIM_CONFIG = {
     "node_count": 1024,
-    "dt": 2e-7,
+    "dt": 4e-7,
     "chunk_size": 512,
     "dispatches": 1,
     "hammer_node": 25,
     "inspect_node": 25,
     "hammer_width": 1,
-    "oversampling_factor": int(1.0 / (2e-7 * 50_000)),
+    "oversampling_factor": int(1.0 / (4e-7 * 50_000)),
     "dampening": [1e-6, 1e-6],
 }
 

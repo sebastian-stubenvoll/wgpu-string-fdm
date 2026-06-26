@@ -34,8 +34,21 @@ class SimulationRun:
                 break
 
             dispatch, nodes, edges = item
-            np.save(self.sim_dir / f"n_{dispatch:06d}.npy", np.array(nodes, dtype=object))
-            np.save(self.sim_dir / f"e_{dispatch:06d}.npy", np.array(edges, dtype=object))
+            try:
+                # Pre-allocate empty object arrays
+                n_arr = np.empty(len(nodes), dtype=object)
+                e_arr = np.empty(len(edges), dtype=object)
+                
+                # Assign lists to bypass inner shape validation
+                n_arr[:] = list(nodes)
+                e_arr[:] = list(edges)
+
+                # Save the explicitly constructed object arrays
+                np.save(self.sim_dir / f"n_{dispatch:06d}.npy", n_arr)
+                np.save(self.sim_dir / f"e_{dispatch:06d}.npy", e_arr)
+            except Exception as e:
+                print(f"Write error on dispatch {dispatch}: {e}")
+
             self.write_queue.task_done()
 
     def save_metadata(self):
