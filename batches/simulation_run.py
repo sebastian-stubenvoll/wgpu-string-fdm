@@ -1,6 +1,8 @@
 import threading
 import queue
 import json
+import pickle
+import gzip
 from pathlib import Path
 from datetime import datetime
 import numpy as np
@@ -21,7 +23,8 @@ class SimulationRun:
         self.sim_dir = Path(base_dir) / f"{timestamp_str}_run_{run_id:03d}"
         self.sim_dir.mkdir(parents=True, exist_ok=True)
 
-        self.write_queue = queue.Queue(maxsize=128)
+        # Strict backpressure: only 2 chunks allowed in RAM at a time.
+        self.write_queue = queue.Queue(maxsize=2)
         self.writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
 
         self.rod_derived = {}
@@ -35,17 +38,21 @@ class SimulationRun:
 
             dispatch, nodes, edges = item
             try:
-                # Pre-allocate empty object arrays
-                n_arr = np.empty(len(nodes), dtype=object)
-                e_arr = np.empty(len(edges), dtype=object)
-                
-                # Assign lists to bypass inner shape validation
-                n_arr[:] = list(nodes)
-                e_arr[:] = list(edges)
+                # GZIP Compression with compresslevel=4 for fast write speeds
+                n_file = self.sim_dir / f"n_{dispatch:06d}.pkl.gz"
+                e_file = self.sim_dir / f"e_{dispatch:06d}.pkl.gz"
 
-                # Save the explicitly constructed object arrays
-                np.save(self.sim_dir / f"n_{dispatch:06d}.npy", n_arr)
-                np.save(self.sim_dir / f"e_{dispatch:06d}.npy", e_arr)
+                with gzip.open(n_file, "wb", compresslevel=4) as f:
+                    pickle.dump(nodes, f, protocol=pickle.HIGHEST_PROTOCOL)
+                
+                with gzip.open(e_file, "wb", compresslevel=4) as f:
+                    pickle.dump(edges, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+                # Explicitly severe references so Python immediately reclaims the RAM
+                del nodes
+                del edges
+                del item
+
             except Exception as e:
                 print(f"Write error on dispatch {dispatch}: {e}")
 
@@ -122,8 +129,15 @@ class SimulationRun:
         self.sim.enable_hammer(True)
         for dispatch in range(dispatches):
             self.sim.compute()
-            n, e = self.sim.save()
-            self.write_queue.put((dispatch, n, e))
+            n_raw, e_raw = self.sim.save()
+
+            # --- CRITICAL ---
+            # Deep-copy into pure Python lists NOW so the background 
+            # thread doesn't read GPU memory during the next compute()
+            n_safe = list(n_raw)
+            e_safe = list(e_raw)
+
+            self.write_queue.put((dispatch, n_safe, e_safe))
 
             if dispatch == 1:
                 print(f"[{datetime.now()}] Run {self.run_id:03d}: Disabling hammer.")

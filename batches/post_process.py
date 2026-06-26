@@ -11,6 +11,8 @@ import smtplib
 from email.message import EmailMessage
 import os
 import threading
+import pickle
+import gzip
 
 plot_lock = threading.Lock()
 
@@ -36,7 +38,6 @@ def E_PS(strain, K_se):
     return 0.5 * np.dot(s, k * s)
 
 
-
 def plot_node_pos_vel_moment_fft(
     pos, vel, mom, 
     dt,
@@ -46,7 +47,7 @@ def plot_node_pos_vel_moment_fft(
     save_output=False,
     windowing=False,
     fundamental_weight=0.2,
-    prefix="unkown"
+    prefix="unknown"
 ):
     T = len(pos)
     time = np.arange(T) * dt * oversampling_factor
@@ -65,9 +66,6 @@ def plot_node_pos_vel_moment_fft(
             sig = sig * window
         fft = np.fft.rfft(sig)
         return np.abs(fft)
-
-    def stiff_string_model(n, f1_val, B_val):
-        return n * f1_val * np.sqrt(1 + B_val * (n**2))
 
     saved_files = []
 
@@ -168,7 +166,9 @@ def plot_node_pos_vel_moment_fft(
             
             if len(ns) >= 4:
                 try:
-                    popt, pcov = curve_fit(stiff_string_model, ns, fns, p0=[f1_est, 0.0001])
+                    # Removed curve_fit requirement to assume `stiff_string_model` exists globally
+                    # Assuming stiff_string_model was defined elsewhere or skipping to avoid NameError
+                    popt, pcov = curve_fit(lambda n, f1, B: n * f1 * np.sqrt(1 + B * n**2), ns, fns, p0=[f1_est, 0.0001])
                     f1_fit, B_fit = popt
                 except RuntimeError:
                     pass
@@ -176,7 +176,7 @@ def plot_node_pos_vel_moment_fft(
             ax_fit.plot(freqs, mag_norm, color='lightgray', label='Spectrum')
             ax_fit.plot(peak_freqs, peak_mags, 'x', color='tab:blue', label='Detected Peaks')
 
-            fitted_freqs = stiff_string_model(ns, f1_fit, B_fit)
+            fitted_freqs = ns * f1_fit * np.sqrt(1 + B_fit * ns**2)
             
             if len(fitted_freqs) > 0:
                 ax_fit.scatter(fitted_freqs, np.interp(fitted_freqs, freqs, mag_norm), 
@@ -205,10 +205,10 @@ def plot_node_pos_vel_moment_fft(
 
         if save_output:
             filename = os.path.join(prefix, f"{label}_pos_vel_fft.png")
-            plt.savefig(filename, dpi=300, bbox_inches="tight")
+            fig.savefig(filename, dpi=300, bbox_inches="tight")
             saved_files.append(filename)
 
-        plt.close()
+        plt.close(fig)
     return saved_files
 
 
@@ -254,9 +254,9 @@ def plot_axis_angle_over_time(quats, node_index, components="xyz", save_output=F
     saved_file = None
     if save_output:
         filename = os.path.join(prefix, "angles.png")
-        plt.savefig(filename, dpi=300, bbox_inches="tight")
+        fig.savefig(filename, dpi=300, bbox_inches="tight")
         saved_file = filename
-    plt.close()
+    plt.close(fig)
     return saved_file
 
 
@@ -277,7 +277,7 @@ def plot_energies(trans_ke, rot_ke, bend_twist_pe, shear_stretch_pe, dl, show_to
     total_pot = bend_pe + shear_pe
     total_energy = total_kin + total_pot
 
-    plt.figure(figsize=(12, 8))
+    fig = plt.figure(figsize=(12, 8))
     plt.plot(trans_ke, label="Translational KE", alpha=0.4, linestyle=':')
     plt.plot(rot_ke, label="Rotational KE", alpha=0.4, linestyle=':')
     plt.plot(bend_pe, label="Potential: Bend/Twist", alpha=0.4, linestyle=':')
@@ -299,10 +299,10 @@ def plot_energies(trans_ke, rot_ke, bend_twist_pe, shear_stretch_pe, dl, show_to
     saved_file = None
     if save_output:        
         filename = os.path.join(prefix, "energy.png")
-        plt.savefig(filename, dpi=300, bbox_inches="tight")
+        fig.savefig(filename, dpi=300, bbox_inches="tight")
         saved_file = filename
         
-    plt.close()
+    plt.close(fig)
     print(f"Total Energy Mean: {np.mean(total_energy):.6e} J")
     print(f"Energy Variation: {np.std(total_energy):.6e} J")
     return saved_file
@@ -312,8 +312,9 @@ def process_and_email(sim_dir, run_id, config, email_config, m_node, inertia, K_
     sim_path = Path(sim_dir)
     print(f"[{datetime.now()}] Streaming chunks to extract lightweight timeseries...")
     
-    node_files = sorted(sim_path.glob("n_*.npy"))
-    edge_files = sorted(sim_path.glob("e_*.npy"))
+    # LOAD compressed .pkl.gz files
+    node_files = sorted(sim_path.glob("n_*.pkl.gz"))
+    edge_files = sorted(sim_path.glob("e_*.pkl.gz"))
     
     node_idx = config.get("inspect_node", 10)
     
@@ -321,9 +322,12 @@ def process_and_email(sim_dir, run_id, config, email_config, m_node, inertia, K_
     t_ke_all, r_ke_all, bt_pe_all, ss_pe_all = [], [], [], []
     
     for nf, ef in zip(node_files, edge_files):
-        n_chunk = np.load(nf, allow_pickle=True)
-        e_chunk = np.load(ef, allow_pickle=True)
-        
+        # STREAMING with gzip transparent decompression
+        with gzip.open(nf, "rb") as f:
+            n_chunk = pickle.load(f)
+        with gzip.open(ef, "rb") as f:
+            e_chunk = pickle.load(f)
+            
         for i in range(len(n_chunk)):
             n_frame = n_chunk[i]
             e_frame = e_chunk[i]
@@ -346,6 +350,10 @@ def process_and_email(sim_dir, run_id, config, email_config, m_node, inertia, K_
                 
             t_ke_all.append(t_sum); bt_pe_all.append(bt_sum)
             r_ke_all.append(r_sum); ss_pe_all.append(ss_sum)
+
+        # Explicit garbage collection for the massive chunks
+        del n_chunk
+        del e_chunk
 
     pos_all = np.array(pos_all, dtype=np.float32)
     vel_all = np.array(vel_all, dtype=np.float32)
