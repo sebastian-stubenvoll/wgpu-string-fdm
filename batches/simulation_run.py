@@ -139,7 +139,7 @@ class SimulationRun:
 
             self.write_queue.put((dispatch, n_safe, e_safe))
 
-            if dispatch == 1:
+            if dispatch == 5:
                 print(f"[{datetime.now()}] Run {self.run_id:03d}: Disabling hammer.")
                 self.sim.enable_hammer(False)
 
