@@ -4,7 +4,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
-from scipy.signal import find_peaks, butter, sosfiltfilt
+from scipy.signal import find_peaks, butter, sosfiltfilt, spectrogram
 from scipy.optimize import curve_fit
 from scipy.spatial.transform import Rotation as R
 import smtplib
@@ -286,6 +286,42 @@ def plot_axis_angle_over_time(quats, node_index, components="xyz", save_output=F
     plt.close(fig)
     return saved_file
 
+def plot_euler_unwrapped(quats, node_index, save_output=False, prefix="unknown"):
+    """Plots unwrapped Euler angles to prevent 0 to 2pi jump artifacts."""
+    q_array = np.array(quats, dtype=float)
+    # Normalize quaternions safely
+    norms = np.linalg.norm(q_array, axis=1, keepdims=True)
+    q_array = np.divide(q_array, norms, out=np.zeros_like(q_array), where=norms!=0)
+    
+    rot = R.from_quat(q_array)
+    euler_angles = rot.as_euler('xyz', degrees=False) # Get in radians first
+    
+    # Unwrap to prevent jumps, then convert to degrees
+    euler_unwrapped = np.unwrap(euler_angles, axis=0)
+    euler_deg = np.degrees(euler_unwrapped)
+    
+    t = np.arange(len(quats))
+    
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(t, euler_deg[:, 0], label="Roll (X)", alpha=0.8)
+    ax.plot(t, euler_deg[:, 1], label="Pitch (Y)", alpha=0.8)
+    ax.plot(t, euler_deg[:, 2], label="Yaw (Z)", alpha=0.8)
+    
+    ax.set_title(f"Unwrapped Euler Angles Over Time (Node {node_index})")
+    ax.set_ylabel("Angle (Degrees)")
+    ax.set_xlabel("Frame")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    saved_file = []
+    if save_output:
+        filename = os.path.join(prefix, "euler_angles_unwrapped.png")
+        fig.savefig(filename, dpi=300, bbox_inches="tight")
+        saved_file = [filename]
+    plt.close(fig)
+    return saved_file
+
 
 def plot_energies(trans_ke, rot_ke, bend_twist_pe, shear_stretch_pe, dl, show_totals=False, remove_offset=True, save_output=False, prefix="unknown"):
     trans_ke = np.array(trans_ke)
@@ -335,6 +371,132 @@ def plot_energies(trans_ke, rot_ke, bend_twist_pe, shear_stretch_pe, dl, show_to
     print(f"Energy Variation: {np.std(total_energy):.6e} J")
     return saved_file
 
+def plot_energy_partition(trans_ke, rot_ke, bend_pe, shear_pe, dl, save_output=False, prefix="unknown"):
+    """Plots Normalized Stacked Area & Gradient (Energy Transfer Rate) over time."""
+    t_ke = np.array(trans_ke)
+    r_ke = np.array(rot_ke)
+    b_pe = np.array(bend_pe) * dl
+    s_pe = np.array(shear_pe) * dl
+
+    # Smooth the signals slightly to make trends visible over high-freq oscillations
+    sos = butter(2, 0.05, btype='low', output='sos')
+    t_ke_s = np.abs(sosfiltfilt(sos, t_ke))
+    r_ke_s = np.abs(sosfiltfilt(sos, r_ke))
+    b_pe_s = np.abs(sosfiltfilt(sos, b_pe))
+    s_pe_s = np.abs(sosfiltfilt(sos, s_pe))
+    
+    total_e_s = t_ke_s + r_ke_s + b_pe_s + s_pe_s
+    # Avoid division by zero
+    total_e_s[total_e_s == 0] = 1e-10
+
+    # Normalized Percentages
+    t_norm = (t_ke_s / total_e_s) * 100
+    r_norm = (r_ke_s / total_e_s) * 100
+    b_norm = (b_pe_s / total_e_s) * 100
+    s_norm = (s_pe_s / total_e_s) * 100
+
+    frames = np.arange(len(t_ke))
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    
+    # 1. Stacked Area Plot
+    axes[0].stackplot(frames, t_norm, r_norm, b_norm, s_norm, 
+                      labels=['Trans KE', 'Rot KE', 'Bend/Twist PE', 'Shear/Stretch PE'],
+                      colors=['tab:blue', 'tab:orange', 'tab:green', 'tab:red'], alpha=0.8)
+    axes[0].set_title("Normalized Energy Partition (Mode Transfer)")
+    axes[0].set_ylabel("Percentage of Total Energy (%)")
+    axes[0].set_ylim(0, 100)
+    axes[0].legend(loc='upper left', bbox_to_anchor=(1.02, 1))
+    
+    # 2. Gradient (Rate of Energy Transfer)
+    t_grad = np.gradient(t_ke_s)
+    r_grad = np.gradient(r_ke_s)
+    b_grad = np.gradient(b_pe_s)
+    s_grad = np.gradient(s_pe_s)
+
+    axes[1].plot(frames, t_grad, label=r'$\Delta$ Trans KE', color='tab:blue', alpha=0.7)
+    axes[1].plot(frames, r_grad, label=r'$\Delta$ Rot KE', color='tab:orange', alpha=0.9, linewidth=1.5)
+    axes[1].plot(frames, b_grad, label=r'$\Delta$ Bend/Twist PE', color='tab:green', alpha=0.7)
+    axes[1].plot(frames, s_grad, label=r'$\Delta$ Shear/Stretch PE', color='tab:red', alpha=0.7)
+    
+    axes[1].axhline(0, color='black', linewidth=1, linestyle='--')
+    axes[1].set_title("Energy Gradients (Power flow in/out of modes)")
+    axes[1].set_ylabel("dE/dt (Smoothed)")
+    axes[1].set_xlabel("Frame Index")
+    axes[1].legend(loc='upper left', bbox_to_anchor=(1.02, 1))
+
+    plt.tight_layout()
+    
+    saved_file = []
+    if save_output:
+        filename = os.path.join(prefix, "energy_partition_transfer.png")
+        fig.savefig(filename, dpi=300, bbox_inches="tight")
+        saved_file = [filename]
+    plt.close(fig)
+    return saved_file
+
+def plot_spectrogram(pos, dt, oversampling_factor, save_output=False, prefix="unknown"):
+    """Generates a Waterfall/Spectrogram plot for node displacement."""
+    fs = 1.0 / (dt * oversampling_factor)
+    saved_files = []
+    
+    components = [("x", pos[:, 0]), ("y", pos[:, 1]), ("z", pos[:, 2])]
+    
+    for label, data in components:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        
+        # Scipy spectrogram: nperseg determines freq vs time resolution tradeoff
+        nperseg = min(256, len(data) // 4)
+        if nperseg < 16:
+            plt.close(fig)
+            continue # Too short for a meaningful spectrogram
+            
+        f, t, Sxx = spectrogram(data - np.mean(data), fs=fs, nperseg=nperseg, noverlap=nperseg//2)
+        
+        # Plot log scale to make smaller partials visible
+        pcm = ax.pcolormesh(t, f, 10 * np.log10(Sxx + 1e-12), shading='gouraud', cmap='inferno')
+        fig.colorbar(pcm, ax=ax, label='Power/Frequency (dB/Hz)')
+        
+        ax.set_title(f"Waterfall/Spectrogram: {label.upper()}-Displacement")
+        ax.set_ylabel('Frequency [Hz]')
+        ax.set_xlabel('Time [sec]')
+        ax.set_ylim(0, min(20000, fs/2)) # Cap at 20kHz or Nyquist
+        
+        plt.tight_layout()
+        if save_output:
+            filename = os.path.join(prefix, f"{label}_spectrogram.png")
+            fig.savefig(filename, dpi=300, bbox_inches="tight")
+            saved_files.append(filename)
+        plt.close(fig)
+        
+    return saved_files
+
+def plot_phase_space(pos, vel, save_output=False, prefix="unknown"):
+    """Phase space portrait (Displacement vs Velocity) for X, Y, Z."""
+    saved_files = []
+    components = [("x", pos[:, 0], vel[:, 0]), ("y", pos[:, 1], vel[:, 1]), ("z", pos[:, 2], vel[:, 2])]
+    
+    for label, p_data, v_data in components:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        
+        # Plot with a color gradient over time to show evolution/damping
+        time = np.linspace(0, 1, len(p_data))
+        ax.scatter(p_data, v_data, c=time, cmap='viridis', s=1, alpha=0.5)
+        
+        ax.set_title(f"Phase Space Portrait ({label.upper()})")
+        ax.set_xlabel("Displacement")
+        ax.set_ylabel("Velocity")
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        if save_output:
+            filename = os.path.join(prefix, f"{label}_phase_space.png")
+            fig.savefig(filename, dpi=300, bbox_inches="tight")
+            saved_files.append(filename)
+        plt.close(fig)
+        
+    return saved_files
+
 
 # ---------------------------------------------------------
 # Main Processor
@@ -375,6 +537,8 @@ def process_and_email(sim_dir, run_id, config, email_config, m_node, inertia, K_
     free_dir = sim_path / "free_vib"
     full_dir.mkdir(exist_ok=True)
     free_dir.mkdir(exist_ok=True)
+    short_dir = sim_path / "short_vib"
+    short_dir.mkdir(exist_ok=True)
     
     hammer_limit = 5 * config["chunk_size"]
 
@@ -389,21 +553,31 @@ def process_and_email(sim_dir, run_id, config, email_config, m_node, inertia, K_
     # --- Full Simulation Tasks ---
     plot_tasks.append((plot_node_pos_vel_moment_fft, (pos_all, vel_all, mom_all, dt, oversamp, 20_000, False, True, False, 0.2, str(full_dir))))
     plot_tasks.append((plot_axis_angle_over_time, (quat_all, node_idx, "xyz", True, str(full_dir))))
+    plot_tasks.append((plot_euler_unwrapped, (quat_all, node_idx, True, str(full_dir))))
     plot_tasks.append((plot_energies, (t_ke_all, r_ke_all, bt_pe_all, ss_pe_all, dl, False, True, True, str(full_dir))))
     plot_tasks.append((plot_energies, (t_ke_all, r_ke_all, bt_pe_all, ss_pe_all, dl, True, True, True, str(full_dir))))
+    plot_tasks.append((plot_energy_partition, (t_ke_all, r_ke_all, bt_pe_all, ss_pe_all, dl, True, str(full_dir))))
 
     # --- Free Vibration Tasks ---
     if len(pos_all) > hammer_limit:
         plot_tasks.append((plot_node_pos_vel_moment_fft, (pos_all[hammer_limit:], vel_all[hammer_limit:], mom_all[hammer_limit:], dt, oversamp, 20_000, False, True, False, 0.2, str(free_dir))))
         plot_tasks.append((plot_axis_angle_over_time, (quat_all[hammer_limit:], node_idx, "xyz", True, str(free_dir))))
+        plot_tasks.append((plot_euler_unwrapped, (quat_all[hammer_limit:], node_idx, True, str(free_dir))))
         plot_tasks.append((plot_energies, (t_ke_all[hammer_limit:], r_ke_all[hammer_limit:], bt_pe_all[hammer_limit:], ss_pe_all[hammer_limit:], dl, False, True, True, str(free_dir))))
         plot_tasks.append((plot_energies, (t_ke_all[hammer_limit:], r_ke_all[hammer_limit:], bt_pe_all[hammer_limit:], ss_pe_all[hammer_limit:], dl, True, True, True, str(free_dir))))
+        plot_tasks.append((plot_energy_partition, (t_ke_all[hammer_limit:], r_ke_all[hammer_limit:], bt_pe_all[hammer_limit:], ss_pe_all[hammer_limit:], dl, True, str(free_dir))))
 
     # --- Short Files Tasks ---
-    plot_tasks.append((plot_node_pos_vel_moment_fft, (pos_all[:hammer_limit], vel_all[:hammer_limit], mom_all[:hammer_limit], dt, oversamp, 20_000, False, True, False, 0.2, str(free_dir))))
-    plot_tasks.append((plot_axis_angle_over_time, (quat_all[:hammer_limit], node_idx, "xyz", True, str(free_dir))))
-    plot_tasks.append((plot_energies, (t_ke_all[:hammer_limit], r_ke_all[:hammer_limit], bt_pe_all[:hammer_limit], ss_pe_all[:hammer_limit], dl, False, True, True, str(free_dir))))
-    plot_tasks.append((plot_energies, (t_ke_all[:hammer_limit], r_ke_all[:hammer_limit], bt_pe_all[:hammer_limit], ss_pe_all[:hammer_limit], dl, True, True, True, str(free_dir))))
+    plot_tasks.append((plot_node_pos_vel_moment_fft, (pos_all[:hammer_limit], vel_all[:hammer_limit], mom_all[:hammer_limit], dt, oversamp, 20_000, False, True, False, 0.2, str(short_dir))))
+    plot_tasks.append((plot_axis_angle_over_time, (quat_all[:hammer_limit], node_idx, "xyz", True, str(short_dir))))
+    plot_tasks.append((plot_euler_unwrapped, (quat_all[:hammer_limit], node_idx, True, str(short_dir))))
+    plot_tasks.append((plot_energies, (t_ke_all[:hammer_limit], r_ke_all[:hammer_limit], bt_pe_all[:hammer_limit], ss_pe_all[:hammer_limit], dl, False, True, True, str(short_dir))))
+    plot_tasks.append((plot_energies, (t_ke_all[:hammer_limit], r_ke_all[:hammer_limit], bt_pe_all[:hammer_limit], ss_pe_all[:hammer_limit], dl, True, True, True, str(short_dir))))
+    plot_tasks.append((plot_energy_partition, (t_ke_all[:hammer_limit], r_ke_all[:hammer_limit], bt_pe_all[:hammer_limit], ss_pe_all[:hammer_limit], dl, True, str(short_dir))))
+    
+    # New additions for Short Vibes only
+    plot_tasks.append((plot_spectrogram, (pos_all[:hammer_limit], dt, oversamp, True, str(short_dir))))
+    plot_tasks.append((plot_phase_space, (pos_all[:hammer_limit], vel_all[:hammer_limit], True, str(short_dir))))
 
     generated_files = []
     
