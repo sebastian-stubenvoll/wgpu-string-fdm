@@ -515,7 +515,7 @@ def process_and_email(sim_dir, run_id, config, email_config, m_node, inertia, K_
         for nf, ef in zip(node_files, edge_files)
     ]
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=32) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=16) as executor:
         results = list(executor.map(_process_single_chunk, chunk_args))
 
     # Flatten results from all processes

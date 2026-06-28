@@ -201,7 +201,7 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         let sigma_eff = current_strain_MF - edges[current].reference_strain; // (MF)
         edges[future].strain = sigma_eff;
-        edges[current].internal_force = rotate(edges[current].orientation, (uniforms.stiffness_se * sigma_eff * dilatation_inv)) ; // (LF)
+        edges[current].internal_force = rotate(edges[current].orientation, (uniforms.stiffness_se * sigma_eff)) ; // (LF)
     }
 
     if ( global_id.x < uniforms.node_count - 2) {
