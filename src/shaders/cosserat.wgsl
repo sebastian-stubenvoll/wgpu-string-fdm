@@ -197,11 +197,13 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
         len_inv = 1.0 / length(r);
         edges[current].len_inv = len_inv;
 
-        let dilatation_inv = uniforms.dl * len_inv;
+        let e = 1.0/ (len_inv * uniforms.dl);
+        let eta = 1.0 - 0.3 * (e - 1.0);
+        let stiffness_se_dyn = uniforms.stiffness_se * eta * eta;
 
         let sigma_eff = current_strain_MF - edges[current].reference_strain; // (MF)
         edges[future].strain = sigma_eff;
-        edges[current].internal_force = rotate(edges[current].orientation, (uniforms.stiffness_se * sigma_eff)) ; // (LF)
+        edges[current].internal_force = rotate(edges[current].orientation, (stiffness_se_dyn * sigma_eff)) ; // (LF)
     }
 
     if ( global_id.x < uniforms.node_count - 2) {
@@ -212,7 +214,12 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
         
         let r = edges[current+1].reference_vector + (nodes[current + 2].displacement - nodes[current + 1].displacement);
         let next_len_inv = 1.0 / length(r);
-    
+        let e1 = 1.0 / (len_inv * uniforms.dl);
+        let e2 = 1.0 / (next_len_inv * uniforms.dl);
+        let epsilon = 0.5 * (e1 + e2);
+        let eta_voronoi = 1.0 - 0.3 * (epsilon - 1.0);
+        let stiffness_bt_dyn = uniforms.stiffness_bt * eta_voronoi * eta_voronoi * eta_voronoi * eta_voronoi;
+
         var relative_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
 
         // Select closest quaternion pole
@@ -226,7 +233,7 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // This is B applied to kappa (MF); here B is diagonal -> pointwise multiplication
         let kappa = 2.0 * uniforms.dl_inv * effective_orientation.xyz;
         nodes[current].curvature = kappa;
-        nodes[current].internal_moment = uniforms.stiffness_bt * kappa;
+        nodes[current].internal_moment = stiffness_bt_dyn * kappa;
     }
 }
 
@@ -301,14 +308,25 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
             average = 0.5 * uniforms.dl * (cross(nodes[current].curvature, nodes[current].internal_moment) + cross(nodes[current- 1].curvature, nodes[current- 1].internal_moment));
         }
 
+        let e = 1.0 / (edges[current].len_inv * uniforms.dl);
+        let eta = 1.0 - 0.3 * (e - 1.0);
+        let inertia_dyn = uniforms.inertia * eta * eta;
+        let inertia_inv_dyn = uniforms.inertia_inv * ( 1.0 / (eta * eta));
+
+        let relative_velocity = nodes[current + 1].velocity - nodes[current].velocity;
+        let tangent_unit = (nodes[current + 1].displacement - nodes[current].displacement) * edges[current].len_inv;
+        let e_dot = dot(relative_velocity, tangent_unit);
+
+        let unsteady_dilatation = (0.6 * e_dot / eta) * inertia_dyn * edges[current].angular_velocity;
     
         let phi_tt =( difference
                             + average
                             + (cross(tangent_MF, rotate_inv(edges[current].orientation, edges[current].internal_force)) * uniforms.dl)
                             + ext_couple
                             + damping_torque
-                            + cross((uniforms.inertia * edges[current].angular_velocity), edges[current].angular_velocity) 
-                            ) * uniforms.inertia_inv;
+                            + cross((inertia_dyn * edges[current].angular_velocity), edges[current].angular_velocity) 
+                            + unsteady_dilatation
+                            ) * inertia_inv_dyn;
 
 
         // Full step velocity update (kick)
