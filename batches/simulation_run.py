@@ -157,9 +157,10 @@ class SimulationRun:
             target=process_and_email,
             args=(
                 self.sim_dir, self.run_id, self.config, self.email_config, 
-                self.rod_derived["m_node"], self.rod_derived["inertia"], 
-                self.rod_derived["K_se"], self.rod_derived["K_bt"], self.rod_derived["dl"]
+                self.rod_derived["m_node"], self.rod_derived["dl"], self.rod_derived["inertia"], 
+                self.rod_derived["K_se"], self.rod_derived["K_bt"]
             ),
             daemon=False
         )
         plot_thread.start()
+        plot_thread.join()
