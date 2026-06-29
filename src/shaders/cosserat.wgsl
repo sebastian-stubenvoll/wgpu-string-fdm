@@ -314,7 +314,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let inertia_inv_dyn = uniforms.inertia_inv * ( 1.0 / (eta * eta));
 
         let relative_velocity = nodes[current + 1].velocity - nodes[current].velocity;
-        let tangent_unit = (nodes[current + 1].displacement - nodes[current].displacement) * edges[current].len_inv;
+        let tangent_unit = (edges[current].reference_vector + nodes[current + 1].displacement - nodes[current].displacement) * edges[current].len_inv;
         let e_dot = dot(relative_velocity, tangent_unit);
 
         let unsteady_dilatation = (0.6 * e_dot / eta) * inertia_dyn * edges[current].angular_velocity;
