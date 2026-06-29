@@ -47,7 +47,9 @@ def _process_single_chunk(args):
     """Worker function to read a single chunk of data and extract timeseries."""
     nf, ef, node_idx, m_node, inertia, K_se, K_bt = args
     
-    pos_chunk, vel_chunk, mom_chunk, quat_chunk = [], [], [], []
+    # Updated accumulators based on new Rust structures
+    pos_chunk, vel_chunk, mom_chunk, curv_chunk = [], [], [], []
+    quat_chunk, ang_vel_chunk, force_chunk, strain_chunk = [], [], [], []
     t_ke_chunk, r_ke_chunk, bt_pe_chunk, ss_pe_chunk = [], [], [], []
 
     with gzip.open(nf, "rb") as f:
@@ -59,35 +61,95 @@ def _process_single_chunk(args):
         n_frame = n_chunk[i]
         e_frame = e_chunk[i]
         
-        p, v, m, _ = n_frame[node_idx]
+        # --- NEW NODE EXTRACTION ---
+        # Rust: [position, velocity, internal_moment, curvature]
+        p, v, m, c = n_frame[node_idx]
         pos_chunk.append(p)
         vel_chunk.append(v)
         mom_chunk.append(m)
-        quat_chunk.append(e_frame[node_idx][0])
+        curv_chunk.append(c)
         
+        # --- NEW EDGE EXTRACTION ---
+        # Rust: (orientation, [angular_velocity, internal_force, strain])
+        quat, edge_data = e_frame[node_idx]
+        w, f_int, s = edge_data
+        quat_chunk.append(quat)
+        ang_vel_chunk.append(w)
+        force_chunk.append(f_int)
+        strain_chunk.append(s)
+        
+        # --- ENERGY CALCULATION ---
         t_sum, bt_sum = 0, 0
         for j, node in enumerate(n_frame):
             weight = 0.5 if (j == 0 or j == len(n_frame)-1) else 1.0
             t_sum += E_T(node, m_node) * weight
-            bt_sum += E_PB(node[2], K_bt) * weight
+            # Curvature is now index 3 in the node array
+            bt_sum += E_PB(node[3], K_bt) * weight
             
         r_sum, ss_sum = 0, 0
         for edge in e_frame:
-            r_sum += E_R(edge[1][0], inertia)
-            ss_sum += E_PS(edge[1][2], K_se)
+            edge_quat, edge_data_vals = edge
+            edge_w, edge_f, edge_s = edge_data_vals
+            r_sum += E_R(edge_w, inertia)
+            ss_sum += E_PS(edge_s, K_se)
             
         t_ke_chunk.append(t_sum)
         bt_pe_chunk.append(bt_sum)
         r_ke_chunk.append(r_sum)
         ss_pe_chunk.append(ss_sum)
 
-    return (pos_chunk, vel_chunk, mom_chunk, quat_chunk, 
+    return (pos_chunk, vel_chunk, mom_chunk, curv_chunk, 
+            quat_chunk, ang_vel_chunk, force_chunk, strain_chunk,
             t_ke_chunk, r_ke_chunk, bt_pe_chunk, ss_pe_chunk)
 
 
 # ---------------------------------------------------------
 # Plotting Functions 
 # ---------------------------------------------------------
+def plot_structural_dynamics(curvature, internal_force, strain, dt, oversampling_factor, save_output=False, prefix="unknown"):
+    """Plots Curvature, Internal Force, and Strain over time for X, Y, Z components."""
+    T = len(curvature)
+    time = np.arange(T) * dt * oversampling_factor
+    
+    datasets = [
+        ("Curvature", curvature, "tab:purple"),
+        ("Internal Force", internal_force, "tab:red"),
+        ("Strain", strain, "tab:brown")
+    ]
+    
+    saved_files = []
+    
+    for name, data, color in datasets:
+        data = np.array(data)
+        fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+        components = ['X', 'Y', 'Z']
+        
+        for i in range(3):
+            ax = axes[i]
+            comp_data = data[:, i]
+            ax.plot(time, comp_data, color=color, alpha=0.8)
+            ax.set_ylabel(f"{name} {components[i]}")
+            ax.grid(True, alpha=0.3)
+            
+            # Auto-scale Y to ignore massive initial transient spikes if necessary
+            y_min, y_max = np.percentile(comp_data, [1, 99])
+            padding = (y_max - y_min) * 0.1
+            if y_max - y_min > 1e-10:
+                ax.set_ylim(y_min - padding, y_max + padding)
+
+        axes[0].set_title(f"Node {name} Over Time")
+        axes[2].set_xlabel("Time [s]")
+        plt.tight_layout()
+        
+        if save_output:
+            filename = os.path.join(prefix, f"{name.lower().replace(' ', '_')}.png")
+            fig.savefig(filename, dpi=300, bbox_inches="tight")
+            saved_files.append(filename)
+            
+        plt.close(fig)
+        
+    return saved_files
+
 def plot_node_pos_vel_moment_fft(pos, vel, mom, dt, oversampling_factor, cutoff=4000, 
                                  moments=False, save_output=False, windowing=False, 
                                  fundamental_weight=0.2, prefix="unknown", plot_velocity=False):
@@ -166,7 +228,6 @@ def plot_node_pos_vel_moment_fft(pos, vel, mom, dt, oversampling_factor, cutoff=
         ax_fit = axes[plot_idx]
         mag_norm = bins / np.max(bins) if np.max(bins) > 0 else bins
         
-        # Fixed peak detection: minimum height is 8% of the max peak to avoid noise
         peak_indices, _ = find_peaks(mag_norm, height=0.08, distance=5)
         peak_freqs = freqs[peak_indices]
         peak_mags = mag_norm[peak_indices]
@@ -202,11 +263,22 @@ def plot_node_pos_vel_moment_fft(pos, vel, mom, dt, oversampling_factor, cutoff=
 
             f1_fit, B_fit = f1_est, 0.0
             
+            # --- IMPROVED FFT FIT & DYNAMIC WIDTH ---
             if len(ns) >= 4:
                 try:
-                    popt, pcov = curve_fit(lambda n, f1, B: n * f1 * np.sqrt(1 + B * n**2), ns, fns, p0=[f1_est, 0.0001])
+                    # Enforce strict physical bounds: B MUST be >= 0.
+                    lower_bounds = [f1_est * 0.8, 0.0] 
+                    upper_bounds = [f1_est * 1.2, 0.05] 
+                    
+                    popt, pcov = curve_fit(
+                        lambda n, f1, B: n * f1 * np.sqrt(1 + B * n**2), 
+                        ns, fns, 
+                        p0=[f1_est, 1e-4],
+                        bounds=(lower_bounds, upper_bounds)
+                    )
                     f1_fit, B_fit = popt
-                except RuntimeError: pass
+                except RuntimeError: 
+                    pass
             
             ax_fit.plot(freqs, mag_norm, color='lightgray', label='Spectrum')
             ax_fit.plot(peak_freqs, peak_mags, 'x', color='tab:blue', label='Detected Peaks')
@@ -217,14 +289,18 @@ def plot_node_pos_vel_moment_fft(pos, vel, mom, dt, oversampling_factor, cutoff=
                                color='tab:red', zorder=5, label=f'Fit (B={B_fit:.2e})')
 
             ideal_freqs = ns * f1_fit
-            # Add explicit fundamental frequency text to legend
             if len(ideal_freqs) > 0:
                 ax_fit.axvline(ideal_freqs[0], color='green', linestyle=':', alpha=0.5, label=f'Harmonics (f1={f1_fit:.2f} Hz)')
                 for f_ideal in ideal_freqs[1:]:
                     ax_fit.axvline(f_ideal, color='green', linestyle=':', alpha=0.5)
 
-            ax_fit.set_xlim(0, cutoff) 
-            if len(fns) > 0: ax_fit.set_xlim(0, min(cutoff, max(fns) * 1.2))
+            # --- DYNAMIC WIDTH CALCULATION ---
+            significant_peaks = peak_freqs[peak_mags > 0.01]
+            max_sig_freq = np.max(significant_peaks) if len(significant_peaks) > 0 else f1_fit * 10
+            dynamic_cutoff = min(cutoff, max_sig_freq * 1.15)
+            
+            axf.set_xlim(0, dynamic_cutoff) 
+            ax_fit.set_xlim(0, dynamic_cutoff)
                   
             ax_fit.set_title(f"{label} — Inharmonicity Fit")
             ax_fit.set_xlabel("Frequency [Hz]")
@@ -456,7 +532,7 @@ def plot_spectrogram(pos, dt, oversampling_factor, save_output=False, prefix="un
         ax.set_title(f"Waterfall/Spectrogram: {label.upper()}-Displacement")
         ax.set_ylabel('Frequency [Hz]')
         ax.set_xlabel('Time [sec]')
-        ax.set_ylim(0, min(4000, fs/2)) # Limited to 4000Hz as requested
+        ax.set_ylim(0, min(4000, fs/2)) 
         
         plt.tight_layout()
         if save_output:
@@ -478,7 +554,6 @@ def plot_phase_space(pos, vel, save_output=False, prefix="unknown"):
         time = np.linspace(0, 1, len(p_data))
         scatter = ax.scatter(p_data, v_data, c=time, cmap='viridis', s=1, alpha=0.5)
         
-        # Colorbar acts as the legend for time evolution
         cbar = fig.colorbar(scatter, ax=ax)
         cbar.set_label('Normalized Time (0 = Start, 1 = End)')
         
@@ -545,16 +620,27 @@ def process_and_email(sim_dir, run_id, config, email_config, m_node, inertia, K_
     pos_all = list(chain.from_iterable(r[0] for r in results))
     vel_all = list(chain.from_iterable(r[1] for r in results))
     mom_all = list(chain.from_iterable(r[2] for r in results))
-    quat_all = list(chain.from_iterable(r[3] for r in results))
-    t_ke_all = list(chain.from_iterable(r[4] for r in results))
-    r_ke_all = list(chain.from_iterable(r[5] for r in results))
-    bt_pe_all = list(chain.from_iterable(r[6] for r in results))
-    ss_pe_all = list(chain.from_iterable(r[7] for r in results))
+    curv_all = list(chain.from_iterable(r[3] for r in results))
+    
+    quat_all = list(chain.from_iterable(r[4] for r in results))
+    ang_vel_all = list(chain.from_iterable(r[5] for r in results))
+    force_all = list(chain.from_iterable(r[6] for r in results))
+    strain_all = list(chain.from_iterable(r[7] for r in results))
+    
+    t_ke_all = list(chain.from_iterable(r[8] for r in results))
+    r_ke_all = list(chain.from_iterable(r[9] for r in results))
+    bt_pe_all = list(chain.from_iterable(r[10] for r in results))
+    ss_pe_all = list(chain.from_iterable(r[11] for r in results))
 
     pos_all = np.array(pos_all, dtype=np.float32)
     vel_all = np.array(vel_all, dtype=np.float32)
     mom_all = np.array(mom_all, dtype=np.float32)
+    curv_all = np.array(curv_all, dtype=np.float32)
+    
     quat_all = np.array(quat_all, dtype=np.float32)
+    ang_vel_all = np.array(ang_vel_all, dtype=np.float32)
+    force_all = np.array(force_all, dtype=np.float32)
+    strain_all = np.array(strain_all, dtype=np.float32)
     
     # Apply PE Offset: Subtract first frame PE from all frames
     ss_pe_all = np.array(ss_pe_all, dtype=np.float32)
@@ -578,6 +664,7 @@ def process_and_email(sim_dir, run_id, config, email_config, m_node, inertia, K_
 
     # --- Full Simulation Tasks ---
     plot_tasks.append((plot_node_pos_vel_moment_fft, (pos_all, vel_all, mom_all, dt, oversamp, 4000, False, True, False, 0.2, str(full_dir), False)))
+    plot_tasks.append((plot_structural_dynamics, (curv_all, force_all, strain_all, dt, oversamp, True, str(full_dir))))
     plot_tasks.append((plot_axis_angle_over_time, (quat_all, node_idx, "xyz", True, str(full_dir))))
     plot_tasks.append((plot_euler_unwrapped, (quat_all, node_idx, True, str(full_dir))))
     plot_tasks.append((plot_energies, (t_ke_all, r_ke_all, bt_pe_all, ss_pe_all, dl, False, True, True, str(full_dir))))
@@ -589,6 +676,7 @@ def process_and_email(sim_dir, run_id, config, email_config, m_node, inertia, K_
     # --- Free Vibration Tasks ---
     if len(pos_all) > hammer_limit:
         plot_tasks.append((plot_node_pos_vel_moment_fft, (pos_all[hammer_limit:], vel_all[hammer_limit:], mom_all[hammer_limit:], dt, oversamp, 4000, False, True, False, 0.2, str(free_dir), False)))
+        plot_tasks.append((plot_structural_dynamics, (curv_all[hammer_limit:], force_all[hammer_limit:], strain_all[hammer_limit:], dt, oversamp, True, str(free_dir))))
         plot_tasks.append((plot_axis_angle_over_time, (quat_all[hammer_limit:], node_idx, "xyz", True, str(free_dir))))
         plot_tasks.append((plot_euler_unwrapped, (quat_all[hammer_limit:], node_idx, True, str(free_dir))))
         plot_tasks.append((plot_energies, (t_ke_all[hammer_limit:], r_ke_all[hammer_limit:], bt_pe_all[hammer_limit:], ss_pe_all[hammer_limit:], dl, False, True, True, str(free_dir))))
@@ -599,6 +687,7 @@ def process_and_email(sim_dir, run_id, config, email_config, m_node, inertia, K_
 
     # --- Short Files Tasks ---
     plot_tasks.append((plot_node_pos_vel_moment_fft, (pos_all[:hammer_limit], vel_all[:hammer_limit], mom_all[:hammer_limit], dt, oversamp, 4000, False, True, False, 0.2, str(short_dir), True)))
+    plot_tasks.append((plot_structural_dynamics, (curv_all[:hammer_limit], force_all[:hammer_limit], strain_all[:hammer_limit], dt, oversamp, True, str(short_dir))))
     plot_tasks.append((plot_axis_angle_over_time, (quat_all[:hammer_limit], node_idx, "xyz", True, str(short_dir))))
     plot_tasks.append((plot_euler_unwrapped, (quat_all[:hammer_limit], node_idx, True, str(short_dir))))
     plot_tasks.append((plot_energies, (t_ke_all[:hammer_limit], r_ke_all[:hammer_limit], bt_pe_all[:hammer_limit], ss_pe_all[:hammer_limit], dl, False, True, True, str(short_dir))))
