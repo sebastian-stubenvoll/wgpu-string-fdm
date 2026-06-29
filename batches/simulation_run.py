@@ -114,6 +114,7 @@ class SimulationRun:
             dampening=self.config["dampening"],
         )
         self.sim.initialize()
+        self.sim.create_references()
 
     def run(self):
         print(f"[{datetime.now()}] Starting run {self.run_id:03d} in {self.sim_dir.name}")

@@ -138,8 +138,8 @@ fn create_references(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
         let current_strain_MF = tangent_MF - vec3<f32>(0.0, 0.0, 1.0);
         
-        edges[current].strain = current_strain_MF;
-        edges[future].strain = current_strain_MF;
+        edges[current].reference_strain = current_strain_MF;
+        edges[future].reference_strain = current_strain_MF;
     }
 
     if (global_id.x < uniforms.node_count - 2) {
