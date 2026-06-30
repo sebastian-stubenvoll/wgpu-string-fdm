@@ -4,12 +4,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SIM_CONFIG = {
-    "node_count": 1024,
+    "node_count": 128,
     "dt": 4e-7, # 2e-7 is every so slightly unstable
     "chunk_size": 512,
     "dispatches": 1,
     "hammer_node": 25,
-    "inspect_nodes": [25, 512, 800],
+    "inspect_nodes": [25],
     "hammer_width": 1,
     "oversampling_factor": int(1.0 / (4e-7 * 50_000)),
     "dampening": [1e-6, 1e-6],
