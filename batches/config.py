@@ -4,10 +4,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SIM_CONFIG = {
-    "node_count": 128,
+    "node_count": 1024,
     "dt": 4e-7, # 2e-7 is every so slightly unstable
     "chunk_size": 512,
-    "dispatches": 1,
+    "dispatches": 200,
     "hammer_node": 25,
     "inspect_nodes": [25],
     "hammer_width": 1,

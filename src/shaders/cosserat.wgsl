@@ -275,7 +275,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let damping_force = - c.linear_dampening * nodes[current].velocity;
         
         // Only calculate for interior edges, so naive difference operator is fine here!
-        let v_tt = (edges[current].internal_force - edges[current- 1].internal_force + ext_force + damping_force) * vec3<f32>(0.1, 1.0, 1.0) * uniforms.mass_inv;
+        let v_tt = (edges[current].internal_force - edges[current- 1].internal_force + ext_force + damping_force) * uniforms.mass_inv;
 
         // Full step velocity update (kick)
         nodes[future].velocity = nodes[current].velocity + (v_tt * uniforms.dt);
@@ -315,7 +315,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         let relative_velocity = nodes[current + 1].velocity - nodes[current].velocity;
         let tangent_unit = (edges[current].reference_vector + nodes[current + 1].displacement - nodes[current].displacement) * edges[current].len_inv;
-        let e_dot = dot(relative_velocity, tangent_unit);
+        let e_dot = dot(relative_velocity, tangent_unit) * uniforms.dl_inv;
 
         let unsteady_dilatation = (0.6 * e_dot / eta) * inertia_dyn * edges[current].angular_velocity;
     
