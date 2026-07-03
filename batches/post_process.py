@@ -46,6 +46,52 @@ def E_PS(strain, K_se):
     return 0.5 * np.dot(s, K @ s)
 
 # ---------------------------------------------------------
+# Parallel Extraction Worker
+# ---------------------------------------------------------
+def _process_single_chunk(args):
+    nf, ef, node_idx, m_node, inertia, K_se, K_bt, dl = args
+    
+    pos, vel, mom, quats = [], [], [], []
+    t_ke, r_ke, bt_pe, ss_pe = [], [], [], []
+
+    with gzip.open(nf, "rb") as f: n_chunk = pickle.load(f)
+    with gzip.open(ef, "rb") as f: e_chunk = pickle.load(f)
+
+    for i in range(len(n_chunk)):
+        n_frame, e_frame = n_chunk[i], e_chunk[i]
+        
+        target_node = n_frame[node_idx]
+        pos.append(target_node[0])
+        vel.append(target_node[1])
+        mom.append(target_node[2])
+        
+        target_edge_idx = min(node_idx, len(e_frame)-1)
+        quats.append(e_frame[target_edge_idx][0])
+        
+        t_sum, bt_sum = 0, 0
+        for j, n in enumerate(n_frame):
+            weight = 0.5 if (j == 0 or j == len(n_frame)-1) else 1.0
+            t_sum += E_T(n, m_node) * weight
+            bt_sum += E_PB(n[3], K_bt) * weight
+            
+        r_sum, ss_sum = 0, 0
+        for e in e_frame:
+            _, e_vecs = e
+            r_sum += E_R(e_vecs[0], inertia)
+            ss_sum += E_PS(e_vecs[2], K_se)
+            
+        t_ke.append(t_sum)
+        bt_pe.append(bt_sum * dl)
+        r_ke.append(r_sum)
+        ss_pe.append(ss_sum * dl)
+
+    # Return numpy arrays directly to minimize IPC overhead
+    return (len(n_chunk), np.array(pos, dtype=np.float32), np.array(vel, dtype=np.float32), 
+            np.array(mom, dtype=np.float32), np.array(quats, dtype=np.float32), 
+            np.array(t_ke, dtype=np.float32), np.array(r_ke, dtype=np.float32), 
+            np.array(bt_pe, dtype=np.float32), np.array(ss_pe, dtype=np.float32))
+
+# ---------------------------------------------------------
 # Plotting Functions (Designed for Parallel Workers)
 # ---------------------------------------------------------
 def plot_node_pos_vel_moment_fft(time, pos, vel, mom, dt, oversampling_factor, cutoff=20_000, 
@@ -181,7 +227,7 @@ def plot_node_pos_vel_moment_fft(time, pos, vel, mom, dt, oversampling_factor, c
         
         file_path = f"{filename_prefix}_{label}.png"
         plt.savefig(file_path, dpi=200, bbox_inches="tight")
-        plt.close(fig) # Prevent memory leaks
+        plt.close(fig) 
         generated_files.append(file_path)
 
     return generated_files
@@ -303,59 +349,48 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     dt = config.get("dt", 1e-5)
     oversamp = config.get("oversampling_factor", 100)
     
-    # Pre-allocate specific arrays
-    t_ke, r_ke, bt_pe, ss_pe = [], [], [], []
-    pos, vel, mom = [], [], []
-    quats = []
+    print(f"[{datetime.now()}] Dispatching data extraction for {len(node_files)} chunks across 8 workers...")
+    
+    # 1. Fully Parallelized Extraction
+    args_list = [(nf, ef, node_idx, m_node, inertia, K_se, K_bt, dl) for nf, ef in zip(node_files, edge_files)]
+    
+    all_pos, all_vel, all_mom, all_quats = [], [], [], []
+    all_tke, all_rke, all_bpe, all_spe = [], [], [], []
     
     excitation_cutoff_frame = 0
     frames_processed = 0
 
-    print(f"[{datetime.now()}] Streaming {len(node_files)} chunks for memory-efficient extraction...")
-    
-    for file_idx, (nf, ef) in enumerate(zip(node_files, edge_files)):
-        with gzip.open(nf, "rb") as f: n_chunk = pickle.load(f)
-        with gzip.open(ef, "rb") as f: e_chunk = pickle.load(f)
-        
-        for i in range(len(n_chunk)):
-            n_frame, e_frame = n_chunk[i], e_chunk[i]
+    with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
+        # map ensures chronological order is preserved!
+        for file_idx, res in enumerate(executor.map(_process_single_chunk, args_list)):
+            n_frames, c_pos, c_vel, c_mom, c_quats, c_tke, c_rke, c_bpe, c_spe = res
             
-            target_node = n_frame[node_idx]
-            pos.append(target_node[0])
-            vel.append(target_node[1])
-            mom.append(target_node[2])
+            all_pos.append(c_pos)
+            all_vel.append(c_vel)
+            all_mom.append(c_mom)
+            all_quats.append(c_quats)
+            all_tke.append(c_tke)
+            all_rke.append(c_rke)
+            all_bpe.append(c_bpe)
+            all_spe.append(c_spe)
             
-            target_edge_idx = min(node_idx, len(e_frame)-1)
-            quats.append(e_frame[target_edge_idx][0])
-            
-            t_sum, bt_sum = 0, 0
-            for j, n in enumerate(n_frame):
-                weight = 0.5 if (j == 0 or j == len(n_frame)-1) else 1.0
-                t_sum += E_T(n, m_node) * weight
-                bt_sum += E_PB(n[3], K_bt) * weight
-                
-            r_sum, ss_sum = 0, 0
-            for e in e_frame:
-                _, e_vecs = e
-                r_sum += E_R(e_vecs[0], inertia)
-                ss_sum += E_PS(e_vecs[2], K_se)
-                
-            t_ke.append(t_sum)
-            bt_pe.append(bt_sum * dl)
-            r_ke.append(r_sum)
-            ss_pe.append(ss_sum * dl)
-            
-            frames_processed += 1
-            
-        if file_idx == 9:
-            excitation_cutoff_frame = frames_processed
+            frames_processed += n_frames
+            if file_idx <= 9: # Files 0 through 9 represent the first 10 dispatches
+                excitation_cutoff_frame += n_frames
 
+    print(f"[{datetime.now()}] Extraction complete. Stitching arrays...")
     time = np.arange(frames_processed) * (dt * oversamp)
-    pos, vel, mom = np.array(pos), np.array(vel), np.array(mom)
-    quats = np.array(quats)
-    t_ke, r_ke, bt_pe, ss_pe = np.array(t_ke), np.array(r_ke), np.array(bt_pe), np.array(ss_pe)
+    pos = np.concatenate(all_pos)
+    vel = np.concatenate(all_vel)
+    mom = np.concatenate(all_mom)
+    quats = np.concatenate(all_quats)
+    t_ke = np.concatenate(all_tke)
+    r_ke = np.concatenate(all_rke)
+    bt_pe = np.concatenate(all_bpe)
+    ss_pe = np.concatenate(all_spe)
 
-    # Free up memory aggressively before spawning plot workers
+    # Free up collection lists aggressively
+    del all_pos, all_vel, all_mom, all_quats, all_tke, all_rke, all_bpe, all_spe
     gc.collect()
 
     # ---------------------------------------------------------
@@ -380,49 +415,25 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
         prefix = str(output_dir / f"run_{run_id:03d}_{phase_name}")
         title = phase_name.replace("_", " ")
 
-        # Queue FFT Task
-        plot_tasks.append((
-            plot_node_pos_vel_moment_fft, 
-            (p_time, p_pos, p_vel, p_mom, dt, oversamp), 
-            {"show_velocities": (phase_name == "Excitation"), "moments": True, 
-             "title_prefix": title, "filename_prefix": f"{prefix}_fft"}
-        ))
+        plot_tasks.append((plot_node_pos_vel_moment_fft, (p_time, p_pos, p_vel, p_mom, dt, oversamp), 
+                           {"show_velocities": (phase_name == "Excitation"), "moments": True, 
+                            "title_prefix": title, "filename_prefix": f"{prefix}_fft"}))
 
-        # Queue Axis Angle Task
-        plot_tasks.append((
-            plot_axis_angle_over_time, 
-            (p_time, p_quats), 
-            {"title_prefix": title, "filename": f"{prefix}_angles.png"}
-        ))
+        plot_tasks.append((plot_axis_angle_over_time, (p_time, p_quats), 
+                           {"title_prefix": title, "filename": f"{prefix}_angles.png"}))
 
-        # Queue Standard Energy
-        plot_tasks.append((
-            plot_energies, 
-            (p_time, p_tke, p_rke, p_bpe, p_spe), 
-            {"print_totals": (phase_name == "Full_Simulation"), "title_prefix": title, "filename": f"{prefix}_energy.png"}
-        ))
+        plot_tasks.append((plot_energies, (p_time, p_tke, p_rke, p_bpe, p_spe), 
+                           {"print_totals": (phase_name == "Full_Simulation"), "title_prefix": title, "filename": f"{prefix}_energy.png"}))
 
-        # Queue Normalized Energy
-        plot_tasks.append((
-            plot_energies, 
-            (p_time, p_tke, p_rke, p_bpe, p_spe), 
-            {"normalized": True, "title_prefix": title, "filename": f"{prefix}_energy_norm.png"}
-        ))
+        plot_tasks.append((plot_energies, (p_time, p_tke, p_rke, p_bpe, p_spe), 
+                           {"normalized": True, "title_prefix": title, "filename": f"{prefix}_energy_norm.png"}))
 
-        # Queue Mode Transfer
-        plot_tasks.append((
-            plot_energies, 
-            (p_time, p_tke, p_rke, p_bpe, p_spe), 
-            {"mode_transfer": True, "title_prefix": title, "filename": f"{prefix}_energy_mode.png"}
-        ))
+        plot_tasks.append((plot_energies, (p_time, p_tke, p_rke, p_bpe, p_spe), 
+                           {"mode_transfer": True, "title_prefix": title, "filename": f"{prefix}_energy_mode.png"}))
 
-        # Queue Phase Space
         if phase_name == "Free_Vibration":
-            plot_tasks.append((
-                plot_phase_space, 
-                (p_pos, p_vel), 
-                {"title_prefix": title, "filename": f"{prefix}_phasespace.png"}
-            ))
+            plot_tasks.append((plot_phase_space, (p_pos, p_vel), 
+                               {"title_prefix": title, "filename": f"{prefix}_phasespace.png"}))
 
     # ---------------------------------------------------------
     # Execute Plotting in Parallel
@@ -434,7 +445,6 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
         futures = [executor.submit(func, *args, **kwargs) for func, args, kwargs in plot_tasks]
         for future in concurrent.futures.as_completed(futures):
             try:
-                # Each function returns a list of filepaths it generated
                 generated_images.extend(future.result()) 
             except Exception as e:
                 print(f"[{datetime.now()}] A plot worker encountered an error: {e}")
@@ -471,23 +481,22 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
 if __name__ == "__main__":
     import argparse
     import json
-
+    
     try:
         from dotenv import load_dotenv
-        load_dotenv()  # This actively looks for a .env file and loads it
+        load_dotenv()
     except ImportError:
         print(f"[{datetime.now()}] Warning: 'python-dotenv' is not installed. Falling back to system environment variables.")
-    
-    # 1. Environment Variable Validation Check
+
     sender_email = os.environ.get("SENDER_EMAIL")
     sender_password = os.environ.get("SENDER_PASSWORD")
     receiver_email = os.environ.get("RECEIVER_EMAIL")
     smpt_server = os.environ.get("SMPT_SERVER")
-    smpt_port = os.environ.get("SMPT_PORT")
+    smpt_port = os.environ.get("smpt_port")
 
     if not sender_email or not sender_password or not receiver_email:
         print(f"[{datetime.now()}] FATAL ERROR: Email environment variables not set.")
-        print("Please ensure SENDER_EMAIL, SENDER_PASSWORD, and RECEIVER_EMAIL are configured properly.")
+        print("Please ensure SENDER_EMAIL, SENDER_PASSWORD, and RECEIVER_EMAIL are defined in your .env file.")
         sys.exit(1)
 
     parser = argparse.ArgumentParser()
@@ -500,7 +509,6 @@ if __name__ == "__main__":
     with open(param_file, "r") as f:
         metadata = json.load(f)
 
-    # Config setup
     rod = metadata["rod_derived"]
     email_config_dict = {
         "sender_email": sender_email,
@@ -519,3 +527,4 @@ if __name__ == "__main__":
         inertia=np.array(rod["inertia"]), K_se=np.array(rod["K_se"]), K_bt=np.array(rod["K_bt"]),
         node_idx=args.node_idx
     )
+
