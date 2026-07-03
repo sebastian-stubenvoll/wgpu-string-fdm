@@ -1,3 +1,4 @@
+
 import os
 import sys
 import pickle
@@ -49,9 +50,9 @@ def E_PS(strain, K_se):
 # Parallel Extraction Worker
 # ---------------------------------------------------------
 def _process_single_chunk(args):
-    nf, ef, node_idx, m_node, inertia, K_se, K_bt, dl = args
+    nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl = args
     
-    pos, vel, mom, quats = [], [], [], []
+    node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': []} for n in inspect_nodes}
     t_ke, r_ke, bt_pe, ss_pe = [], [], [], []
 
     with gzip.open(nf, "rb") as f: n_chunk = pickle.load(f)
@@ -60,19 +61,22 @@ def _process_single_chunk(args):
     for i in range(len(n_chunk)):
         n_frame, e_frame = n_chunk[i], e_chunk[i]
         
-        target_node = n_frame[node_idx]
-        pos.append(target_node[0])
-        vel.append(target_node[1])
-        mom.append(target_node[2])
+        # Extract specific nodes
+        for n in inspect_nodes:
+            target_node = n_frame[n]
+            node_data[n]['pos'].append(target_node[0])
+            node_data[n]['vel'].append(target_node[1])
+            node_data[n]['mom'].append(target_node[2])
+            
+            target_edge_idx = min(n, len(e_frame)-1)
+            node_data[n]['quats'].append(e_frame[target_edge_idx][0])
         
-        target_edge_idx = min(node_idx, len(e_frame)-1)
-        quats.append(e_frame[target_edge_idx][0])
-        
+        # Global energy sums
         t_sum, bt_sum = 0, 0
-        for j, n in enumerate(n_frame):
+        for j, n_node in enumerate(n_frame):
             weight = 0.5 if (j == 0 or j == len(n_frame)-1) else 1.0
-            t_sum += E_T(n, m_node) * weight
-            bt_sum += E_PB(n[3], K_bt) * weight
+            t_sum += E_T(n_node, m_node) * weight
+            bt_sum += E_PB(n_node[3], K_bt) * weight
             
         r_sum, ss_sum = 0, 0
         for e in e_frame:
@@ -85,9 +89,17 @@ def _process_single_chunk(args):
         r_ke.append(r_sum)
         ss_pe.append(ss_sum * dl)
 
-    # Return numpy arrays directly to minimize IPC overhead
-    return (len(n_chunk), np.array(pos, dtype=np.float32), np.array(vel, dtype=np.float32), 
-            np.array(mom, dtype=np.float32), np.array(quats, dtype=np.float32), 
+    # Convert to numpy arrays directly to minimize IPC overhead
+    out_node_data = {}
+    for n in inspect_nodes:
+        out_node_data[n] = {
+            'pos': np.array(node_data[n]['pos'], dtype=np.float32),
+            'vel': np.array(node_data[n]['vel'], dtype=np.float32),
+            'mom': np.array(node_data[n]['mom'], dtype=np.float32),
+            'quats': np.array(node_data[n]['quats'], dtype=np.float32)
+        }
+
+    return (len(n_chunk), out_node_data,
             np.array(t_ke, dtype=np.float32), np.array(r_ke, dtype=np.float32), 
             np.array(bt_pe, dtype=np.float32), np.array(ss_pe, dtype=np.float32))
 
@@ -341,7 +353,7 @@ def plot_phase_space(pos, vel, title_prefix="", filename=""):
 # ---------------------------------------------------------
 # Core Memory-Efficient Extraction
 # ---------------------------------------------------------
-def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia, K_se, K_bt, node_idx=10):
+def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia, K_se, K_bt, inspect_nodes):
     sim_path = Path(sim_path)
     node_files = sorted(sim_path.glob("n_*.pkl.gz"))
     edge_files = sorted(sim_path.glob("e_*.pkl.gz"))
@@ -349,26 +361,28 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     dt = config.get("dt", 1e-5)
     oversamp = config.get("oversampling_factor", 100)
     
-    print(f"[{datetime.now()}] Dispatching data extraction for {len(node_files)} chunks across 8 workers...")
+    print(f"[{datetime.now()}] Dispatching data extraction for {len(node_files)} chunks across 16 workers...")
+    print(f"[{datetime.now()}] Target nodes for inspection: {inspect_nodes}")
     
     # 1. Fully Parallelized Extraction
-    args_list = [(nf, ef, node_idx, m_node, inertia, K_se, K_bt, dl) for nf, ef in zip(node_files, edge_files)]
+    args_list = [(nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl) for nf, ef in zip(node_files, edge_files)]
     
-    all_pos, all_vel, all_mom, all_quats = [], [], [], []
+    all_node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': []} for n in inspect_nodes}
     all_tke, all_rke, all_bpe, all_spe = [], [], [], []
     
     excitation_cutoff_frame = 0
     frames_processed = 0
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
-        # map ensures chronological order is preserved!
+    with concurrent.futures.ProcessPoolExecutor(max_workers=16) as executor:
         for file_idx, res in enumerate(executor.map(_process_single_chunk, args_list)):
-            n_frames, c_pos, c_vel, c_mom, c_quats, c_tke, c_rke, c_bpe, c_spe = res
+            n_frames, nd_dict, c_tke, c_rke, c_bpe, c_spe = res
             
-            all_pos.append(c_pos)
-            all_vel.append(c_vel)
-            all_mom.append(c_mom)
-            all_quats.append(c_quats)
+            for n in inspect_nodes:
+                all_node_data[n]['pos'].append(nd_dict[n]['pos'])
+                all_node_data[n]['vel'].append(nd_dict[n]['vel'])
+                all_node_data[n]['mom'].append(nd_dict[n]['mom'])
+                all_node_data[n]['quats'].append(nd_dict[n]['quats'])
+                
             all_tke.append(c_tke)
             all_rke.append(c_rke)
             all_bpe.append(c_bpe)
@@ -380,17 +394,23 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
 
     print(f"[{datetime.now()}] Extraction complete. Stitching arrays...")
     time = np.arange(frames_processed) * (dt * oversamp)
-    pos = np.concatenate(all_pos)
-    vel = np.concatenate(all_vel)
-    mom = np.concatenate(all_mom)
-    quats = np.concatenate(all_quats)
+    
+    stitched_node_data = {}
+    for n in inspect_nodes:
+        stitched_node_data[n] = {
+            'pos': np.concatenate(all_node_data[n]['pos']),
+            'vel': np.concatenate(all_node_data[n]['vel']),
+            'mom': np.concatenate(all_node_data[n]['mom']),
+            'quats': np.concatenate(all_node_data[n]['quats'])
+        }
+        
     t_ke = np.concatenate(all_tke)
     r_ke = np.concatenate(all_rke)
     bt_pe = np.concatenate(all_bpe)
     ss_pe = np.concatenate(all_spe)
 
     # Free up collection lists aggressively
-    del all_pos, all_vel, all_mom, all_quats, all_tke, all_rke, all_bpe, all_spe
+    del all_node_data, all_tke, all_rke, all_bpe, all_spe
     gc.collect()
 
     # ---------------------------------------------------------
@@ -409,39 +429,47 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
 
     for phase_name, (start, end) in phases.items():
         p_time = time[start:end]
-        p_pos, p_vel, p_mom, p_quats = pos[start:end], vel[start:end], mom[start:end], quats[start:end]
         p_tke, p_rke, p_bpe, p_spe = t_ke[start:end], r_ke[start:end], bt_pe[start:end], ss_pe[start:end]
         
-        prefix = str(output_dir / f"run_{run_id:03d}_{phase_name}")
-        title = phase_name.replace("_", " ")
+        energy_prefix = str(output_dir / f"run_{run_id:03d}_{phase_name}")
+        phase_title = phase_name.replace("_", " ")
 
-        plot_tasks.append((plot_node_pos_vel_moment_fft, (p_time, p_pos, p_vel, p_mom, dt, oversamp), 
-                           {"show_velocities": (phase_name == "Excitation"), "moments": True, 
-                            "title_prefix": title, "filename_prefix": f"{prefix}_fft"}))
-
-        plot_tasks.append((plot_axis_angle_over_time, (p_time, p_quats), 
-                           {"title_prefix": title, "filename": f"{prefix}_angles.png"}))
-
+        # Queue Global Energy Plots (Only once per phase)
         plot_tasks.append((plot_energies, (p_time, p_tke, p_rke, p_bpe, p_spe), 
-                           {"print_totals": (phase_name == "Full_Simulation"), "title_prefix": title, "filename": f"{prefix}_energy.png"}))
-
+                           {"print_totals": (phase_name == "Full_Simulation"), "title_prefix": phase_title, "filename": f"{energy_prefix}_energy.png"}))
         plot_tasks.append((plot_energies, (p_time, p_tke, p_rke, p_bpe, p_spe), 
-                           {"normalized": True, "title_prefix": title, "filename": f"{prefix}_energy_norm.png"}))
-
+                           {"normalized": True, "title_prefix": phase_title, "filename": f"{energy_prefix}_energy_norm.png"}))
         plot_tasks.append((plot_energies, (p_time, p_tke, p_rke, p_bpe, p_spe), 
-                           {"mode_transfer": True, "title_prefix": title, "filename": f"{prefix}_energy_mode.png"}))
+                           {"mode_transfer": True, "title_prefix": phase_title, "filename": f"{energy_prefix}_energy_mode.png"}))
 
-        if phase_name == "Free_Vibration":
-            plot_tasks.append((plot_phase_space, (p_pos, p_vel), 
-                               {"title_prefix": title, "filename": f"{prefix}_phasespace.png"}))
+        # Queue Node-Specific Plots
+        for n in inspect_nodes:
+            p_pos = stitched_node_data[n]['pos'][start:end]
+            p_vel = stitched_node_data[n]['vel'][start:end]
+            p_mom = stitched_node_data[n]['mom'][start:end]
+            p_quats = stitched_node_data[n]['quats'][start:end]
+            
+            node_prefix = str(output_dir / f"run_{run_id:03d}_node_{n:03d}_{phase_name}")
+            node_title = f"Node {n} | {phase_title}"
+
+            plot_tasks.append((plot_node_pos_vel_moment_fft, (p_time, p_pos, p_vel, p_mom, dt, oversamp), 
+                               {"show_velocities": (phase_name == "Excitation"), "moments": True, 
+                                "title_prefix": node_title, "filename_prefix": f"{node_prefix}_fft"}))
+
+            plot_tasks.append((plot_axis_angle_over_time, (p_time, p_quats), 
+                               {"title_prefix": node_title, "filename": f"{node_prefix}_angles.png"}))
+
+            if phase_name == "Free_Vibration":
+                plot_tasks.append((plot_phase_space, (p_pos, p_vel), 
+                                   {"title_prefix": node_title, "filename": f"{node_prefix}_phasespace.png"}))
 
     # ---------------------------------------------------------
     # Execute Plotting in Parallel
     # ---------------------------------------------------------
-    print(f"[{datetime.now()}] Dispatching {len(plot_tasks)} plotting tasks to 8 concurrent workers...")
+    print(f"[{datetime.now()}] Dispatching {len(plot_tasks)} plotting tasks to 16 concurrent workers...")
     generated_images = []
     
-    with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=16) as executor:
         futures = [executor.submit(func, *args, **kwargs) for func, args, kwargs in plot_tasks]
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -452,12 +480,12 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     # ---------------------------------------------------------
     # Email Dispatch
     # ---------------------------------------------------------
-    print(f"[{datetime.now()}] Plotting complete. Dispatching email...")
+    print(f"[{datetime.now()}] Plotting complete. Attached {len(generated_images)} images. Dispatching email...")
     msg = EmailMessage()
     msg['Subject'] = f"Piano Sim Run {run_id:03d} Completed - Plot Suite"
     msg['From'] = email_config['sender_email']
     msg['To'] = email_config['receiver_email']
-    msg.set_content(f"Simulation {run_id:03d} plots attached.\nMemory-efficient parallel generation successful.")
+    msg.set_content(f"Simulation {run_id:03d} plots attached. Memory-efficient parallel generation successful for {len(inspect_nodes)} nodes.")
 
     for img_path in generated_images:
         try:
@@ -491,8 +519,6 @@ if __name__ == "__main__":
     sender_email = os.environ.get("SENDER_EMAIL")
     sender_password = os.environ.get("SENDER_PASSWORD")
     receiver_email = os.environ.get("RECEIVER_EMAIL")
-    smpt_server = os.environ.get("SMPT_SERVER")
-    smpt_port = os.environ.get("smpt_port")
 
     if not sender_email or not sender_password or not receiver_email:
         print(f"[{datetime.now()}] FATAL ERROR: Email environment variables not set.")
@@ -501,7 +527,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("sim_path", type=str)
-    parser.add_argument("--node_idx", type=int, default=64, help="Node index to track for plots")
+    # Note: --node_idx is removed as it's now dynamically pulled from the config.
     args = parser.parse_args()
     target_dir = Path(args.sim_path).resolve()
 
@@ -509,22 +535,27 @@ if __name__ == "__main__":
     with open(param_file, "r") as f:
         metadata = json.load(f)
 
+    # Config setup
+    sim_config = metadata.get("config", {})
+    inspect_nodes = sim_config.get("inspect_nodes", [64])
+    if not inspect_nodes:
+        inspect_nodes = [64]  # Safety fallback if list is empty
+
     rod = metadata["rod_derived"]
     email_config_dict = {
         "sender_email": sender_email,
         "sender_password": sender_password,
         "receiver_email": receiver_email,
-        "smtp_server": smpt_server,
-        "smtp_port": smpt_port
+        "smtp_server": "smtp.gmail.com",
+        "smtp_port": 465
     }
 
     process_and_plot(
         sim_path=target_dir,
         run_id=metadata.get("run_id", 0),
-        config=metadata["config"],
+        config=sim_config,
         email_config=email_config_dict,
         m_node=rod["m_node"], dl=rod["dl"], 
         inertia=np.array(rod["inertia"]), K_se=np.array(rod["K_se"]), K_bt=np.array(rod["K_bt"]),
-        node_idx=args.node_idx
+        inspect_nodes=inspect_nodes
     )
-
