@@ -476,6 +476,8 @@ if __name__ == "__main__":
     sender_email = os.environ.get("SENDER_EMAIL")
     sender_password = os.environ.get("SENDER_PASSWORD")
     receiver_email = os.environ.get("RECEIVER_EMAIL")
+    smpt_server = os.environ.get("SMPT_SERVER")
+    smpt_port = os.environ.get("SMPT_PORT")
 
     if not sender_email or not sender_password or not receiver_email:
         print(f"[{datetime.now()}] FATAL ERROR: Email environment variables not set.")
@@ -498,8 +500,8 @@ if __name__ == "__main__":
         "sender_email": sender_email,
         "sender_password": sender_password,
         "receiver_email": receiver_email,
-        "smtp_server": "smtp.gmail.com",
-        "smtp_port": 465
+        "smtp_server": smpt_server,
+        "smtp_port": smpt_port
     }
 
     process_and_plot(
