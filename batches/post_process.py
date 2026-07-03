@@ -471,6 +471,12 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
 if __name__ == "__main__":
     import argparse
     import json
+
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()  # This actively looks for a .env file and loads it
+    except ImportError:
+        print(f"[{datetime.now()}] Warning: 'python-dotenv' is not installed. Falling back to system environment variables.")
     
     # 1. Environment Variable Validation Check
     sender_email = os.environ.get("SENDER_EMAIL")
