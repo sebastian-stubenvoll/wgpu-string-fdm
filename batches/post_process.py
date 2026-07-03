@@ -112,19 +112,22 @@ def process_and_email(sim_path, run_id, config, email_config, m_node, dl, inerti
     all_edges = {'quat': [], 'ang_vel': [], 'force': [], 'strain': []}
                  
     # 1. PARALLEL DATA EXTRACTION
-    with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
-        results = list(executor.map(_process_single_chunk, args_list))
-        
-    for res in results:
-        chunk_nodes, chunk_edges, t_ke, r_ke, bt_pe, ss_pe = res
-        
-        for key in all_nodes: all_nodes[key].extend(chunk_nodes[key])
-        for key in all_edges: all_edges[key].extend(chunk_edges[key])
+    with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
+        # Iterate directly over the map object. DO NOT wrap it in list()!
+        for res in executor.map(_process_single_chunk, args_list):
+            chunk_nodes, chunk_edges, t_ke, r_ke, bt_pe, ss_pe = res
             
-        t_ke_all.extend(t_ke)
-        r_ke_all.extend(r_ke)
-        bt_pe_all.extend(bt_pe)
-        ss_pe_all.extend(ss_pe)
+            for key in all_nodes: all_nodes[key].extend(chunk_nodes[key])
+            for key in all_edges: all_edges[key].extend(chunk_edges[key])
+                
+            t_ke_all.extend(t_ke)
+            r_ke_all.extend(r_ke)
+            bt_pe_all.extend(bt_pe)
+            ss_pe_all.extend(ss_pe)
+
+            # Explicitly sever the reference so the main thread's 
+            # garbage collector immediately reclaims the RAM for this chunk
+            del res, chunk_nodes, chunk_edges, t_ke, r_ke, bt_pe, ss_pe
 
     # 2. DATA PACKAGING
     dt = sim_config["dt"]
