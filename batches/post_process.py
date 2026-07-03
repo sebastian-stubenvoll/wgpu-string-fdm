@@ -112,7 +112,7 @@ def process_and_email(sim_path, run_id, config, email_config, m_node, dl, inerti
     all_edges = {'quat': [], 'ang_vel': [], 'force': [], 'strain': []}
                  
     # 1. PARALLEL DATA EXTRACTION
-    with concurrent.futures.ProcessPoolExecutor() as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
         results = list(executor.map(_process_single_chunk, args_list))
         
     for res in results:
@@ -188,3 +188,74 @@ def process_and_email(sim_path, run_id, config, email_config, m_node, dl, inerti
 
 
 
+# ---------------------------------------------------------
+# Command Line Execution
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    import sys
+    import argparse
+    import json
+    
+    # 1. Set up argument parsing
+    parser = argparse.ArgumentParser(description="Post-process simulation data and dispatch email.")
+    parser.add_argument(
+        "sim_path", 
+        type=str, 
+        help="Absolute path to the simulation directory containing the .pkl.gz files and parameters.json"
+    )
+
+    args = parser.parse_args()
+    target_dir = Path(args.sim_path).resolve()
+
+    if not target_dir.is_dir():
+        print(f"[{datetime.now()}] Error: Directory '{target_dir}' does not exist.")
+        sys.exit(1)
+
+    # 2. Parse Metadata
+    param_file = target_dir / "parameters.json"
+    if not param_file.exists():
+        print(f"[{datetime.now()}] Error: 'parameters.json' not found in '{target_dir}'.")
+        sys.exit(1)
+
+    print(f"[{datetime.now()}] Reading metadata from {param_file}...")
+    with open(param_file, "r") as f:
+        metadata = json.load(f)
+
+    # Extract configs and cast lists back to numpy arrays
+    run_id = metadata.get("run_id", 0)
+    sim_config = metadata["config"]
+    rod_derived = metadata["rod_derived"]
+
+    m_node = rod_derived["m_node"]
+    dl = rod_derived["dl"]
+    inertia = np.array(rod_derived["inertia"])
+    K_se = np.array(rod_derived["K_se"])
+    K_bt = np.array(rod_derived["K_bt"])
+
+    # 3. Email Configuration (Not saved in JSON for security)
+    # Populate these from environment variables or hardcode them here
+    email_config_dict = {
+        "sender_email": os.environ.get("SENDER_EMAIL", "your_email@example.com"),
+        "sender_password": os.environ.get("SENDER_PASSWORD", "your_app_password"),
+        "receiver_email": os.environ.get("RECEIVER_EMAIL", "target_email@example.com"),
+        "smtp_server": "smtp.gmail.com",
+        "smtp_port": 465
+    }
+
+    # 4. Execution
+    try:
+        process_and_email(
+            sim_path=target_dir,
+            run_id=run_id,
+            config=sim_config,
+            email_config=email_config_dict,
+            m_node=m_node,
+            dl=dl,
+            inertia=inertia,
+            K_se=K_se,
+            K_bt=K_bt
+        )
+        print(f"[{datetime.now()}] Post-processing script completed successfully.")
+    except Exception as e:
+        print(f"[{datetime.now()}] Fatal error during execution: {e}")
+        sys.exit(1)
