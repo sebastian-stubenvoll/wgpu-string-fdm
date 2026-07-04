@@ -32,8 +32,8 @@ def main():
         batch_jobs[i + 8]["rod"]["mu"] = mu_v
         batch_jobs[i + 12]["rod"]["mu"] = mu_v
 
-        batch_jobs[i + 4]["hammer"]["velocity"] = 2.0
-        batch_jobs[i + 12]["hammer"]["velocity"] = 2.0
+        batch_jobs[i + 4]["hammer"]["hammer_velocity"] = 2.0
+        batch_jobs[i + 12]["hammer"]["hammer_velocity"] = 2.0
 
         batch_jobs[i + 8]["rod"]["twists"] = 3.0
         batch_jobs[i + 12]["rod"]["twists"] = 3.0
