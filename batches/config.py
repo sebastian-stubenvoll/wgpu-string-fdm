@@ -9,8 +9,8 @@ SIM_CONFIG = {
     "chunk_size": 512,
     "dispatches": 200,
     "hammer_node": 25,
-    "inspect_nodes": [25],
-    "hammer_width": 1,
+    "inspect_nodes": [25, 512, 800],
+    "hammer_width": 15,
     "oversampling_factor": int(1.0 / (4e-7 * 50_000)),
     "dampening": [1e-6, 1e-6],
 }

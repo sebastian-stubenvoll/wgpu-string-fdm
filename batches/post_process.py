@@ -1,4 +1,3 @@
-
 import os
 import sys
 import pickle
@@ -52,7 +51,7 @@ def E_PS(strain, K_se):
 def _process_single_chunk(args):
     nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl = args
     
-    node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': []} for n in inspect_nodes}
+    node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': [], 'omega': []} for n in inspect_nodes}
     t_ke, r_ke, bt_pe, ss_pe = [], [], [], []
 
     with gzip.open(nf, "rb") as f: n_chunk = pickle.load(f)
@@ -70,6 +69,7 @@ def _process_single_chunk(args):
             
             target_edge_idx = min(n, len(e_frame)-1)
             node_data[n]['quats'].append(e_frame[target_edge_idx][0])
+            node_data[n]['omega'].append(e_frame[target_edge_idx][1][0])
         
         # Global energy sums
         t_sum, bt_sum = 0, 0
@@ -96,7 +96,8 @@ def _process_single_chunk(args):
             'pos': np.array(node_data[n]['pos'], dtype=np.float32),
             'vel': np.array(node_data[n]['vel'], dtype=np.float32),
             'mom': np.array(node_data[n]['mom'], dtype=np.float32),
-            'quats': np.array(node_data[n]['quats'], dtype=np.float32)
+            'quats': np.array(node_data[n]['quats'], dtype=np.float32),
+            'omega': np.array(node_data[n]['omega'], dtype=np.float32)
         }
 
     return (len(n_chunk), out_node_data,
@@ -106,14 +107,14 @@ def _process_single_chunk(args):
 # ---------------------------------------------------------
 # Plotting Functions (Designed for Parallel Workers)
 # ---------------------------------------------------------
-def plot_node_pos_vel_moment_fft(time, pos, vel, mom, dt, oversampling_factor, cutoff=20_000, 
-                                 show_velocities=False, moments=False, fundamental_weight=0.2, 
-                                 title_prefix="", filename_prefix=""):
+def plot_node_pos_moment_fft(time, pos, mom, dt, oversampling_factor, cutoff=20_000, 
+                             moments=False, fundamental_weight=0.2, 
+                             title_prefix="", filename_prefix=""):
     T = len(time)
     freqs = np.fft.rfftfreq(T, dt * oversampling_factor)
-    components = [("x", pos[:, 0], vel[:, 0], mom[:, 0]),
-                  ("y", pos[:, 1], vel[:, 1], mom[:, 1]),
-                  ("z", pos[:, 2], vel[:, 2], mom[:, 2])]
+    components = [("x", pos[:, 0], mom[:, 0]),
+                  ("y", pos[:, 1], mom[:, 1]),
+                  ("z", pos[:, 2], mom[:, 2])]
 
     def fft_mag(signal):
         sig = signal - np.mean(signal)
@@ -125,39 +126,22 @@ def plot_node_pos_vel_moment_fft(time, pos, vel, mom, dt, oversampling_factor, c
 
     generated_files = []
 
-    for label, p_data, v_data, m_data in components:
-        n_plots = 3 if moments else 2
+    for label, p_data, m_data in components:
+        n_plots = 4 if moments else 3
         fig, axes = plt.subplots(n_plots, 1, figsize=(10, 2.8 * n_plots), sharex=False)
 
-        # Displacement (& optionally Velocity)
+        # Displacement
         ax = axes[0]
         p_max = np.max(np.abs(p_data))
         p_scaled = p_data / p_max if p_max > 0 else p_data
-        l1 = ax.plot(time, p_scaled, color="tab:blue", label=f"{label} Disp")
+        ax.plot(time, p_scaled, color="tab:blue", label=f"{label} Disp")
         ax.set_ylim(-1.05, 1.05)
         ax.set_ylabel("Normalized Disp.", color="tab:blue")
         ax.set_xlabel("Time (s)")
         ax.set_yticks([-1, 0, 1])
         ax.set_yticklabels([f"{-p_max:.3e}", "0", f"{p_max:.3e}"])
         ax.set_title(f"[{title_prefix}] {label}-axis Displacement over Time")
-        
-        lines = l1
-        labels = [l.get_label() for l in l1]
-
-        if show_velocities:
-            v_max = np.max(np.abs(v_data))
-            v_scaled = v_data / v_max if v_max > 0 else v_data
-            ax2 = ax.twinx()
-            l2 = ax2.plot(time, v_scaled, "--", color="tab:orange", label=f"{label} Vel")
-            ax2.set_ylim(-1.05, 1.05)
-            ax2.set_ylabel("Normalized Vel.", color="tab:orange")
-            ax2.set_yticks([-1, 0, 1])
-            ax2.set_yticklabels([f"{-v_max:.3e}", "0", f"{v_max:.3e}"])
-            ax.set_title(f"[{title_prefix}] {label}-axis Displacement & Velocity over Time")
-            lines += l2
-            labels += [l.get_label() for l in l2]
-        
-        ax.legend(lines, labels, loc='upper right')
+        ax.legend(loc='upper right')
         ax.grid(True, alpha=0.3)
 
         plot_idx = 1
@@ -177,11 +161,23 @@ def plot_node_pos_vel_moment_fft(time, pos, vel, mom, dt, oversampling_factor, c
             axm.grid(True, alpha=0.3)
             plot_idx += 1
 
-        # FFT
+        # FFT (No Fit)
         bins = fft_mag(p_data)
-        ax_fit = axes[plot_idx]
         mag_norm = bins / np.max(bins) if np.max(bins) > 0 else bins
         
+        ax_fft = axes[plot_idx]
+        ax_fft.plot(freqs, mag_norm, color='tab:cyan', label='Spectrum')
+        ax_fft.set_xlim(0, cutoff)
+        ax_fft.set_title(f"[{title_prefix}] {label}-axis FFT Spectrum (Raw)")
+        ax_fft.set_xlabel("Frequency (Hz)")
+        ax_fft.set_ylabel("Normalized Magnitude")
+        ax_fft.legend(loc='upper right')
+        ax_fft.grid(True, alpha=0.3)
+        
+        plot_idx += 1
+
+        # FFT (With Fit)
+        ax_fit = axes[plot_idx]
         peak_indices, _ = find_peaks(mag_norm, height=0.02, distance=5)
         peak_freqs = freqs[peak_indices]
         peak_mags = mag_norm[peak_indices]
@@ -244,6 +240,27 @@ def plot_node_pos_vel_moment_fft(time, pos, vel, mom, dt, oversampling_factor, c
 
     return generated_files
 
+def plot_angular_velocity(time, omega, title_prefix="", filename=""):
+    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+    
+    omega_mag = np.linalg.norm(omega, axis=1)
+    
+    ax.plot(time, np.abs(omega[:, 0]), label="|Omega X|", alpha=0.6)
+    ax.plot(time, np.abs(omega[:, 1]), label="|Omega Y|", alpha=0.6)
+    ax.plot(time, np.abs(omega[:, 2]), label="|Omega Z|", alpha=0.6)
+    ax.plot(time, omega_mag, label="Magnitude", color='black', linewidth=1.5)
+    
+    ax.set_ylabel("Angular Velocity (rad/s)")
+    ax.set_xlabel("Time (s)")
+    ax.set_title(f"[{title_prefix}] Absolute Angular Velocity Over Time")
+    ax.legend(loc="upper right")
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(filename, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return [filename]
+
 def plot_axis_angle_over_time(time, quats, title_prefix="", filename=""):
     axes_arr, angles = [], []
     for q in quats:
@@ -278,19 +295,23 @@ def plot_axis_angle_over_time(time, quats, title_prefix="", filename=""):
 
 def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe, print_totals=False, 
                   normalized=False, mode_transfer=False, title_prefix="", filename=""):
+    # Remove the potential energy offset from frame 0
+    bend_pe = bend_pe - bend_pe[0]
+    shear_pe = shear_pe - shear_pe[0]
+    
     total_kin = trans_ke + rot_ke
     total_pot = bend_pe + shear_pe
     total_energy = total_kin + total_pot
     
+    fig = plt.figure(figsize=(12, 6))
+    
     if normalized:
-        trans_ke = trans_ke - trans_ke[0]
-        rot_ke = rot_ke - rot_ke[0]
-        bend_pe = bend_pe - bend_pe[0]
-        shear_pe = shear_pe - shear_pe[0]
-        total_kin = total_kin - total_kin[0]
-        total_pot = total_pot - total_pot[0]
-        total_energy = total_energy - total_energy[0]
-        title = f"[{title_prefix}] Normalized Energy Breakdown (Offset Removed)"
+        title = f"[{title_prefix}] Normalized Energy Breakdown (Stacked)"
+        plt.stackplot(time, trans_ke, rot_ke, bend_pe, shear_pe, 
+                      labels=["Translational KE", "Rotational KE", "Bend/Twist PE", "Shear/Stretch PE"], 
+                      colors=["tab:blue", "tab:purple", "tab:orange", "tab:green"], alpha=0.8)
+        plt.plot(time, total_energy, label="TOTAL SYSTEM ENERGY", color='black', linestyle='--', linewidth=1.5)
+        plt.ylabel("Energy (Joules)")
     elif mode_transfer:
         with np.errstate(divide='ignore', invalid='ignore'):
             trans_ke = trans_ke / total_energy
@@ -300,24 +321,26 @@ def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe, print_totals=False,
             total_kin = total_kin / total_energy
             total_pot = total_pot / total_energy
         title = f"[{title_prefix}] Energy Mode Transfer (Fraction of Total)"
-    else:
-        title = f"[{title_prefix}] Cosserat Rod Energy Breakdown"
-
-    fig = plt.figure(figsize=(12, 6))
-    plt.plot(time, trans_ke, label="Translational KE", alpha=0.4, linestyle=':')
-    plt.plot(time, rot_ke, label="Rotational KE", alpha=0.4, linestyle=':')
-    plt.plot(time, bend_pe, label="Bend/Twist PE", alpha=0.4, linestyle=':')
-    plt.plot(time, shear_pe, label="Shear/Stretch PE", alpha=0.4, linestyle=':')
-    
-    plt.plot(time, total_kin, label="TOTAL Kinetic", linewidth=2, color='blue')
-    plt.plot(time, total_pot, label="TOTAL Potential", linewidth=2, color='orange')
-    
-    if not mode_transfer:
-        plt.plot(time, total_energy, label="TOTAL SYSTEM ENERGY", color='black', linestyle='--', linewidth=1.5)
-        plt.ylabel("Energy (Joules)")
-    else:
+        plt.plot(time, trans_ke, label="Translational KE", alpha=0.4, linestyle=':')
+        plt.plot(time, rot_ke, label="Rotational KE", alpha=0.4, linestyle=':')
+        plt.plot(time, bend_pe, label="Bend/Twist PE", alpha=0.4, linestyle=':')
+        plt.plot(time, shear_pe, label="Shear/Stretch PE", alpha=0.4, linestyle=':')
+        plt.plot(time, total_kin, label="TOTAL Kinetic", linewidth=2, color='blue')
+        plt.plot(time, total_pot, label="TOTAL Potential", linewidth=2, color='orange')
         plt.ylabel("Fraction of Total Energy")
         plt.ylim(-0.1, 1.1)
+    else:
+        title = f"[{title_prefix}] Cosserat Rod Energy Breakdown (Offset Removed)"
+        plt.plot(time, trans_ke, label="Translational KE", alpha=0.4, linestyle=':')
+        plt.plot(time, rot_ke, label="Rotational KE", alpha=0.4, linestyle=':')
+        plt.plot(time, bend_pe, label="Bend/Twist PE", alpha=0.4, linestyle=':')
+        plt.plot(time, shear_pe, label="Shear/Stretch PE", alpha=0.4, linestyle=':')
+        
+        plt.plot(time, total_kin, label="TOTAL Kinetic", linewidth=2, color='blue')
+        plt.plot(time, total_pot, label="TOTAL Potential", linewidth=2, color='orange')
+        
+        plt.plot(time, total_energy, label="TOTAL SYSTEM ENERGY", color='black', linestyle='--', linewidth=1.5)
+        plt.ylabel("Energy (Joules)")
 
     plt.title(title)
     plt.xlabel("Time (s)")
@@ -329,23 +352,6 @@ def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe, print_totals=False,
         print(f"Total Energy Mean: {np.mean(total_energy):.6e} J")
         print(f"Energy Variation: {np.std(total_energy):.6e} J")
 
-    plt.savefig(filename, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return [filename]
-
-def plot_phase_space(pos, vel, title_prefix="", filename=""):
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    labels = ['X', 'Y', 'Z']
-    
-    for i in range(3):
-        axes[i].plot(pos[:, i], vel[:, i], color='purple', alpha=0.6, linewidth=0.5, label="Trajectory")
-        axes[i].set_title(f"[{title_prefix}] {labels[i]}-Axis Phase Space")
-        axes[i].set_xlabel("Displacement (m)")
-        axes[i].set_ylabel("Velocity (m/s)")
-        axes[i].legend(loc="upper right")
-        axes[i].grid(True, alpha=0.3)
-
-    plt.tight_layout()
     plt.savefig(filename, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return [filename]
@@ -367,13 +373,13 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     # 1. Fully Parallelized Extraction
     args_list = [(nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl) for nf, ef in zip(node_files, edge_files)]
     
-    all_node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': []} for n in inspect_nodes}
+    all_node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': [], 'omega': []} for n in inspect_nodes}
     all_tke, all_rke, all_bpe, all_spe = [], [], [], []
     
     excitation_cutoff_frame = 0
     frames_processed = 0
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=16) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=32) as executor:
         for file_idx, res in enumerate(executor.map(_process_single_chunk, args_list)):
             n_frames, nd_dict, c_tke, c_rke, c_bpe, c_spe = res
             
@@ -382,6 +388,7 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
                 all_node_data[n]['vel'].append(nd_dict[n]['vel'])
                 all_node_data[n]['mom'].append(nd_dict[n]['mom'])
                 all_node_data[n]['quats'].append(nd_dict[n]['quats'])
+                all_node_data[n]['omega'].append(nd_dict[n]['omega'])
                 
             all_tke.append(c_tke)
             all_rke.append(c_rke)
@@ -401,7 +408,8 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
             'pos': np.concatenate(all_node_data[n]['pos']),
             'vel': np.concatenate(all_node_data[n]['vel']),
             'mom': np.concatenate(all_node_data[n]['mom']),
-            'quats': np.concatenate(all_node_data[n]['quats'])
+            'quats': np.concatenate(all_node_data[n]['quats']),
+            'omega': np.concatenate(all_node_data[n]['omega'])
         }
         
     t_ke = np.concatenate(all_tke)
@@ -445,23 +453,21 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
         # Queue Node-Specific Plots
         for n in inspect_nodes:
             p_pos = stitched_node_data[n]['pos'][start:end]
-            p_vel = stitched_node_data[n]['vel'][start:end]
             p_mom = stitched_node_data[n]['mom'][start:end]
             p_quats = stitched_node_data[n]['quats'][start:end]
+            p_omega = stitched_node_data[n]['omega'][start:end]
             
             node_prefix = str(output_dir / f"run_{run_id:03d}_node_{n:03d}_{phase_name}")
             node_title = f"Node {n} | {phase_title}"
 
-            plot_tasks.append((plot_node_pos_vel_moment_fft, (p_time, p_pos, p_vel, p_mom, dt, oversamp), 
-                               {"show_velocities": (phase_name == "Excitation"), "moments": True, 
-                                "title_prefix": node_title, "filename_prefix": f"{node_prefix}_fft"}))
+            plot_tasks.append((plot_node_pos_moment_fft, (p_time, p_pos, p_mom, dt, oversamp), 
+                               {"moments": True, "title_prefix": node_title, "filename_prefix": f"{node_prefix}_fft"}))
 
             plot_tasks.append((plot_axis_angle_over_time, (p_time, p_quats), 
                                {"title_prefix": node_title, "filename": f"{node_prefix}_angles.png"}))
-
-            if phase_name == "Free_Vibration":
-                plot_tasks.append((plot_phase_space, (p_pos, p_vel), 
-                                   {"title_prefix": node_title, "filename": f"{node_prefix}_phasespace.png"}))
+                               
+            plot_tasks.append((plot_angular_velocity, (p_time, p_omega), 
+                               {"title_prefix": node_title, "filename": f"{node_prefix}_omega.png"}))
 
     # ---------------------------------------------------------
     # Execute Plotting in Parallel
@@ -519,6 +525,8 @@ if __name__ == "__main__":
     sender_email = os.environ.get("SENDER_EMAIL")
     sender_password = os.environ.get("SENDER_PASSWORD")
     receiver_email = os.environ.get("RECEIVER_EMAIL")
+    smtp_server = os.environ.get("SMTP_SERVER")
+    smtp_port = os.environ.get("SMTP_PORT")
 
     if not sender_email or not sender_password or not receiver_email:
         print(f"[{datetime.now()}] FATAL ERROR: Email environment variables not set.")
@@ -527,7 +535,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("sim_path", type=str)
-    # Note: --node_idx is removed as it's now dynamically pulled from the config.
     args = parser.parse_args()
     target_dir = Path(args.sim_path).resolve()
 
@@ -546,8 +553,8 @@ if __name__ == "__main__":
         "sender_email": sender_email,
         "sender_password": sender_password,
         "receiver_email": receiver_email,
-        "smtp_server": "smtp.gmail.com",
-        "smtp_port": 465
+        "smtp_server": smtp_server,
+        "smtp_port": smtp_port,
     }
 
     process_and_plot(

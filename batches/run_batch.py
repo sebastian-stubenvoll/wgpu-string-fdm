@@ -9,6 +9,18 @@ def main():
         {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
         {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
         {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
+        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
+        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
+        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
+        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
+        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
+        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
+        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
+        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
+        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
+        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
+        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
+        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
         {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS}
     ]
 
@@ -16,6 +28,17 @@ def main():
 
     for i, mu_v in enumerate(mu_vars):
         batch_jobs[i]["rod"]["mu"] = mu_v
+        batch_jobs[i + 4]["rod"]["mu"] = mu_v
+        batch_jobs[i + 8]["rod"]["mu"] = mu_v
+        batch_jobs[i + 12]["rod"]["mu"] = mu_v
+
+        batch_jobs[i + 4]["hammer"]["velocity"] = 2.0
+        batch_jobs[i + 12]["hammer"]["velocity"] = 2.0
+
+        batch_jobs[i + 8]["rod"]["twists"] = 3.0
+        batch_jobs[i + 12]["rod"]["twists"] = 3.0
+
+    
 
     for i, params in enumerate(batch_jobs):
         sim = SimulationRun(
