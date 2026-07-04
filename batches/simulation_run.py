@@ -9,7 +9,7 @@ import numpy as np
 
 from py_wgpu_fdm import Simulation
 from utils import generate_straight_rod, make_weights
-from post_process import process_and_email
+from post_process import process_and_plot
 
 class SimulationRun:
     def __init__(self, run_id, rod_params, hammer_params, config, email_config, base_dir="simulation_results"):
@@ -154,7 +154,7 @@ class SimulationRun:
         print(f"Run {self.run_id:03d} compute complete. Launching post-processing...")
         
         plot_thread = threading.Thread(
-            target=process_and_email,
+            target=process_and_plot,
             args=(
                 self.sim_dir, self.run_id, self.config, self.email_config, 
                 self.rod_derived["m_node"], self.rod_derived["dl"], self.rod_derived["inertia"], 
