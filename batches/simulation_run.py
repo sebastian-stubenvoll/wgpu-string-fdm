@@ -158,7 +158,7 @@ class SimulationRun:
             args=(
                 self.sim_dir, self.run_id, self.config, self.email_config, 
                 self.rod_derived["m_node"], self.rod_derived["dl"], self.rod_derived["inertia"], 
-                self.config["inspect_nodes"]
+                self.rod_derived["K_se"], self.rod_derived["K_bt"], self.config["inspect_nodes"]
             ),
             daemon=False
         )
