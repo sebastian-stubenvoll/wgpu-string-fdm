@@ -181,6 +181,7 @@ def plot_node_pos_moment_fft(time, pos, mom, dt, oversampling_factor, cutoff=20_
         peak_indices, _ = find_peaks(mag_norm, height=0.02, distance=5)
         peak_freqs = freqs[peak_indices]
         peak_mags = mag_norm[peak_indices]
+        highest_peak = peak_freqs.max()
 
         if len(peak_freqs) >= 2:
             sig_idx = np.where(peak_mags > fundamental_weight)[0]
@@ -220,11 +221,13 @@ def plot_node_pos_moment_fft(time, pos, mom, dt, oversampling_factor, cutoff=20_
                 ax_fit.axvline(f_ideal, color='green', linestyle=':', alpha=0.5)
 
             ax_fit.set_xlim(0, cutoff) 
+            ax_fft.set_xlim(0, cutoff) 
             if len(fns) > 0: ax_fit.set_xlim(0, max(fns) * 1.2)
             ax_fit.set_title(f"[{title_prefix}] {label}-axis FFT Inharmonicity Fit (B = {B_fit:.5f})")
         else:
             ax_fit.plot(freqs, mag_norm, color='lightgray', label='Spectrum')
             ax_fit.set_xlim(0, cutoff)
+            ax_fft.set_xlim(0, cutoff)
             ax_fit.set_title(f"[{title_prefix}] {label}-axis FFT (Not enough peaks for fit)")
 
         ax_fit.set_xlabel("Frequency (Hz)")
@@ -232,12 +235,24 @@ def plot_node_pos_moment_fft(time, pos, mom, dt, oversampling_factor, cutoff=20_
         ax_fit.legend(loc='upper right')
         ax_fit.grid(True, alpha=0.3)
         plt.tight_layout()
+
         
         file_path = f"{filename_prefix}_{label}.png"
         plt.savefig(file_path, dpi=200, bbox_inches="tight")
         plt.close(fig) 
         generated_files.append(file_path)
 
+        fit_results = dict()
+        fit_results[label] = {
+            "fundamental": float(f1_fit),
+            "inharmonicity": float(B_fit),
+        }
+
+    stats_path = filename_prefix + "_fft_stats.json"
+    with open(stats_path, "w") as f:
+        json.dump(fit_results, f, indent=2)
+
+    generated_files.append(stats_path)
     return generated_files
 
 def plot_angular_velocity(time, omega, title_prefix="", filename=""):
@@ -248,7 +263,7 @@ def plot_angular_velocity(time, omega, title_prefix="", filename=""):
     ax.plot(time, np.abs(omega[:, 0]), label="|Omega X|", alpha=0.6)
     ax.plot(time, np.abs(omega[:, 1]), label="|Omega Y|", alpha=0.6)
     ax.plot(time, np.abs(omega[:, 2]), label="|Omega Z|", alpha=0.6)
-    ax.plot(time, omega_mag, label="Magnitude", color='black', linewidth=1.5)
+    ax.plot(time, omega_mag, label="Magnitude", color='grey', linewidth=1.5)
     
     ax.set_ylabel("Angular Velocity (rad/s)")
     ax.set_xlabel("Time (s)")
@@ -306,12 +321,39 @@ def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe, print_totals=False,
     fig = plt.figure(figsize=(12, 6))
     
     if normalized:
-        title = f"[{title_prefix}] Normalized Energy Breakdown (Stacked)"
-        plt.stackplot(time, trans_ke, rot_ke, bend_pe, shear_pe, 
-                      labels=["Translational KE", "Rotational KE", "Bend/Twist PE", "Shear/Stretch PE"], 
-                      colors=["tab:blue", "tab:purple", "tab:orange", "tab:green"], alpha=0.8)
-        plt.plot(time, total_energy, label="TOTAL SYSTEM ENERGY", color='black', linestyle='--', linewidth=1.5)
-        plt.ylabel("Energy (Joules)")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            trans = np.divide(trans_ke, total_energy,
+                              out=np.zeros_like(trans_ke),
+                              where=np.abs(total_energy) > 1e-20)
+            rot = np.divide(rot_ke, total_energy,
+                            out=np.zeros_like(rot_ke),
+                            where=np.abs(total_energy) > 1e-20)
+            bend = np.divide(bend_pe, total_energy,
+                             out=np.zeros_like(bend_pe),
+                             where=np.abs(total_energy) > 1e-20)
+            shear = np.divide(shear_pe, total_energy,
+                              out=np.zeros_like(shear_pe),
+                              where=np.abs(total_energy) > 1e-20)
+
+        title = f"[{title_prefix}] Energy Distribution"
+
+        plt.stackplot(
+            time,
+            trans,
+            rot,
+            bend,
+            shear,
+            labels=[
+                "Translational KE",
+                "Rotational KE",
+                "Bend/Twist PE",
+                "Shear/Stretch PE",
+            ],
+            colors=["tab:blue", "tab:purple", "tab:orange", "tab:green"],
+        )
+
+        plt.ylim(0, 1)
+        plt.ylabel("Fraction of Total Energy")
     elif mode_transfer:
         with np.errstate(divide='ignore', invalid='ignore'):
             trans_ke = trans_ke / total_energy
@@ -339,7 +381,7 @@ def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe, print_totals=False,
         plt.plot(time, total_kin, label="TOTAL Kinetic", linewidth=2, color='blue')
         plt.plot(time, total_pot, label="TOTAL Potential", linewidth=2, color='orange')
         
-        plt.plot(time, total_energy, label="TOTAL SYSTEM ENERGY", color='black', linestyle='--', linewidth=1.5)
+        plt.plot(time, total_energy, label="TOTAL SYSTEM ENERGY", color='gray', linestyle='--', linewidth=1.5)
         plt.ylabel("Energy (Joules)")
 
     plt.title(title)

@@ -3,15 +3,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+dt = 2.5e-7 # 4e-7 is every so slightly unstable
+
 SIM_CONFIG = {
     "node_count": 1024,
-    "dt": 4e-7, # 2e-7 is every so slightly unstable
+    "dt": dt, 
     "chunk_size": 512,
     "dispatches": 200,
     "hammer_node": 25,
     "inspect_nodes": [25, 512, 800],
     "hammer_width": 15,
-    "oversampling_factor": int(1.0 / (4e-7 * 50_000)),
+    "oversampling_factor": int(1.0 / (dt * 50_000)),
     "dampening": [1e-6, 1e-6],
 }
 

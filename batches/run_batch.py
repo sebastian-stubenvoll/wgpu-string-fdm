@@ -1,44 +1,23 @@
 import os
+from itertrools import product
 from simulation_run import SimulationRun
 from config import SIM_CONFIG, ROD_PARAMS, HAMMER_PARAMS, EMAIL_CONFIG
 
 OUTPUT_DIR = "/simulation_data" 
 
 def main():
-    batch_jobs = [
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS},
-        {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS}
-    ]
+    batch_jobs = list()
 
-    mu_vars = [ 0.1, 0.15, 0.2, 0.25 ]
+    mu_vars = [ 0.15, 0.2, 0.25 ]
+    hammer_velocities [ 2.0, 4.0, 6.0 ]
+    twists = [ 0.0, 3.0 ]
 
-    for i, mu_v in enumerate(mu_vars):
-        batch_jobs[i]["rod"]["mu"] = mu_v
-        batch_jobs[i + 4]["rod"]["mu"] = mu_v
-        batch_jobs[i + 8]["rod"]["mu"] = mu_v
-        batch_jobs[i + 12]["rod"]["mu"] = mu_v
-
-        batch_jobs[i + 4]["hammer"]["hammer_velocity"] = 2.0
-        batch_jobs[i + 12]["hammer"]["hammer_velocity"] = 2.0
-
-        batch_jobs[i + 8]["rod"]["twists"] = 3.0
-        batch_jobs[i + 12]["rod"]["twists"] = 3.0
-
-    
+    for mu, hv, tw in product(mu_vars, hammer_velocities, twists):
+        base = {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS}
+        base["rod"]["mu"] = mu
+        base["hammer"]["hammer_velocity"] = hv
+        base["rod"]["twists"] = tw
+        batch_jobs.append(base)
 
     for i, params in enumerate(batch_jobs):
         sim = SimulationRun(
