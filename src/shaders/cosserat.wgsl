@@ -79,8 +79,8 @@ struct PushConstants {
 
     linear_dampening: f32,
     angular_dampening: f32,
+    hammer_offset_y: f32,
     _pad0: u32,
-    _pad1: u32,
 }
 
 var <push_constant> c: PushConstants;
@@ -159,7 +159,6 @@ fn half_step(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Half step position update (drift)
     if (global_id.x > (0 + uniforms.clamp_offset) && global_id.x < (uniforms.node_count - 2 - uniforms.clamp_offset)) {
-        let dq = 0.5 * qmul(edges[current].orientation, vec4<f32>(edges[current].angular_velocity, 0.0));
         var update = integrate_exponential(edges[current].orientation, edges[current].angular_velocity, uniforms.dt * 0.5);
         // Safety: make sure future orientation selects pole closest to current orientation
         if (dot(update, edges[current].orientation) < 0.0) {
@@ -244,10 +243,12 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + global_id.x;
     let future = (c.future * uniforms.node_count) + global_id.x;
 
+    var ext_force = vec3<f32>(0.0);
+    var ext_couple = vec3<f32>(0.0);
+
     // Interior nodes
     if (global_id.x > 0 && global_id.x < uniforms.node_count - 1) {
 
-        var ext_force = vec3<f32>(0.0);
         // Hammer collision
         if (c.hammering == 1) {
             let weight = hammer_weights[global_id.x];
@@ -263,6 +264,14 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
                 let weighted_force = local_force * weight;
                 ext_force = vec3<f32>(0.0, 0.0, weighted_force);
+
+                // LF_x is center line, LF_z is striking direction, so LF_y is tangential
+                // THEORETICALLY this belongs inside the edge IF-block, but if the string isn't struck
+                // at its far end, calculating this here is fine. 
+                // In fact, the ghost edge makes these accesses always safe and the ghost torque is never applied.
+                // For hammer_offset_y = 0 this becomes 0.
+                ext_couple = rotate_inv(edges[current].orientation, cross(vec3<f32>(0.0, c.hammer_offset_y, 0.0), ext_force))
+
                 let fixed_point_force = i32(weighted_force * 10000.0);
                 atomicAdd(&hammer.force_accumulator, fixed_point_force);
             } else {
@@ -292,7 +301,6 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let tangent_LF = r * uniforms.dl_inv;
         let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
 
-        let ext_couple = vec3<f32>(0.0, 0.0, 0.0);
         let damping_torque = - c.angular_dampening * edges[current].angular_velocity;
 
         var difference: vec3<f32>;

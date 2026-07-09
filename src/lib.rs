@@ -38,6 +38,7 @@ mod py_wgpu_fdm {
             hammer_exponent: f32,
             hammer_hysteresis_factor: f32,
             hammer_relaxation_time: f32,
+            hammer_offset_y: f32,
         ) -> PyResult<Self> {
             let nodes: Vec<gpu_bindings::Node> = nodes
                 .iter()
@@ -77,6 +78,7 @@ mod py_wgpu_fdm {
                 edges,
                 hammer_weights,
                 hammer,
+                hammer_offset_y,
                 uniforms,
                 oversampling_factor,
                 dampening,

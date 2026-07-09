@@ -169,8 +169,8 @@ struct PushConstants {
 
     linear_dampening: f32,
     angular_dampening: f32,
+    hammer_offset_y: f32,
     _pad0: u32,
-    _pad1: u32,
 }
 
 #[repr(C)]
@@ -275,6 +275,7 @@ impl State {
         mut edges_vec: Vec<Edge>,
         hammer_weights: Vec<f32>,
         hammer: Hammer,
+        hammer_offset_y: f32,
         uniforms: FDMUniform,
         oversampling_factor: usize,
         dampening: [f32; 2],
@@ -417,8 +418,8 @@ impl State {
 
             linear_dampening: dampening[0],
             angular_dampening: dampening[1],
+            hammer_offset_y: hammer_offset_y,
             _pad0: 0,
-            _pad1: 0,
         };
 
         let compute_bind_group_layout =
