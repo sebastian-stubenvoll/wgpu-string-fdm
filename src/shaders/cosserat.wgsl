@@ -270,7 +270,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 // at its far end, calculating this here is fine. 
                 // In fact, the ghost edge makes these accesses always safe and the ghost torque is never applied.
                 // For hammer_offset_y = 0 this becomes 0.
-                ext_couple = rotate_inv(edges[current].orientation, cross(vec3<f32>(0.0, c.hammer_offset_y, 0.0), ext_force))
+                ext_couple = rotate_inv(edges[current].orientation, cross(vec3<f32>(0.0, c.hammer_offset_y, 0.0), ext_force));
 
                 let fixed_point_force = i32(weighted_force * 10000.0);
                 atomicAdd(&hammer.force_accumulator, fixed_point_force);

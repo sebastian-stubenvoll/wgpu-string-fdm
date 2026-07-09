@@ -1,5 +1,5 @@
 import os
-from itertrools import product
+from itertools import product
 from simulation_run import SimulationRun
 from config import SIM_CONFIG, ROD_PARAMS, HAMMER_PARAMS, EMAIL_CONFIG
 
@@ -9,13 +9,14 @@ def main():
     batch_jobs = list()
 
     mu_vars = [ 0.15, 0.2, 0.25 ]
-    hammer_velocities [ 2.0, 4.0, 6.0 ]
+    hammer_velocities = [ 6.0 ]
     twists = [ 0.0, 3.0 ]
 
     for mu, hv, tw in product(mu_vars, hammer_velocities, twists):
         base = {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS}
         base["rod"]["mu"] = mu
         base["hammer"]["hammer_velocity"] = hv
+        base["hammer"]["hammer_offset_y"] = 3.5e-4
         base["rod"]["twists"] = tw
         batch_jobs.append(base)
 

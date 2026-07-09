@@ -41,7 +41,7 @@ HAMMER_PARAMS = {
     "hammer_exponent": 2.3,
     "hammer_hysteresis_factor": 0.1,
     "hammer_relaxation_time": 0.000014,
-    "hammer_offset": 0.0,
+    "hammer_offset_y": 0.0,
 }
 
 EMAIL_CONFIG = {
