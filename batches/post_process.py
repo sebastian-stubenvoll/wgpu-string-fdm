@@ -2,24 +2,22 @@ import os
 import sys
 import pickle
 import gzip
+import json
 from pathlib import Path
 from datetime import datetime
 import smtplib
 from email.message import EmailMessage
 import concurrent.futures
-
-import numpy as np
-import matplotlib
-matplotlib.use('Agg') # MUST be set before pyplot import for multiprocessing safety
-import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
-from scipy.optimize import curve_fit
-from scipy.spatial.transform import Rotation as R
 import gc
 
-# ---------------------------------------------------------
+import numpy as np
+
+# Import Plotting Modules
+from plots.pos_fft import plot_node_pos_moment_fft
+from plots.rotation import plot_angular_velocity, plot_axis_angle_over_time
+from plots.energy import plot_energies
+
 # Helper Functions (Energy)
-# ---------------------------------------------------------
 def E_T(node, mass):
     velocity = np.array(node[1])
     return 0.5 * mass * np.dot(velocity, velocity)
@@ -45,9 +43,7 @@ def E_PS(strain, K_se):
         return 0.5 * np.dot(s, K * s)
     return 0.5 * np.dot(s, K @ s)
 
-# ---------------------------------------------------------
 # Parallel Extraction Worker
-# ---------------------------------------------------------
 def _process_single_chunk(args):
     nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl = args
     
@@ -104,303 +100,7 @@ def _process_single_chunk(args):
             np.array(t_ke, dtype=np.float32), np.array(r_ke, dtype=np.float32), 
             np.array(bt_pe, dtype=np.float32), np.array(ss_pe, dtype=np.float32))
 
-# ---------------------------------------------------------
-# Plotting Functions (Designed for Parallel Workers)
-# ---------------------------------------------------------
-def plot_node_pos_moment_fft(time, pos, mom, dt, oversampling_factor, cutoff=20_000, 
-                             moments=False, fundamental_weight=0.2, 
-                             title_prefix="", filename_prefix=""):
-    T = len(time)
-    freqs = np.fft.rfftfreq(T, dt * oversampling_factor)
-    components = [("x", pos[:, 0], mom[:, 0]),
-                  ("y", pos[:, 1], mom[:, 1]),
-                  ("z", pos[:, 2], mom[:, 2])]
-
-    def fft_mag(signal):
-        sig = signal - np.mean(signal)
-        window = np.hanning(len(sig))
-        return np.abs(np.fft.rfft(sig * window))
-
-    def stiff_string_model(n, f1_val, B_val):
-        return n * f1_val * np.sqrt(1 + B_val * (n**2))
-
-    generated_files = []
-
-    for label, p_data, m_data in components:
-        n_plots = 4 if moments else 3
-        fig, axes = plt.subplots(n_plots, 1, figsize=(10, 2.8 * n_plots), sharex=False)
-
-        # Displacement
-        ax = axes[0]
-        p_max = np.max(np.abs(p_data))
-        p_scaled = p_data / p_max if p_max > 0 else p_data
-        ax.plot(time, p_scaled, color="tab:blue", label=f"{label} Disp")
-        ax.set_ylim(-1.05, 1.05)
-        ax.set_ylabel("Normalized Disp.", color="tab:blue")
-        ax.set_xlabel("Time (s)")
-        ax.set_yticks([-1, 0, 1])
-        ax.set_yticklabels([f"{-p_max:.3e}", "0", f"{p_max:.3e}"])
-        ax.set_title(f"[{title_prefix}] {label}-axis Displacement over Time")
-        ax.legend(loc='upper right')
-        ax.grid(True, alpha=0.3)
-
-        plot_idx = 1
-        
-        # Moments
-        if moments:
-            axm = axes[plot_idx]
-            m_max = np.max(np.abs(m_data))
-            m_scaled = m_data / m_max if m_max > 0 else m_data
-            axm.plot(time, m_scaled, color="tab:green", label=f"{label} Moment")
-            axm.set_ylim(-1.05, 1.05)
-            axm.set_xlabel("Time (s)")
-            axm.set_ylabel("Normalized Moment")
-            axm.set_yticks([-1, 0, 1])
-            axm.set_title(f"[{title_prefix}] {label}-axis Moment over Time")
-            axm.legend(loc='upper right')
-            axm.grid(True, alpha=0.3)
-            plot_idx += 1
-
-        # FFT (No Fit)
-        bins = fft_mag(p_data)
-        mag_norm = bins / np.max(bins) if np.max(bins) > 0 else bins
-        
-        ax_fft = axes[plot_idx]
-        ax_fft.plot(freqs, mag_norm, color='tab:cyan', label='Spectrum')
-        ax_fft.set_xlim(0, cutoff)
-        ax_fft.set_title(f"[{title_prefix}] {label}-axis FFT Spectrum (Raw)")
-        ax_fft.set_xlabel("Frequency (Hz)")
-        ax_fft.set_ylabel("Normalized Magnitude")
-        ax_fft.legend(loc='upper right')
-        ax_fft.grid(True, alpha=0.3)
-        
-        plot_idx += 1
-
-        # FFT (With Fit)
-        ax_fit = axes[plot_idx]
-        peak_indices, _ = find_peaks(mag_norm, height=0.02, distance=5)
-        peak_freqs = freqs[peak_indices]
-        peak_mags = mag_norm[peak_indices]
-        highest_peak = peak_freqs.max()
-
-        if len(peak_freqs) >= 2:
-            sig_idx = np.where(peak_mags > fundamental_weight)[0]
-            f1_est = peak_freqs[sig_idx[0]] if len(sig_idx) > 0 else peak_freqs[np.argmax(peak_mags)]
-            
-            measured_partials, harmonic_indices = [], []
-            consecutive_misses = 0
-            for n in range(1, 20):
-                if consecutive_misses > 2: break
-                target = n * f1_est
-                idx_closest = np.argmin(np.abs(peak_freqs - target))
-                if np.abs(peak_freqs[idx_closest] - target) < 0.45 * f1_est:
-                    measured_partials.append(peak_freqs[idx_closest])
-                    harmonic_indices.append(n)
-                    consecutive_misses = 0
-                else:
-                    consecutive_misses += 1
-
-            ns, fns = np.array(harmonic_indices), np.array(measured_partials)
-            f1_fit, B_fit = f1_est, 0.0
-            
-            if len(ns) >= 4:
-                try:
-                    popt, _ = curve_fit(stiff_string_model, ns, fns, p0=[f1_est, 0.0001])
-                    f1_fit, B_fit = popt
-                except RuntimeError: pass
-
-            ax_fit.plot(freqs, mag_norm, color='lightgray', label='Spectrum')
-            ax_fit.plot(peak_freqs, peak_mags, 'x', color='tab:blue', label='Detected Peaks')
-            
-            fitted_freqs = stiff_string_model(ns, f1_fit, B_fit)
-            if len(fitted_freqs) > 0:
-                ax_fit.scatter(fitted_freqs, np.interp(fitted_freqs, freqs, mag_norm), 
-                               color='tab:red', zorder=5, label=f'Fit (B={B_fit:.2e})')
-
-            for f_ideal in (ns * f1_fit):
-                ax_fit.axvline(f_ideal, color='green', linestyle=':', alpha=0.5)
-
-            ax_fit.set_xlim(0, cutoff) 
-            ax_fft.set_xlim(0, cutoff) 
-            if len(fns) > 0: ax_fit.set_xlim(0, max(fns) * 1.2)
-            ax_fit.set_title(f"[{title_prefix}] {label}-axis FFT Inharmonicity Fit (B = {B_fit:.5f})")
-        else:
-            ax_fit.plot(freqs, mag_norm, color='lightgray', label='Spectrum')
-            ax_fit.set_xlim(0, cutoff)
-            ax_fft.set_xlim(0, cutoff)
-            ax_fit.set_title(f"[{title_prefix}] {label}-axis FFT (Not enough peaks for fit)")
-
-        ax_fit.set_xlabel("Frequency (Hz)")
-        ax_fit.set_ylabel("Normalized Magnitude")
-        ax_fit.legend(loc='upper right')
-        ax_fit.grid(True, alpha=0.3)
-        plt.tight_layout()
-
-        
-        file_path = f"{filename_prefix}_{label}.png"
-        plt.savefig(file_path, dpi=200, bbox_inches="tight")
-        plt.close(fig) 
-        generated_files.append(file_path)
-
-        fit_results = dict()
-        fit_results[label] = {
-            "fundamental": float(f1_fit),
-            "inharmonicity": float(B_fit),
-        }
-
-    stats_path = filename_prefix + "_fft_stats.json"
-    with open(stats_path, "w") as f:
-        json.dump(fit_results, f, indent=2)
-
-    generated_files.append(stats_path)
-    return generated_files
-
-def plot_angular_velocity(time, omega, title_prefix="", filename=""):
-    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
-    
-    omega_mag = np.linalg.norm(omega, axis=1)
-    
-    ax.plot(time, np.abs(omega[:, 0]), label="|Omega X|", alpha=0.6)
-    ax.plot(time, np.abs(omega[:, 1]), label="|Omega Y|", alpha=0.6)
-    ax.plot(time, np.abs(omega[:, 2]), label="|Omega Z|", alpha=0.6)
-    ax.plot(time, omega_mag, label="Magnitude", color='grey', linewidth=1.5)
-    
-    ax.set_ylabel("Angular Velocity (rad/s)")
-    ax.set_xlabel("Time (s)")
-    ax.set_title(f"[{title_prefix}] Absolute Angular Velocity Over Time")
-    ax.legend(loc="upper right")
-    ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(filename, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return [filename]
-
-def plot_axis_angle_over_time(time, quats, title_prefix="", filename=""):
-    axes_arr, angles = [], []
-    for q in quats:
-        q_norm = q / np.linalg.norm(q)
-        rotvec = R.from_quat(q_norm).as_rotvec()
-        angle = np.linalg.norm(rotvec)
-        axis = rotvec / angle if angle > 1e-8 else np.array([0.0, 0.0, 0.0])
-        axes_arr.append(axis)
-        angles.append(angle)
-
-    axes_arr, angles = np.array(axes_arr), np.array(angles)
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-    ax1.plot(time, np.degrees(angles), label="Rotation Angle", color='tab:purple')
-    ax1.set_ylabel("Angle (degrees)")
-    ax1.set_title(f"[{title_prefix}] Axis-Angle Orientation Over Time")
-    ax1.legend(loc="upper right")
-    ax1.grid(True)
-
-    ax2.plot(time, axes_arr[:, 0], label="Axis X", color="tab:red")
-    ax2.plot(time, axes_arr[:, 1], label="Axis Y", color="tab:green")
-    ax2.plot(time, axes_arr[:, 2], label="Axis Z", color="tab:blue")
-    ax2.set_xlabel("Time (s)")
-    ax2.set_ylabel("Axis Component")
-    ax2.legend(loc="upper right")
-    ax2.grid(True)
-
-    plt.tight_layout()
-    plt.savefig(filename, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return [filename]
-
-def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe, print_totals=False, 
-                  normalized=False, mode_transfer=False, title_prefix="", filename=""):
-    # Remove the potential energy offset from frame 0
-    bend_pe = bend_pe - bend_pe[0]
-    shear_pe = shear_pe - shear_pe[0]
-    
-    total_kin = trans_ke + rot_ke
-    total_pot = bend_pe + shear_pe
-    total_energy = total_kin + total_pot
-    
-    fig = plt.figure(figsize=(12, 6))
-    
-    if normalized:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            trans = np.divide(trans_ke, total_energy,
-                              out=np.zeros_like(trans_ke),
-                              where=np.abs(total_energy) > 1e-20)
-            rot = np.divide(rot_ke, total_energy,
-                            out=np.zeros_like(rot_ke),
-                            where=np.abs(total_energy) > 1e-20)
-            bend = np.divide(bend_pe, total_energy,
-                             out=np.zeros_like(bend_pe),
-                             where=np.abs(total_energy) > 1e-20)
-            shear = np.divide(shear_pe, total_energy,
-                              out=np.zeros_like(shear_pe),
-                              where=np.abs(total_energy) > 1e-20)
-
-        title = f"[{title_prefix}] Energy Distribution"
-
-        plt.stackplot(
-            time,
-            trans,
-            rot,
-            bend,
-            shear,
-            labels=[
-                "Translational KE",
-                "Rotational KE",
-                "Bend/Twist PE",
-                "Shear/Stretch PE",
-            ],
-            colors=["tab:blue", "tab:purple", "tab:orange", "tab:green"],
-        )
-
-        plt.ylim(0, 1)
-        plt.ylabel("Fraction of Total Energy")
-    elif mode_transfer:
-        with np.errstate(divide='ignore', invalid='ignore'):
-            trans_ke = trans_ke / total_energy
-            rot_ke = rot_ke / total_energy
-            bend_pe = bend_pe / total_energy
-            shear_pe = shear_pe / total_energy
-            total_kin = total_kin / total_energy
-            total_pot = total_pot / total_energy
-        title = f"[{title_prefix}] Energy Mode Transfer (Fraction of Total)"
-        plt.plot(time, trans_ke, label="Translational KE", alpha=0.4, linestyle=':')
-        plt.plot(time, rot_ke, label="Rotational KE", alpha=0.4, linestyle=':')
-        plt.plot(time, bend_pe, label="Bend/Twist PE", alpha=0.4, linestyle=':')
-        plt.plot(time, shear_pe, label="Shear/Stretch PE", alpha=0.4, linestyle=':')
-        plt.plot(time, total_kin, label="TOTAL Kinetic", linewidth=2, color='blue')
-        plt.plot(time, total_pot, label="TOTAL Potential", linewidth=2, color='orange')
-        plt.ylabel("Fraction of Total Energy")
-        plt.ylim(-0.1, 1.1)
-    else:
-        title = f"[{title_prefix}] Cosserat Rod Energy Breakdown (Offset Removed)"
-        plt.plot(time, trans_ke, label="Translational KE", alpha=0.4, linestyle=':')
-        plt.plot(time, rot_ke, label="Rotational KE", alpha=0.4, linestyle=':')
-        plt.plot(time, bend_pe, label="Bend/Twist PE", alpha=0.4, linestyle=':')
-        plt.plot(time, shear_pe, label="Shear/Stretch PE", alpha=0.4, linestyle=':')
-        
-        plt.plot(time, total_kin, label="TOTAL Kinetic", linewidth=2, color='blue')
-        plt.plot(time, total_pot, label="TOTAL Potential", linewidth=2, color='orange')
-        
-        plt.plot(time, total_energy, label="TOTAL SYSTEM ENERGY", color='gray', linestyle='--', linewidth=1.5)
-        plt.ylabel("Energy (Joules)")
-
-    plt.title(title)
-    plt.xlabel("Time (s)")
-    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    
-    if print_totals and not normalized and not mode_transfer:
-        print(f"Total Energy Mean: {np.mean(total_energy):.6e} J")
-        print(f"Energy Variation: {np.std(total_energy):.6e} J")
-
-    plt.savefig(filename, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return [filename]
-
-# ---------------------------------------------------------
 # Core Memory-Efficient Extraction
-# ---------------------------------------------------------
 def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia, K_se, K_bt, inspect_nodes):
     sim_path = Path(sim_path)
     node_files = sorted(sim_path.glob("n_*.pkl.gz"))
@@ -409,7 +109,7 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     dt = config.get("dt", 1e-5)
     oversamp = config.get("oversampling_factor", 100)
     
-    print(f"[{datetime.now()}] Dispatching data extraction for {len(node_files)} chunks across 16 workers...")
+    print(f"[{datetime.now()}] Dispatching data extraction for {len(node_files)} chunks across workers...")
     print(f"[{datetime.now()}] Target nodes for inspection: {inspect_nodes}")
     
     # 1. Fully Parallelized Extraction
@@ -463,9 +163,7 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     del all_node_data, all_tke, all_rke, all_bpe, all_spe
     gc.collect()
 
-    # ---------------------------------------------------------
     # Prepare Plotting Tasks for Multiprocessing
-    # ---------------------------------------------------------
     output_dir = sim_path / "plots"
     output_dir.mkdir(exist_ok=True)
     
@@ -511,10 +209,8 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
             plot_tasks.append((plot_angular_velocity, (p_time, p_omega), 
                                {"title_prefix": node_title, "filename": f"{node_prefix}_omega.png"}))
 
-    # ---------------------------------------------------------
     # Execute Plotting in Parallel
-    # ---------------------------------------------------------
-    print(f"[{datetime.now()}] Dispatching {len(plot_tasks)} plotting tasks to 16 concurrent workers...")
+    print(f"[{datetime.now()}] Dispatching {len(plot_tasks)} plotting tasks to concurrent workers...")
     generated_images = []
     
     with concurrent.futures.ProcessPoolExecutor(max_workers=16) as executor:
@@ -525,10 +221,8 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
             except Exception as e:
                 print(f"[{datetime.now()}] A plot worker encountered an error: {e}")
 
-    # ---------------------------------------------------------
     # Email Dispatch
-    # ---------------------------------------------------------
-    print(f"[{datetime.now()}] Plotting complete. Attached {len(generated_images)} images. Dispatching email...")
+    print(f"[{datetime.now()}] Plotting complete. Attached {len(generated_images)} files. Dispatching email...")
     msg = EmailMessage()
     msg['Subject'] = f"Piano Sim Run {run_id:03d} Completed - Plot Suite"
     msg['From'] = email_config['sender_email']
@@ -539,7 +233,11 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
         try:
             with open(img_path, 'rb') as f:
                 img_data = f.read()
-                msg.add_attachment(img_data, maintype='image', subtype='png', filename=Path(img_path).name)
+                # Use application/json for the stat files and image/png for the plots
+                if str(img_path).endswith('.json'):
+                    msg.add_attachment(img_data, maintype='application', subtype='json', filename=Path(img_path).name)
+                else:
+                    msg.add_attachment(img_data, maintype='image', subtype='png', filename=Path(img_path).name)
         except Exception as e:
             print(f"Could not attach {img_path}: {e}")
 
