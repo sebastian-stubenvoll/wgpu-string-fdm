@@ -9,8 +9,8 @@ def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe, print_totals=False,
 
     # Remove the potential energy offset by applying a highpass filter
     sos = butter(4, 0.01, btype='high', output='sos')
-    trans_ke = sosfiltfilt(sos, trans_ke)
-    rot_ke = sosfiltfilt(sos, rot_ke)
+    # trans_ke = sosfiltfilt(sos, trans_ke)
+    # rot_ke = sosfiltfilt(sos, rot_ke)
     bend_pe = sosfiltfilt(sos, bend_pe)
     shear_pe = sosfiltfilt(sos, shear_pe)
     
@@ -67,8 +67,9 @@ def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe, print_totals=False,
         plt.plot(time, rot_ke, label="Rotational KE", alpha=0.4, linestyle=':')
         plt.plot(time, bend_pe, label="Bend/Twist PE", alpha=0.4, linestyle=':')
         plt.plot(time, shear_pe, label="Shear/Stretch PE", alpha=0.4, linestyle=':')
-        plt.plot(time, total_kin, label="TOTAL Kinetic", linewidth=2, color='blue')
-        plt.plot(time, total_pot, label="TOTAL Potential", linewidth=2, color='orange')
+        if print_totals:
+            plt.plot(time, total_kin, label="TOTAL Kinetic", linewidth=2, color='blue')
+            plt.plot(time, total_pot, label="TOTAL Potential", linewidth=2, color='orange')
         plt.ylabel("Fraction of Total Energy")
         plt.ylim(-0.1, 1.1)
     else:
@@ -78,10 +79,10 @@ def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe, print_totals=False,
         plt.plot(time, bend_pe, label="Bend/Twist PE", alpha=0.4, linestyle=':')
         plt.plot(time, shear_pe, label="Shear/Stretch PE", alpha=0.4, linestyle=':')
         
-        plt.plot(time, total_kin, label="TOTAL Kinetic", linewidth=2, color='blue')
-        plt.plot(time, total_pot, label="TOTAL Potential", linewidth=2, color='orange')
-        
-        plt.plot(time, total_energy, label="TOTAL SYSTEM ENERGY", color='gray', linestyle='--', linewidth=1.5)
+        if print_totals:
+            plt.plot(time, total_kin, label="TOTAL Kinetic", linewidth=2, color='blue')
+            plt.plot(time, total_pot, label="TOTAL Potential", linewidth=2, color='orange')
+            plt.plot(time, total_energy, label="TOTAL SYSTEM ENERGY", color='gray', linestyle='--', linewidth=1.5)
         plt.ylabel("Energy (Joules)")
 
     plt.title(title)
@@ -90,10 +91,6 @@ def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe, print_totals=False,
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     
-    if print_totals and not normalized and not mode_transfer:
-        print(f"Total Energy Mean: {np.mean(total_energy):.6e} J")
-        print(f"Energy Variation: {np.std(total_energy):.6e} J")
-
     plt.savefig(filename, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return [filename]

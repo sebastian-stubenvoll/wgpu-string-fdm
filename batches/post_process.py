@@ -43,6 +43,12 @@ def E_PS(strain, K_se):
         return 0.5 * np.dot(s, K * s)
     return 0.5 * np.dot(s, K @ s)
 
+def dynamic_scaling(edge):
+    len_inv = edge[1][3]      # edges[current].len_inv
+    e = 1.0 / (len_inv * dl)
+    eta = 1.0 - 0.3 * (e - 1.0)
+    return eta
+
 # Parallel Extraction Worker
 def _process_single_chunk(args):
     nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl = args
@@ -50,8 +56,25 @@ def _process_single_chunk(args):
     node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': [], 'omega': []} for n in inspect_nodes}
     t_ke, r_ke, bt_pe, ss_pe = [], [], [], []
 
-    with gzip.open(nf, "rb") as f: n_chunk = pickle.load(f)
-    with gzip.open(ef, "rb") as f: e_chunk = pickle.load(f)
+    with gzip.open(nf, "rb") as f:
+        n_chunk = pickle.load(f)
+    with gzip.open(ef, "rb") as f:
+        e_chunk = pickle.load(f)
+
+    #reconstruct reference vector
+    node_count = len(n_chunk[0])
+    tuned_length = dl * (node_count - 1)
+    x = np.linspace(0.0, tuned_length, node_count, dtype=np.float32)
+    reference_positions = np.stack(
+        [x, np.zeros_like(x), np.zeros_like(x)],
+        axis=1,
+    ).astype(np.float32)
+
+    reference_vectors = np.array(
+        [reference_positions[i + 1] - reference_positions[i]
+         for i in range(node_count - 1)],
+        dtype=np.float32,
+    )
 
     for i in range(len(n_chunk)):
         n_frame, e_frame = n_chunk[i], e_chunk[i]
@@ -67,19 +90,46 @@ def _process_single_chunk(args):
             node_data[n]['quats'].append(e_frame[target_edge_idx][0])
             node_data[n]['omega'].append(e_frame[target_edge_idx][1][0])
         
-        # Global energy sums
-        t_sum, bt_sum = 0, 0
-        for j, n_node in enumerate(n_frame):
-            weight = 0.5 if (j == 0 or j == len(n_frame)-1) else 1.0
-            t_sum += E_T(n_node, m_node) * weight
-            bt_sum += E_PB(n_node[3], K_bt) * weight
-            
-        r_sum, ss_sum = 0, 0
-        for e in e_frame:
-            _, e_vecs = e
-            r_sum += E_R(e_vecs[0], inertia)
-            ss_sum += E_PS(e_vecs[2], K_se)
-            
+        edge_stretch = np.empty(len(e_frame), dtype=np.float32)
+        for k in range(len(e_frame)-1): 
+            r = (
+                reference_vectors[k]
+                + np.asarray(n_frame[k + 1][0], dtype=np.float32)
+                - np.asarray(n_frame[k][0], dtype=np.float32)
+            )
+
+            len_inv = np.float32(1.0) / np.linalg.norm(r)
+            stretch = np.float32(1.0) / (len_inv * np.float32(dl))
+
+            edge_stretch[k] = stretch
+
+        t_sum = 0.0
+        bt_sum = 0.0
+        for j, node in enumerate(n_frame):
+            weight = 0.5 if (j == 0 or j == node_count - 1) else 1.0
+            t_sum += E_T(node, m_node) * weight
+            if 0 < j < node_count - 1:
+                epsilon = np.float32(0.5) * (
+                    edge_stretch[j - 1] + edge_stretch[j]
+                )
+                eta = np.float32(1.0) - np.float32(0.3) * (
+                    epsilon - np.float32(1.0)
+                )
+                K_bt_dyn = K_bt * (eta ** 4)
+                bt_sum += E_PB(node[3], K_bt_dyn)
+
+        r_sum = 0.0
+        ss_sum = 0.0
+        for k, edge in enumerate(e_frame[:-1]): # Renamed 'i' to 'k' here too
+            _, edge_vecs = edge
+            eta = np.float32(1.0) - np.float32(0.3) * (
+                edge_stretch[k] - np.float32(1.0)
+            )
+            inertia_dyn = inertia * (eta ** 2)
+            K_se_dyn = K_se * (eta ** 2)
+            r_sum += E_R(edge_vecs[0], inertia_dyn)
+            ss_sum += E_PS(edge_vecs[2], K_se_dyn)
+               
         t_ke.append(t_sum)
         bt_pe.append(bt_sum * dl)
         r_ke.append(r_sum)
@@ -220,6 +270,8 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
                 generated_images.extend(future.result()) 
             except Exception as e:
                 print(f"[{datetime.now()}] A plot worker encountered an error: {e}")
+                import traceback
+                traceback.print_exc()
 
     # Email Dispatch
     print(f"[{datetime.now()}] Plotting complete. Attached {len(generated_images)} files. Dispatching email...")

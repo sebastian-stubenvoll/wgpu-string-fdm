@@ -16,7 +16,7 @@ def main():
         base = {"rod": ROD_PARAMS, "hammer": HAMMER_PARAMS}
         base["rod"]["mu"] = mu
         base["hammer"]["hammer_velocity"] = hv
-        base["hammer"]["hammer_offset_y"] = 3.5e-4
+        base["hammer"]["hammer_offset_y"] = 7.0e-4
         base["rod"]["twists"] = tw
         batch_jobs.append(base)
 
