@@ -315,6 +315,14 @@ impl State {
             )
             .await?;
 
+        let info = adapter.get_info();
+        println!("Selected GPU:");
+        println!("  Name:    {}", info.name);
+        println!("  Vendor:  {:#06x}", info.vendor);
+        println!("  Device:  {:#06x}", info.device);
+        println!("  Backend: {:?}", info.backend);
+        println!("  Type:    {:?}", info.device_type);
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("FDM Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cosserat.wgsl").into()),
