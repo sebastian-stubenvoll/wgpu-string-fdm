@@ -6,7 +6,14 @@ def generate_straight_rod(
 ):
     core_area = np.pi * core_radius**2
     EA = E_core * core_area
-    dilatation = tension_force / EA
+    linear_strain = tension_force / EA
+
+    coeffs = [ 0.09, -0.6, 1.0, -linear_strain ]
+    roots = np.roots(coeffs)
+
+    real_roots = roots[np.isreal(roots)].real
+    dilatation = np.min(real_roots[real_roots >= 0])
+    
     rest_length = tuned_length / (1 + dilatation)
     dl = rest_length / float(node_count - 1)
 

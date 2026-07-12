@@ -20,8 +20,8 @@ SIM_CONFIG = {
 ROD_PARAMS = {
     "tuned_length": 1.602,
     "tension_force": 915.0,
-    "core_radius": 5.5e-4,
-    "winding_radius": 4.5e-4,
+    "core_radius": 3.375e-4,
+    "winding_radius": 3.25e-4,
     "E_core": 2.07e11,
     "G_core": 8.0e10,
     "rho_core": 7.85e3,
