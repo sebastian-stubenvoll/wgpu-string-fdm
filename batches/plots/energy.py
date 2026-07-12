@@ -74,8 +74,8 @@ def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe, print_totals=False,
         plt.ylim(-0.1, 1.1)
     else:
         title = f"[{title_prefix}] Cosserat Rod Energy Breakdown (Offset Removed)"
-        plt.plot(time, sos_filtfilt(sos, trans_ke), label="Translational KE", alpha=0.4, linestyle=':')
-        plt.plot(time, sos_filtilt(sos, rot_ke), label="Rotational KE", alpha=0.4, linestyle=':')
+        plt.plot(time, sosfiltfilt(sos, trans_ke), label="Translational KE", alpha=0.4, linestyle=':')
+        plt.plot(time, sosfiltilt(sos, rot_ke), label="Rotational KE", alpha=0.4, linestyle=':')
         plt.plot(time, bend_pe, label="Bend/Twist PE", alpha=0.4, linestyle=':')
         plt.plot(time, shear_pe, label="Shear/Stretch PE", alpha=0.4, linestyle=':')
         
