@@ -9,7 +9,7 @@ SIM_CONFIG = {
     "node_count": 1024,
     "dt": dt, 
     "chunk_size": 512,
-    "dispatches": 200,
+    "dispatches": 150,
     "hammer_node": 25,
     "inspect_nodes": [25, 512, 800],
     "hammer_width": 15,

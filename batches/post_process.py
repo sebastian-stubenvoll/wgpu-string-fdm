@@ -171,7 +171,7 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     excitation_cutoff_frame = 0
     frames_processed = 0
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=32) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=16) as executor:
         for file_idx, res in enumerate(executor.map(_process_single_chunk, args_list)):
             n_frames, nd_dict, c_tke, c_rke, c_bpe, c_spe = res
             

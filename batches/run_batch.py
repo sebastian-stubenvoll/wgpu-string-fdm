@@ -9,10 +9,10 @@ OUTPUT_DIR = "/simulation_data"
 def main():
     batch_jobs = list()
 
-    mu_vars = [ 0.15, 0.3 ]
+    mu_vars = [ 0.45, 0.60 ]
     hammer_velocities = [ 2.5, 6.0 ]
     twists = [ 0.0, 3.0 ]
-    offset = [ 0.0, 7.0e-3]
+    offset = [ 0.0, 9.0e-4 ]
 
     for mu, hv, tw, o in product(mu_vars, hammer_velocities, twists, offset):
         base = {"rod": copy.deepcopy(ROD_PARAMS), "hammer": copy.deepcopy(HAMMER_PARAMS)}
@@ -21,6 +21,14 @@ def main():
         base["hammer"]["hammer_offset_y"] = o
         base["rod"]["twists"] = tw
         batch_jobs.append(base)
+
+    base = {"rod": copy.deepcopy(ROD_PARAMS), "hammer": copy.deepcopy(HAMMER_PARAMS)}
+    base["rod"]["mu"] = 0.3
+    base["hammer"]["hammer_velocity"] = 6.0
+    base["hammer"]["hammer_offset_y"] = 9.0e-4
+    base["rod"]["twists"] = 3.0
+    batch_jobs.append(base)
+    
 
     for i, params in enumerate(batch_jobs):
         sim = SimulationRun(
