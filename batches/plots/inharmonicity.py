@@ -126,10 +126,10 @@ def run_variant(freqs, mag_norm, parabolic=False, median_f1=False, iterative=Fal
 
 # Cumulative variants: baseline, then each improvement stacked on top.
 VARIANTS = [
-    ("Baseline (current)", dict(parabolic=False, median_f1=False, iterative=False)),
-    ("+ Parabolic interp",  dict(parabolic=True,  median_f1=False, iterative=False)),
-    ("+ Median-spacing f1", dict(parabolic=True,  median_f1=True,  iterative=False)),
-    ("+ Iterative refit",   dict(parabolic=True,  median_f1=True,  iterative=True)),
+    ("Baseline", dict(parabolic=False, median_f1=False, iterative=False)),
+    ("Parabolic interp",  dict(parabolic=True,  median_f1=False, iterative=False)),
+    ("Median-spacing f1", dict(parabolic=True,  median_f1=True,  iterative=False)),
+    ("Iterative refit",   dict(parabolic=True,  median_f1=True,  iterative=True)),
 ]
 
 

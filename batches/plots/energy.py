@@ -2,7 +2,6 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.signal import sosfiltfilt, butter
 
 
 def _dynamic_above_baseline(x):
@@ -79,19 +78,23 @@ def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe, print_totals=False,
             plt.ylabel("Fraction of Dynamic Energy")
             title = f"[{title_prefix}] Energy Mode Transfer (dynamic fraction)"
     else:
-        sos = butter(4, 0.01, btype='high', output='sos')
-        bend_ac = sosfiltfilt(sos, bend_pe)
-        shear_ac = sosfiltfilt(sos, shear_pe)
+        # Kinetic energy is zero at rest (no static offset) so it is shown as-is.
+        # The potentials carry a large static tension baseline; we remove it by
+        # subtracting the quiescent value (a constant), which keeps every curve
+        # >= 0 and makes TOTAL SYSTEM ENERGY a clean, decaying mechanical energy
+        # equal to the sum of the plotted components.
+        bend_dyn = _dynamic_above_baseline(bend_pe)
+        shear_dyn = _dynamic_above_baseline(shear_pe)
 
         total_kin = trans_ke + rot_ke
-        total_pot = bend_ac + shear_ac
+        total_pot = bend_dyn + shear_dyn
         total_energy = total_kin + total_pot
 
         title = f"[{title_prefix}] Cosserat Rod Energy Breakdown (Offset Removed)"
-        plt.plot(time, sosfiltfilt(sos, trans_ke), label="Translational KE", alpha=0.4, linestyle=':')
-        plt.plot(time, sosfiltfilt(sos, rot_ke), label="Rotational KE", alpha=0.4, linestyle=':')
-        plt.plot(time, bend_ac, label="Bend/Twist PE", alpha=0.4, linestyle=':')
-        plt.plot(time, shear_ac, label="Shear/Stretch PE", alpha=0.4, linestyle=':')
+        plt.plot(time, trans_ke, label="Translational KE", alpha=0.4, linestyle=':')
+        plt.plot(time, rot_ke, label="Rotational KE", alpha=0.4, linestyle=':')
+        plt.plot(time, bend_dyn, label="Bend/Twist PE", alpha=0.4, linestyle=':')
+        plt.plot(time, shear_dyn, label="Shear/Stretch PE", alpha=0.4, linestyle=':')
 
         if print_totals:
             plt.plot(time, total_kin, label="TOTAL Kinetic", linewidth=2, color='blue')
