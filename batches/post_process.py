@@ -16,6 +16,11 @@ import numpy as np
 from plots.pos_fft import plot_node_pos_moment_fft
 from plots.rotation import plot_angular_velocity, plot_axis_angle_over_time
 from plots.energy import plot_energies
+from plots.audio import generate_node_audio
+from plots.inharmonicity import plot_inharmonicity_comparison, plot_inharmonicity_deviation
+from plots.polarization import plot_polarization
+from plots.decay import plot_partial_decay, plot_spectral_decay
+from plots.transient import plot_spacetime_heatmap, plot_waterfall_3d
 
 # Helper Functions (Energy)
 def E_T(node, mass):
@@ -51,8 +56,8 @@ def dynamic_scaling(edge):
 
 # Parallel Extraction Worker
 def _process_single_chunk(args):
-    nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl = args
-    
+    nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl, capture_field = args
+
     node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': [], 'omega': []} for n in inspect_nodes}
     t_ke, r_ke, bt_pe, ss_pe = [], [], [], []
 
@@ -60,6 +65,14 @@ def _process_single_chunk(args):
         n_chunk = pickle.load(f)
     with gzip.open(ef, "rb") as f:
         e_chunk = pickle.load(f)
+
+    # Optional full-field transverse (Y,Z) displacement for the transient plots.
+    field = None
+    if capture_field:
+        field = np.array(
+            [[(node[0][1], node[0][2]) for node in frame] for frame in n_chunk],
+            dtype=np.float32,
+        )
 
     #reconstruct reference vector
     node_count = len(n_chunk[0])
@@ -147,8 +160,21 @@ def _process_single_chunk(args):
         }
 
     return (len(n_chunk), out_node_data,
-            np.array(t_ke, dtype=np.float32), np.array(r_ke, dtype=np.float32), 
-            np.array(bt_pe, dtype=np.float32), np.array(ss_pe, dtype=np.float32))
+            np.array(t_ke, dtype=np.float32), np.array(r_ke, dtype=np.float32),
+            np.array(bt_pe, dtype=np.float32), np.array(ss_pe, dtype=np.float32),
+            field)
+
+def _format_parameters(metadata):
+    """Render parameters.json as readable, sectioned plain text for the email body."""
+    lines = []
+    for key, val in metadata.items():
+        if isinstance(val, dict):
+            lines.append(f"\n[{key}]")
+            for k, v in val.items():
+                lines.append(f"  {k}: {v}")
+        else:
+            lines.append(f"{key}: {val}")
+    return "\n".join(lines)
 
 # Core Memory-Efficient Extraction
 def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia, K_se, K_bt, inspect_nodes):
@@ -163,36 +189,46 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     print(f"[{datetime.now()}] Target nodes for inspection: {inspect_nodes}")
     
     # 1. Fully Parallelized Extraction
-    args_list = [(nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl) for nf, ef in zip(node_files, edge_files)]
-    
+    #    The first N chunks (the excitation window) also return the full spatial
+    #    field for the transient plots.
+    n_exc_chunks = min(10, len(node_files))
+    args_list = [(nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl, idx < n_exc_chunks)
+                 for idx, (nf, ef) in enumerate(zip(node_files, edge_files))]
+
     all_node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': [], 'omega': []} for n in inspect_nodes}
     all_tke, all_rke, all_bpe, all_spe = [], [], [], []
-    
+    field_chunks = []
+
     excitation_cutoff_frame = 0
     frames_processed = 0
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=16) as executor:
         for file_idx, res in enumerate(executor.map(_process_single_chunk, args_list)):
-            n_frames, nd_dict, c_tke, c_rke, c_bpe, c_spe = res
-            
+            n_frames, nd_dict, c_tke, c_rke, c_bpe, c_spe, c_field = res
+
             for n in inspect_nodes:
                 all_node_data[n]['pos'].append(nd_dict[n]['pos'])
                 all_node_data[n]['vel'].append(nd_dict[n]['vel'])
                 all_node_data[n]['mom'].append(nd_dict[n]['mom'])
                 all_node_data[n]['quats'].append(nd_dict[n]['quats'])
                 all_node_data[n]['omega'].append(nd_dict[n]['omega'])
-                
+
             all_tke.append(c_tke)
             all_rke.append(c_rke)
             all_bpe.append(c_bpe)
             all_spe.append(c_spe)
-            
+            if c_field is not None:
+                field_chunks.append(c_field)
+
             frames_processed += n_frames
             if file_idx <= 9: # Files 0 through 9 represent the first 10 dispatches
                 excitation_cutoff_frame += n_frames
 
+    field_exc = np.concatenate(field_chunks, axis=0) if field_chunks else None
+
     print(f"[{datetime.now()}] Extraction complete. Stitching arrays...")
     time = np.arange(frames_processed) * (dt * oversamp)
+    fs_native = 1.0 / (dt * oversamp)  # stored-frame rate == audio sample rate
     
     stitched_node_data = {}
     for n in inspect_nodes:
@@ -210,7 +246,7 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     ss_pe = np.concatenate(all_spe)
 
     # Free up collection lists aggressively
-    del all_node_data, all_tke, all_rke, all_bpe, all_spe
+    del all_node_data, all_tke, all_rke, all_bpe, all_spe, field_chunks
     gc.collect()
 
     # Prepare Plotting Tasks for Multiprocessing
@@ -228,7 +264,11 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     for phase_name, (start, end) in phases.items():
         p_time = time[start:end]
         p_tke, p_rke, p_bpe, p_spe = t_ke[start:end], r_ke[start:end], bt_pe[start:end], ss_pe[start:end]
-        
+
+        if p_time.size == 0:
+            print(f"[{datetime.now()}] Skipping empty phase '{phase_name}' (no frames in this window).")
+            continue
+
         energy_prefix = str(output_dir / f"run_{run_id:03d}_{phase_name}")
         phase_title = phase_name.replace("_", " ")
 
@@ -243,21 +283,50 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
         # Queue Node-Specific Plots
         for n in inspect_nodes:
             p_pos = stitched_node_data[n]['pos'][start:end]
+            p_vel = stitched_node_data[n]['vel'][start:end]
             p_mom = stitched_node_data[n]['mom'][start:end]
             p_quats = stitched_node_data[n]['quats'][start:end]
             p_omega = stitched_node_data[n]['omega'][start:end]
-            
+
             node_prefix = str(output_dir / f"run_{run_id:03d}_node_{n:03d}_{phase_name}")
             node_title = f"Node {n} | {phase_title}"
 
-            plot_tasks.append((plot_node_pos_moment_fft, (p_time, p_pos, p_mom, dt, oversamp), 
+            plot_tasks.append((plot_node_pos_moment_fft, (p_time, p_pos, p_mom, dt, oversamp),
                                {"moments": True, "title_prefix": node_title, "filename_prefix": f"{node_prefix}_fft"}))
 
-            plot_tasks.append((plot_axis_angle_over_time, (p_time, p_quats), 
+            plot_tasks.append((plot_axis_angle_over_time, (p_time, p_quats),
                                {"title_prefix": node_title, "filename": f"{node_prefix}_angles.png"}))
-                               
-            plot_tasks.append((plot_angular_velocity, (p_time, p_omega), 
-                               {"title_prefix": node_title, "filename": f"{node_prefix}_omega.png"}))
+
+            plot_tasks.append((plot_angular_velocity, (p_time, p_omega),
+                               {"title_prefix": node_title, "filename": f"{node_prefix}_omega.png", "fs": fs_native}))
+
+            # Full-run-only analyses (audio + spectral/decay/polarization);
+            # redundant to repeat these per phase.
+            if phase_name == "Full_Simulation":
+                plot_tasks.append((generate_node_audio, (p_pos, p_vel, p_mom, fs_native),
+                                   {"title_prefix": node_title,
+                                    "filename_prefix": f"{node_prefix}_audio"}))
+
+                plot_tasks.append((plot_inharmonicity_comparison, (p_time, p_pos, dt, oversamp),
+                                   {"title_prefix": node_title, "filename_prefix": node_prefix}))
+                plot_tasks.append((plot_inharmonicity_deviation, (p_time, p_pos, dt, oversamp),
+                                   {"title_prefix": node_title, "filename": f"{node_prefix}_inharm_deviation.png"}))
+                plot_tasks.append((plot_polarization, (p_time, p_pos),
+                                   {"title_prefix": node_title, "filename": f"{node_prefix}_polarization.png"}))
+                plot_tasks.append((plot_partial_decay, (p_time, p_pos, dt, oversamp),
+                                   {"title_prefix": node_title, "filename": f"{node_prefix}_partial_decay.png"}))
+                plot_tasks.append((plot_spectral_decay, (p_time, p_pos, dt, oversamp),
+                                   {"title_prefix": node_title, "filename": f"{node_prefix}_spectral_decay.png"}))
+
+    # Transient (whole-string) plots for the excitation window
+    if field_exc is not None and field_exc.shape[0] > 2:
+        exc_time = time[:field_exc.shape[0]]
+        trans_prefix = str(output_dir / f"run_{run_id:03d}_transient")
+        trans_title = f"Run {run_id} | Excitation"
+        plot_tasks.append((plot_spacetime_heatmap, (exc_time, field_exc, dl),
+                           {"title_prefix": trans_title, "filename": f"{trans_prefix}_heatmap.png"}))
+        plot_tasks.append((plot_waterfall_3d, (exc_time, field_exc, dl),
+                           {"title_prefix": trans_title, "filename": f"{trans_prefix}_waterfall.png"}))
 
     # Execute Plotting in Parallel
     print(f"[{datetime.now()}] Dispatching {len(plot_tasks)} plotting tasks to concurrent workers...")
@@ -273,21 +342,46 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
                 import traceback
                 traceback.print_exc()
 
-    # Email Dispatch
+    # Email Dispatch (optional - skipped when email is not configured, e.g. local CLI runs)
+    email_ready = bool(email_config and email_config.get('sender_email')
+                       and email_config.get('sender_password') and email_config.get('receiver_email'))
+    if not email_ready:
+        print(f"[{datetime.now()}] Plotting complete. Generated {len(generated_images)} files in {output_dir}. "
+              f"Email not configured - skipping dispatch.")
+        return
+
     print(f"[{datetime.now()}] Plotting complete. Attached {len(generated_images)} files. Dispatching email...")
     msg = EmailMessage()
     msg['Subject'] = f"Piano Sim Run {run_id:03d} Completed - Plot Suite"
     msg['From'] = email_config['sender_email']
     msg['To'] = email_config['receiver_email']
-    msg.set_content(f"Simulation {run_id:03d} plots attached. Memory-efficient parallel generation successful for {len(inspect_nodes)} nodes.")
+    body_lines = [
+        f"Simulation {run_id:03d} plots attached.",
+        f"Memory-efficient parallel generation successful for {len(inspect_nodes)} node(s): {inspect_nodes}.",
+        f"Attached {len(generated_images)} artefacts.",
+        "",
+    ]
+    param_file = Path(sim_path) / "parameters.json"
+    if param_file.exists():
+        try:
+            with open(param_file) as pf:
+                meta = json.load(pf)
+            body_lines.append("=== Simulation Parameters ===")
+            body_lines.append(_format_parameters(meta))
+        except Exception as e:
+            body_lines.append(f"(could not read parameters.json: {e})")
+    msg.set_content("\n".join(body_lines))
 
     for img_path in generated_images:
         try:
             with open(img_path, 'rb') as f:
                 img_data = f.read()
-                # Use application/json for the stat files and image/png for the plots
-                if str(img_path).endswith('.json'):
+                # Attach with the right MIME type per artefact
+                path_str = str(img_path)
+                if path_str.endswith('.json'):
                     msg.add_attachment(img_data, maintype='application', subtype='json', filename=Path(img_path).name)
+                elif path_str.endswith('.wav'):
+                    msg.add_attachment(img_data, maintype='audio', subtype='wav', filename=Path(img_path).name)
                 else:
                     msg.add_attachment(img_data, maintype='image', subtype='png', filename=Path(img_path).name)
         except Exception as e:
@@ -321,9 +415,8 @@ if __name__ == "__main__":
     smtp_port = os.environ.get("SMTP_PORT")
 
     if not sender_email or not sender_password or not receiver_email:
-        print(f"[{datetime.now()}] FATAL ERROR: Email environment variables not set.")
-        print("Please ensure SENDER_EMAIL, SENDER_PASSWORD, and RECEIVER_EMAIL are defined in your .env file.")
-        sys.exit(1)
+        print(f"[{datetime.now()}] Note: email env vars not fully set (SENDER_EMAIL, SENDER_PASSWORD, "
+              "RECEIVER_EMAIL). Plots and audio will be generated locally; email dispatch will be skipped.")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("sim_path", type=str)

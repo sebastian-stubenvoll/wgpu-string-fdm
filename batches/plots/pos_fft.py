@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, spectrogram
 from scipy.optimize import curve_fit
 
 def plot_node_pos_moment_fft(time, pos, mom, dt, oversampling_factor, cutoff=20_000, 
@@ -23,10 +23,17 @@ def plot_node_pos_moment_fft(time, pos, mom, dt, oversampling_factor, cutoff=20_
     def stiff_string_model(n, f1_val, B_val):
         return n * f1_val * np.sqrt(1 + B_val * (n**2))
 
+    def display_fmax(freqs, mag_norm, floor=800.0, rel=0.01):
+        sig = np.where(mag_norm > rel)[0]
+        fmax = freqs[sig[-1]] * 1.15 if sig.size else cutoff
+        return float(np.clip(fmax, floor, cutoff))
+
     generated_files = []
 
+    fs = 1.0 / (dt * oversampling_factor)
+
     for label, p_data, m_data in components:
-        n_plots = 4 if moments else 3
+        n_plots = (4 if moments else 3) + 1
         fig, axes = plt.subplots(n_plots, 1, figsize=(10, 2.8 * n_plots), sharex=False)
 
         # Displacement
@@ -63,10 +70,11 @@ def plot_node_pos_moment_fft(time, pos, mom, dt, oversampling_factor, cutoff=20_
         # FFT (No Fit)
         bins = fft_mag(p_data)
         mag_norm = bins / np.max(bins) if np.max(bins) > 0 else bins
-        
+        f_display = display_fmax(freqs, mag_norm)
+
         ax_fft = axes[plot_idx]
         ax_fft.plot(freqs, mag_norm, color='tab:cyan', label='Spectrum')
-        ax_fft.set_xlim(0, cutoff)
+        ax_fft.set_xlim(0, f_display)
         ax_fft.set_title(f"[{title_prefix}] {label}-axis FFT Spectrum (Raw)")
         ax_fft.set_xlabel("Frequency (Hz)")
         ax_fft.set_ylabel("Normalized Magnitude")
@@ -119,20 +127,41 @@ def plot_node_pos_moment_fft(time, pos, mom, dt, oversampling_factor, cutoff=20_
             for f_ideal in (ns * f1_fit):
                 ax_fit.axvline(f_ideal, color='green', linestyle=':', alpha=0.5)
 
-            ax_fit.set_xlim(0, cutoff) 
-            ax_fft.set_xlim(0, cutoff) 
-            if len(fns) > 0: ax_fit.set_xlim(0, max(fns) * 1.2)
+            # Show up to the last fitted partial (with headroom)
+            fit_max = max(fns) * 1.15 if len(fns) > 0 else f_display
+            ax_fit.set_xlim(0, max(f_display, fit_max))
             ax_fit.set_title(f"[{title_prefix}] {label}-axis FFT Inharmonicity Fit (B = {B_fit:.5f})")
         else:
             ax_fit.plot(freqs, mag_norm, color='lightgray', label='Spectrum')
-            ax_fit.set_xlim(0, cutoff)
-            ax_fft.set_xlim(0, cutoff)
+            ax_fit.set_xlim(0, f_display)
             ax_fit.set_title(f"[{title_prefix}] {label}-axis FFT (Not enough peaks for fit)")
 
         ax_fit.set_xlabel("Frequency (Hz)")
         ax_fit.set_ylabel("Normalized Magnitude")
         ax_fit.legend(loc='upper right')
         ax_fit.grid(True, alpha=0.3)
+
+        # Spectrogram: shows how the individual partials decay over time
+        plot_idx += 1
+        ax_spec = axes[plot_idx]
+        sig = p_data - np.mean(p_data)
+        nperseg = int(min(4096, max(64, len(sig) // 16)))
+        if len(sig) >= nperseg and nperseg >= 16:
+            f_s, t_s, Sxx = spectrogram(sig, fs=fs, nperseg=nperseg,
+                                        noverlap=int(nperseg * 0.75), scaling="spectrum")
+            Sxx_db = 10.0 * np.log10(Sxx + 1e-20)
+            pcm = ax_spec.pcolormesh(t_s + time[0], f_s, Sxx_db,
+                                     shading="gouraud", cmap="magma")
+            ax_spec.set_ylim(0, f_display)
+            fig.colorbar(pcm, ax=ax_spec, label="Power (dB)")
+            ax_spec.set_title(f"[{title_prefix}] {label}-axis Spectrogram")
+            ax_spec.set_xlabel("Time (s)")
+            ax_spec.set_ylabel("Frequency (Hz)")
+        else:
+            ax_spec.text(0.5, 0.5, "Signal too short for spectrogram",
+                         ha="center", va="center", transform=ax_spec.transAxes)
+            ax_spec.set_axis_off()
+
         plt.tight_layout()
 
         
