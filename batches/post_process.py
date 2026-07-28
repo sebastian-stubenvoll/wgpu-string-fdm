@@ -332,7 +332,7 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     print(f"[{datetime.now()}] Dispatching {len(plot_tasks)} plotting tasks to concurrent workers...")
     generated_images = []
     
-    with concurrent.futures.ProcessPoolExecutor(max_workers=16) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=32) as executor:
         futures = [executor.submit(func, *args, **kwargs) for func, args, kwargs in plot_tasks]
         for future in concurrent.futures.as_completed(futures):
             try:
