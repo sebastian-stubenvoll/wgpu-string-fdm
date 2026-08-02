@@ -15,7 +15,7 @@ import numpy as np
 # Import Plotting Modules
 from plots.pos_fft import plot_node_pos_moment_fft
 from plots.rotation import plot_angular_velocity, plot_axis_angle_over_time
-from plots.energy import plot_energies
+from plots.energy import plot_energies, plot_energy_envelope, plot_energy_components
 from plots.audio import generate_node_audio
 from plots.inharmonicity import plot_inharmonicity_comparison, plot_inharmonicity_deviation
 from plots.polarization import plot_polarization
@@ -48,6 +48,32 @@ def E_PS(strain, K_se):
         return 0.5 * np.dot(s, K * s)
     return 0.5 * np.dot(s, K @ s)
 
+# Axial-only counterparts of the energy terms. Translational motion is in the
+# world frame where the string lies along x (index 0 is longitudinal), while
+# the material-frame terms (rotation, curvature, strain) put the axial
+# direction at index 2 (inertia [I1,I1,I3], K_bt [EI,EI,GJ], K_se [.,.,EA]).
+def E_T_long(node, mass):
+    vx = np.array(node[1])[0]
+    return 0.5 * mass * vx * vx
+
+def E_R_axial(omega_vec, inertia):
+    w = np.array(omega_vec)
+    I = np.array(inertia)
+    Izz = I[2] if I.ndim == 1 else I[2, 2]
+    return 0.5 * Izz * w[2] * w[2]
+
+def E_PB_axial(kappa, K_bt):
+    k = np.array(kappa)
+    K = np.array(K_bt)
+    Kzz = K[2] if K.ndim == 1 else K[2, 2]
+    return 0.5 * Kzz * k[2] * k[2]
+
+def E_PS_axial(strain, K_se):
+    s = np.array(strain)
+    K = np.array(K_se)
+    Kzz = K[2] if K.ndim == 1 else K[2, 2]
+    return 0.5 * Kzz * s[2] * s[2]
+
 def dynamic_scaling(edge):
     len_inv = edge[1][3]      # edges[current].len_inv
     e = 1.0 / (len_inv * dl)
@@ -60,6 +86,9 @@ def _process_single_chunk(args):
 
     node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': [], 'omega': []} for n in inspect_nodes}
     t_ke, r_ke, bt_pe, ss_pe = [], [], [], []
+    # Axial parts of each family (longitudinal KE, torsional rot KE,
+    # twisting PE, extension PE); the transverse remainder is derived at plot time.
+    t_ke_l, r_ke_t, bt_pe_tw, ss_pe_ex = [], [], [], []
 
     with gzip.open(nf, "rb") as f:
         n_chunk = pickle.load(f)
@@ -118,9 +147,12 @@ def _process_single_chunk(args):
 
         t_sum = 0.0
         bt_sum = 0.0
+        t_long_sum = 0.0
+        bt_twist_sum = 0.0
         for j, node in enumerate(n_frame):
             weight = 0.5 if (j == 0 or j == node_count - 1) else 1.0
             t_sum += E_T(node, m_node) * weight
+            t_long_sum += E_T_long(node, m_node) * weight
             if 0 < j < node_count - 1:
                 epsilon = np.float32(0.5) * (
                     edge_stretch[j - 1] + edge_stretch[j]
@@ -130,9 +162,12 @@ def _process_single_chunk(args):
                 )
                 K_bt_dyn = K_bt * (eta ** 4)
                 bt_sum += E_PB(node[3], K_bt_dyn)
+                bt_twist_sum += E_PB_axial(node[3], K_bt_dyn)
 
         r_sum = 0.0
         ss_sum = 0.0
+        r_tor_sum = 0.0
+        ss_ext_sum = 0.0
         for k, edge in enumerate(e_frame[:-1]): # Renamed 'i' to 'k' here too
             _, edge_vecs = edge
             eta = np.float32(1.0) - np.float32(0.3) * (
@@ -142,11 +177,17 @@ def _process_single_chunk(args):
             K_se_dyn = K_se * (eta ** 2)
             r_sum += E_R(edge_vecs[0], inertia_dyn)
             ss_sum += E_PS(edge_vecs[2], K_se_dyn)
-               
+            r_tor_sum += E_R_axial(edge_vecs[0], inertia_dyn)
+            ss_ext_sum += E_PS_axial(edge_vecs[2], K_se_dyn)
+
         t_ke.append(t_sum)
         bt_pe.append(bt_sum * dl)
         r_ke.append(r_sum)
         ss_pe.append(ss_sum * dl)
+        t_ke_l.append(t_long_sum)
+        bt_pe_tw.append(bt_twist_sum * dl)
+        r_ke_t.append(r_tor_sum)
+        ss_pe_ex.append(ss_ext_sum * dl)
 
     # Convert to numpy arrays directly to minimize IPC overhead
     out_node_data = {}
@@ -162,6 +203,8 @@ def _process_single_chunk(args):
     return (len(n_chunk), out_node_data,
             np.array(t_ke, dtype=np.float32), np.array(r_ke, dtype=np.float32),
             np.array(bt_pe, dtype=np.float32), np.array(ss_pe, dtype=np.float32),
+            np.array(t_ke_l, dtype=np.float32), np.array(r_ke_t, dtype=np.float32),
+            np.array(bt_pe_tw, dtype=np.float32), np.array(ss_pe_ex, dtype=np.float32),
             field)
 
 def _format_parameters(metadata):
@@ -197,6 +240,7 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
 
     all_node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': [], 'omega': []} for n in inspect_nodes}
     all_tke, all_rke, all_bpe, all_spe = [], [], [], []
+    all_tke_l, all_rke_t, all_bpe_tw, all_spe_ex = [], [], [], []
     field_chunks = []
 
     excitation_cutoff_frame = 0
@@ -204,7 +248,8 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=32) as executor:
         for file_idx, res in enumerate(executor.map(_process_single_chunk, args_list)):
-            n_frames, nd_dict, c_tke, c_rke, c_bpe, c_spe, c_field = res
+            (n_frames, nd_dict, c_tke, c_rke, c_bpe, c_spe,
+             c_tke_l, c_rke_t, c_bpe_tw, c_spe_ex, c_field) = res
 
             for n in inspect_nodes:
                 all_node_data[n]['pos'].append(nd_dict[n]['pos'])
@@ -217,6 +262,10 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
             all_rke.append(c_rke)
             all_bpe.append(c_bpe)
             all_spe.append(c_spe)
+            all_tke_l.append(c_tke_l)
+            all_rke_t.append(c_rke_t)
+            all_bpe_tw.append(c_bpe_tw)
+            all_spe_ex.append(c_spe_ex)
             if c_field is not None:
                 field_chunks.append(c_field)
 
@@ -244,9 +293,14 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     r_ke = np.concatenate(all_rke)
     bt_pe = np.concatenate(all_bpe)
     ss_pe = np.concatenate(all_spe)
+    t_ke_l = np.concatenate(all_tke_l)
+    r_ke_t = np.concatenate(all_rke_t)
+    bt_pe_tw = np.concatenate(all_bpe_tw)
+    ss_pe_ex = np.concatenate(all_spe_ex)
 
     # Free up collection lists aggressively
-    del all_node_data, all_tke, all_rke, all_bpe, all_spe, field_chunks
+    del all_node_data, all_tke, all_rke, all_bpe, all_spe
+    del all_tke_l, all_rke_t, all_bpe_tw, all_spe_ex, field_chunks
     gc.collect()
 
     # Prepare Plotting Tasks for Multiprocessing
@@ -264,6 +318,8 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     for phase_name, (start, end) in phases.items():
         p_time = time[start:end]
         p_tke, p_rke, p_bpe, p_spe = t_ke[start:end], r_ke[start:end], bt_pe[start:end], ss_pe[start:end]
+        p_tke_l, p_rke_t = t_ke_l[start:end], r_ke_t[start:end]
+        p_bpe_tw, p_spe_ex = bt_pe_tw[start:end], ss_pe_ex[start:end]
 
         if p_time.size == 0:
             print(f"[{datetime.now()}] Skipping empty phase '{phase_name}' (no frames in this window).")
@@ -277,8 +333,18 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
                            {"print_totals": (phase_name == "Full_Simulation"), "title_prefix": phase_title, "filename": f"{energy_prefix}_energy.png"}))
         plot_tasks.append((plot_energies, (p_time, p_tke, p_rke, p_bpe, p_spe), 
                            {"normalized": True, "title_prefix": phase_title, "filename": f"{energy_prefix}_energy_norm.png"}))
-        plot_tasks.append((plot_energies, (p_time, p_tke, p_rke, p_bpe, p_spe), 
+        plot_tasks.append((plot_energies, (p_time, p_tke, p_rke, p_bpe, p_spe),
                            {"mode_transfer": True, "title_prefix": phase_title, "filename": f"{energy_prefix}_energy_mode.png"}))
+
+        # Fine-grained 8-way component split (all phases).
+        plot_tasks.append((plot_energy_components,
+                           (p_time, p_tke, p_rke, p_bpe, p_spe, p_tke_l, p_rke_t, p_bpe_tw, p_spe_ex),
+                           {"title_prefix": phase_title, "filename": f"{energy_prefix}_energy_components.png"}))
+
+        # Decay envelopes only for the long phases (free vibration + full run).
+        if phase_name in ("Free_Vibration", "Full_Simulation"):
+            plot_tasks.append((plot_energy_envelope, (p_time, p_tke, p_rke, p_bpe, p_spe),
+                               {"title_prefix": phase_title, "filename": f"{energy_prefix}_energy_envelope.png"}))
 
         # Queue Node-Specific Plots
         for n in inspect_nodes:
