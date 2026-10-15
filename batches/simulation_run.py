@@ -1,3 +1,4 @@
+import sys
 import threading
 import queue
 import json
@@ -97,6 +98,9 @@ class SimulationRun:
             self.config["node_count"], self.config["hammer_node"], self.config["hammer_width"]
         )
 
+        # Rust prints the selected GPU adapter on its own stdout; flush ours
+        # first so the two streams don't interleave when output is redirected.
+        sys.stdout.flush()
         self.sim = Simulation(
             nodes=nodes,
             edges=edges,
@@ -160,6 +164,10 @@ class SimulationRun:
                 self.rod_derived["m_node"], self.rod_derived["dl"], self.rod_derived["inertia"], 
                 self.rod_derived["K_se"], self.rod_derived["K_bt"], self.config["inspect_nodes"]
             ),
+            kwargs={
+                "tension": self.rod_params["tension_force"],
+                "length": self.rod_params["tuned_length"],
+            },
             daemon=False
         )
         plot_thread.start()

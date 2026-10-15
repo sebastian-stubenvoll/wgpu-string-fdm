@@ -62,7 +62,7 @@ def plot_node_pos_moment_fft(time, pos, mom, dt, oversampling_factor, cutoff=20_
             axm.set_xlabel("Time (s)")
             axm.set_ylabel("Normalized Moment")
             axm.set_yticks([-1, 0, 1])
-            axm.set_title(f"[{title_prefix}] {label}-axis Moment over Time")
+            axm.set_title(f"[{title_prefix}] {label}-axis Internal Bending Moment over Time")
             axm.legend(loc='upper right')
             axm.grid(True, alpha=0.3)
             plot_idx += 1

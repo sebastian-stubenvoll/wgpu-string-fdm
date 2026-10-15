@@ -59,11 +59,12 @@ def _write_stereo_wav(path, stereo, fs_native):
 
 
 def generate_node_audio(pos, vel, mom, fs_native, title_prefix="", filename_prefix="",
-                        sources=("velocity", "displacement", "momentum")):
+                        sources=("velocity", "displacement", "moment")):
     data = {
         "velocity": np.asarray(vel, dtype=np.float64),
         "displacement": np.asarray(pos, dtype=np.float64),
-        "momentum": np.asarray(mom, dtype=np.float64),
+        # node[2] is the internal bending moment (Node::to_raw), not momentum.
+        "moment": np.asarray(mom, dtype=np.float64),
     }
 
     generated = []

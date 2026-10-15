@@ -84,12 +84,11 @@ mod py_wgpu_fdm {
                 dampening,
             ));
 
-            if let Ok(state) = state {
-                Ok(Self { state })
-            } else {
-                Err(PyValueError::new_err(
-                    "unable to initialize GPU for simulation",
-                ))
+            match state {
+                Ok(state) => Ok(Self { state }),
+                Err(e) => Err(PyValueError::new_err(format!(
+                    "unable to initialize GPU for simulation: {e}"
+                ))),
             }
         }
 

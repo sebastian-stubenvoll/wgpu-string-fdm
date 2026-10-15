@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::{error::Error, fmt::Display, iter};
+use std::{error::Error, fmt::Display, io::Write, iter};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -297,6 +297,16 @@ impl State {
             .await
             .ok_or(StateError::AdapterRequest)?;
 
+        let info = adapter.get_info();
+        println!("Selected GPU:");
+        println!("  Name:    {}", info.name);
+        println!("  Vendor:  {:#06x}", info.vendor);
+        println!("  Device:  {:#06x}", info.device);
+        println!("  Backend: {:?}", info.backend);
+        println!("  Type:    {:?}", info.device_type);
+        // Flush now so the adapter is visible even if request_device fails below.
+        let _ = std::io::stdout().flush();
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -314,14 +324,6 @@ impl State {
                 None,
             )
             .await?;
-
-        let info = adapter.get_info();
-        println!("Selected GPU:");
-        println!("  Name:    {}", info.name);
-        println!("  Vendor:  {:#06x}", info.vendor);
-        println!("  Device:  {:#06x}", info.device);
-        println!("  Backend: {:?}", info.backend);
-        println!("  Type:    {:?}", info.device_type);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("FDM Shader"),

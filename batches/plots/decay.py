@@ -83,7 +83,7 @@ def plot_partial_decay(time, pos, dt, oversampling_factor, title_prefix="",
     ax2.set_title("Decay time per partial")
     ax2.grid(True, alpha=0.3)
 
-    fig.suptitle(f"[{title_prefix}] Partial Decay Analysis (y-axis)")
+    fig.suptitle(f"[{title_prefix}] Partial Decay Analysis ({ax_name}-axis)")
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(filename, dpi=200, bbox_inches='tight')
     plt.close(fig)

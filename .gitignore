@@ -79,3 +79,5 @@ old/
 batches/simulation_results/
 
 .env
+
+batches/plot_preview/
