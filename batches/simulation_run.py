@@ -91,7 +91,11 @@ class SimulationRun:
             "inertia": inertia,
             "K_se": K_se,
             "K_bt": K_bt,
-            "dl": dl
+            "dl": dl,
+            # Marks runs whose edges share one bit-identical reference spacing
+            # (utils.reference_vectors); older runs used the float32 position
+            # differences, which post-processing reproduces when this is absent.
+            "uniform_reference_spacing": True,
         }
 
         weights = make_weights(
@@ -167,6 +171,8 @@ class SimulationRun:
             kwargs={
                 "tension": self.rod_params["tension_force"],
                 "length": self.rod_params["tuned_length"],
+                "rod_params": self.rod_params,
+                "uniform_reference": True,
             },
             daemon=False
         )

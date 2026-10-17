@@ -4,40 +4,48 @@ from itertools import product
 from simulation_run import SimulationRun
 from config import SIM_CONFIG, ROD_PARAMS, HAMMER_PARAMS, EMAIL_CONFIG
 
-OUTPUT_DIR = "/simulation_data" 
+OUTPUT_DIR = "/simulation_data"
+
+# Re-run of run 002 from the 2026-07-29 batch
+# (cosserat-string-sim-data/2026-07-29_20-08-13_run_002/parameters.json),
+# to compare against it after the reference-spacing fix in utils.py.
+RUN_002_DT = 1.25e-7
+RUN_002_CONFIG = {
+    **SIM_CONFIG,
+    "dt": RUN_002_DT,
+    "oversampling_factor": int(1.0 / (RUN_002_DT * 50_000)),  # 160, as in that run
+    "hammer_width": 25,
+}
+RUN_002_ROD = {
+    **ROD_PARAMS,
+    "tuned_length": 0.95,
+    "tension_force": 800.0,
+    "core_radius": 4.925e-4,
+    "winding_radius": 5.08e-4,
+    "mu": 0.15,
+    "twists": 3.0,
+}
+RUN_002_HAMMER = {
+    **HAMMER_PARAMS,
+    "hammer_velocity": 6.0,
+    "hammer_offset_y": 0.0,
+}
+
 
 def main():
-    batch_jobs = list()
+    batch_jobs = [
+        {"run_id": 2, "config": RUN_002_CONFIG,
+         "rod": copy.deepcopy(RUN_002_ROD), "hammer": copy.deepcopy(RUN_002_HAMMER)},
+    ]
 
-    mu_vars = [ 0.45, 0.60 ]
-    hammer_velocities = [ 2.5, 6.0 ]
-    twists = [ 0.0, 3.0 ]
-    offset = [ 0.0, 9.0e-4 ]
-
-    for mu, hv, tw, o in product(mu_vars, hammer_velocities, twists, offset):
-        base = {"rod": copy.deepcopy(ROD_PARAMS), "hammer": copy.deepcopy(HAMMER_PARAMS)}
-        base["rod"]["mu"] = mu
-        base["hammer"]["hammer_velocity"] = hv
-        base["hammer"]["hammer_offset_y"] = o
-        base["rod"]["twists"] = tw
-        batch_jobs.append(base)
-
-    base = {"rod": copy.deepcopy(ROD_PARAMS), "hammer": copy.deepcopy(HAMMER_PARAMS)}
-    base["rod"]["mu"] = 0.3
-    base["hammer"]["hammer_velocity"] = 6.0
-    base["hammer"]["hammer_offset_y"] = 9.0e-4
-    base["rod"]["twists"] = 3.0
-    batch_jobs.append(base)
-    
-
-    for i, params in enumerate(batch_jobs):
+    for params in batch_jobs:
         sim = SimulationRun(
-            run_id=i,
+            run_id=params["run_id"],
             rod_params=params["rod"],
             hammer_params=params["hammer"],
-            config=SIM_CONFIG,
+            config=params["config"],
             email_config=EMAIL_CONFIG,
-            base_dir=OUTPUT_DIR 
+            base_dir=OUTPUT_DIR
         )
         sim.run()
 

@@ -19,8 +19,10 @@ from plots.energy import (plot_energies, plot_energy_components, plot_energy_tot
                           plot_kinetic_trans_long, plot_kinetic_transfer, energy_components,
                           plot_energy_share, plot_modal_energy,
                           ENERGY_DENSITY_BLOCK, block_mean, block_centers)
-from plots.energy_flow import (motion_decomposition, edges_to_nodes, plot_energy_flow,
-                               plot_element_map)
+from plots.energy_flow import (exact_flow, roundoff_forces, modal_transfer, edge_forces, edges_to_nodes,
+                               dst_parseval,
+                               plot_energy_flow, plot_element_map, plot_modal_transfer,
+                               plot_transfer_spectrum, plot_energy_source, N_TRANSFER_MODES)
 from plots.spectrogram import plot_node_spectrogram
 from plots.audio import generate_node_audio
 from plots.inharmonicity import plot_inharmonicity_comparison, plot_inharmonicity_deviation
@@ -28,8 +30,9 @@ from plots.polarization import plot_polarization
 from plots.decay import plot_partial_decay, plot_spectral_decay
 from plots.transient import plot_spacetime_heatmap, plot_waterfall_3d, plot_node_transient
 from plots.dispersion import (modal_projection, kspace_grid, kspace_projection, StreamingModalSpectra,
-                              StreamingKOmegaSpectra, finalize_dispersion, find_resonances,
-                              plot_dispersion)
+                              StreamingKOmegaSpectra, StreamingCrossSpectrum, finalize_dispersion,
+                              find_resonances, plot_dispersion)
+from utils import reference_vectors, rest_orientations
 from plots.gallery import write_gallery
 
 # Dispersion analysis: modes kept per frame and Welch segment length (frames).
@@ -56,7 +59,7 @@ def _diag(K):
 # Parallel Extraction Worker
 def _process_single_chunk(args):
     (nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl, capture_field, want_spectra,
-     n_modes, length, dampening) = args
+     n_modes, length, dampening, ref_vecs, q_rest, dt_sim) = args
 
     with gzip.open(nf, "rb") as f:
         n_chunk = pickle.load(f)
@@ -96,12 +99,10 @@ def _process_single_chunk(args):
     field = pos[:, :, 1:3].copy() if capture_field else None
 
     # Edge stretch exactly as the shader computes it: e = |r| / dl, where r is
-    # the edge's reference vector (the pre-stretched spacing tuned_length/(N-1)
-    # along x, see utils.generate_straight_rod) plus the displacement
+    # the edge's reference vector (the pre-stretched spacing, exactly as handed
+    # to the simulation, see utils.reference_vectors) plus the displacement
     # difference. dl is the rest length, so e ~ 1 + pre-strain at rest.
-    ref = np.zeros(3, dtype=np.float32)
-    ref[0] = length / (node_count - 1) if length is not None else dl
-    r = ref + (pos[:, 1:] - pos[:, :-1])                      # (F, N-1, 3)
+    r = ref_vecs + (pos[:, 1:] - pos[:, :-1])                 # (F, N-1, 3)
     stretch = np.linalg.norm(r.astype(np.float64), axis=-1) / dl
     eta_e = 1.0 - 0.3 * (stretch - 1.0)                        # per edge
     eta_n = 1.0 - 0.3 * (0.5 * (stretch[:, :-1] + stretch[:, 1:]) - 1.0)  # interior nodes
@@ -136,29 +137,52 @@ def _process_single_chunk(args):
     sums = [ke_node.sum(1), rot_edge.sum(1), bt_node.sum(1), ss_edge.sum(1),
             ke_node_l.sum(1), rot_edge_t.sum(1), bt_node_tw.sum(1), ss_edge_ex.sum(1)]
 
-    # Clean split by kind of motion (see plots/energy_flow.py): transverse and
-    # longitudinal energies with their own kinetic and potential parts, the
-    # coupling energy and the transfer power transverse -> longitudinal.
-    spacing = length / (node_count - 1) if length is not None else dl
-    dec = motion_decomposition(pos, vel, spacing, dl, m_node, K_se_d[2])
-    e_trans = (dec["ke_t"] + (bt_node - bt_node_tw)
-               + edges_to_nodes(dec["pe_t"] + (rot_edge - rot_edge_t)))
-    e_long = dec["ke_l"] + edges_to_nodes(dec["pe_l"])
-    c_lin = dampening[0]
+    # Exact energy flow from the shader's force law (see plots/energy_flow.py):
+    # longitudinal energy, transfer power into it by channel, and the float32
+    # rounding of the node force for the energy-source diagnostic.
+    c_lin, c_ang = dampening
+    q_e = quats[:, :-1]
+    fl = exact_flow(pos, vel, q_e, ref_vecs, q_rest, dl, m_node, K_se_d, c_lin)
+    d_round = roundoff_forces(pos, q_e, ref_vecs, dl, K_se_d)[:, 1:-1]
+    d_perp2 = np.sum(d_round[..., 1:] ** 2, axis=-1)
     flow = {
-        "E_T": e_trans.sum(1), "E_L": e_long.sum(1), "U_c": dec["coupling"].sum(1),
-        "E_tor": rot_edge_t.sum(1) + bt_node_tw.sum(1), "P_TL": dec["p"].sum(1),
-        # Linear damping acting on the longitudinal motion (interior nodes).
-        "D_L": c_lin * np.sum(v64[:, 1:-1, 0] ** 2, axis=1),
+        "KE_T": fl["ke_t"].sum(1), "KE_R": (rot_edge - rot_edge_t).sum(1), "KE_tor": rot_edge_t.sum(1),
+        "E_L": fl["ke_l"].sum(1) + fl["u_l_quad"].sum(1) + fl["u_l_lin"].sum(1),
+        "P_disp": fl["p_disp"].sum(1), "P_rot": fl["p_rot"].sum(1), "D_L": fl["d_l"].sum(1),
+        # Damping power of the whole state (linear on interior nodes, angular on edges).
+        "D_all": c_lin * np.sum(v64[:, 1:-1] ** 2, axis=(1, 2)) + c_ang * np.sum(w64 ** 2, axis=(1, 2)),
+        "dF_x_rms": np.sqrt(np.mean(d_round[..., 0] ** 2, axis=1)),
+        "dF_perp_rms": np.sqrt(np.mean(d_perp2, axis=1)),
+        # Heating if the rounding were independent each solver step: dF^2 dt / (2m) per node.
+        "H_x": np.sum(d_round[..., 0] ** 2, axis=1) * dt_sim / (2.0 * m_node),
+        "H_perp": np.sum(d_perp2, axis=1) * dt_sim / (2.0 * m_node),
     }
     flow = {k: v.astype(np.float32) for k, v in flow.items()}
+    del d_round, d_perp2
+
+    # Force-port check against the saved internal force. The saved value is
+    # one solver step behind the saved positions (buffer swap), so expect
+    # agreement to ~omega * dt_sim, not to rounding.
+    f_port = edge_forces(r, q_e, dl, K_se_d)
+    f_saved = evecs[:, :-1, 1].astype(np.float64)
+    force_check = float(np.median(np.linalg.norm(f_saved - f_port, axis=-1)
+                                  / np.maximum(np.linalg.norm(f_port, axis=-1), 1e-30)))
+    del f_port, f_saved
 
     # Per-element maps, block-averaged in time; the excitation chunks also get
     # a finer version for the transient phase.
-    per_elem = {"trans": e_trans, "long": e_long, "transfer": dec["p"]}
+    per_elem = {"trans": fl["ke_t"], "long": fl["ke_l"] + edges_to_nodes(fl["u_l_quad"]),
+                "transfer": fl["p_disp"] + fl["p_rot"]}
     maps = {k: block_mean(v, ENERGY_DENSITY_BLOCK) for k, v in per_elem.items()}
     maps_fine = ({k: block_mean(v, FINE_MAP_BLOCK) for k, v in per_elem.items()}
                  if capture_field else None)
+
+    # Transfer per longitudinal mode (exact sine-basis split) and the mode
+    # coefficients for the streamed transfer spectrum.
+    p_modes, t_coeffs = modal_transfer(v64[..., 0], fl["f_c"], N_TRANSFER_MODES)
+    modal_tr = p_modes.mean(axis=0).astype(np.float32)
+    modal_tr_fine = block_mean(p_modes, FINE_MODAL_BLOCK) if capture_field else None
+    del fl, per_elem, p_modes
 
     # Kinetic energy per spatial mode (~half each mode's energy):
     # KE_n = 0.5 * (total mass) / 2 * adot_n^2, transverse (Y+Z) and longitudinal (X).
@@ -174,6 +198,8 @@ def _process_single_chunk(args):
         "field": field, "spectra": spectra, "flow": flow,
         "maps": maps, "maps_fine": maps_fine,
         "modal_ke": modal_ke, "modal_ke_fine": modal_ke_fine,
+        "modal_transfer": modal_tr, "modal_transfer_fine": modal_tr_fine,
+        "transfer_coeffs": t_coeffs if want_spectra else None, "force_check": force_check,
     }
 
 def _format_parameters(metadata):
@@ -191,8 +217,24 @@ def _format_parameters(metadata):
 ENERGY_KEYS = ("t_ke", "r_ke", "bt_pe", "ss_pe", "t_ke_l", "r_ke_t", "bt_pe_tw", "ss_pe_ex")
 
 # Core Memory-Efficient Extraction
+def rod_reference(node_count, length, dl, rod_params=None, uniform_reference=None):
+    """Edge reference vectors and rest orientations exactly as the simulation
+    got them (utils.generate_straight_rod). uniform_reference=False (runs made
+    before the bit-identical spacing) reproduces the old float32 spacings."""
+    L = length if length is not None else dl * (node_count - 1)
+    ref = reference_vectors(node_count, L, legacy=not uniform_reference)
+    twists = (rod_params or {}).get("twists")
+    if twists is None:
+        print(f"[{datetime.now()}] Warning: rod twist unknown; assuming untwisted rest orientations.")
+        twists = 0.0
+    # The GPU holds the orientations in float32.
+    q_rest = rest_orientations(node_count, twists).astype(np.float32)
+    return ref, q_rest
+
+
 def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_nodes, length=None,
-                 n_modes=DISPERSION_MODES, nperseg=DISPERSION_NPERSEG):
+                 n_modes=DISPERSION_MODES, nperseg=DISPERSION_NPERSEG, rod_params=None,
+                 uniform_reference=None):
     """Read all chunks in parallel and reduce them to the arrays the plots need.
 
     Returns a dict with 'time', 'fs', the energy arrays (ENERGY_KEYS),
@@ -219,8 +261,17 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
         print(f"[{datetime.now()}] Warning: tuned length unknown; edge stretch (and the eta-scaled "
               "energies) will assume rest spacing dl, which ignores the string's pre-strain.")
     dampening = tuple(config.get("dampening", (0.0, 0.0)))
+    node_count = config.get("node_count")
+    if node_count is None:
+        with gzip.open(node_files[0], "rb") as f:
+            node_count = len(pickle.load(f)[0])
+    ref_vecs, q_rest = rod_reference(node_count, length, dl, rod_params, uniform_reference)
+    print(f"[{datetime.now()}] Edge reference spacing: "
+          f"{'uniform' if uniform_reference else 'legacy float32 differences'} "
+          f"({np.unique(ref_vecs[:, 0]).size} distinct values).")
     args_list = [(nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl,
-                  idx < n_exc_chunks, idx >= n_exc_chunks, n_modes, length, dampening)
+                  idx < n_exc_chunks, idx >= n_exc_chunks, n_modes, length, dampening,
+                  ref_vecs, q_rest, dt)
                  for idx, (nf, ef) in enumerate(zip(node_files, edge_files))]
 
     all_node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': [], 'omega': []} for n in inspect_nodes}
@@ -229,12 +280,14 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
     field_chunks = []
     maps, maps_t, maps_fine, maps_fine_t = {}, [], {}, []
     modal_ke_chunks, modal_ke_t, modal_fine, modal_fine_t = [], [], [], []
+    modal_tr_chunks, modal_tr_fine, force_checks = [], [], []
     frame_dt = dt * oversamp
     # Modal spectra are accumulated as chunks arrive (in time order), so only
     # one Welch segment of modal data is ever held. Only free-vibration chunks
     # are fed, so the hammer's forced response doesn't smear the spectrum.
     modal_acc = StreamingModalSpectra(fs_native, nperseg=nperseg)
     kw_acc = StreamingKOmegaSpectra(fs_native, nperseg=nperseg)
+    transfer_acc = StreamingCrossSpectrum(fs_native, nperseg=nperseg)
     spectra_meta = None
 
     excitation_cutoff_frame = 0
@@ -256,18 +309,22 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
                 c_modal, c_kspace, k_grid, n_nodes, grid_len = res["spectra"]
                 modal_acc.feed(c_modal)
                 kw_acc.feed(c_kspace)
+                transfer_acc.feed(res["transfer_coeffs"])
                 spectra_meta = (k_grid, n_nodes, grid_len)
 
             for key, arr in res["maps"].items():
                 maps.setdefault(key, []).append(arr)
             maps_t.append(block_centers(frames_processed, n_frames, ENERGY_DENSITY_BLOCK, frame_dt))
             modal_ke_chunks.append(res["modal_ke"])
+            modal_tr_chunks.append(res["modal_transfer"])
+            force_checks.append(res["force_check"])
             modal_ke_t.append((frames_processed + 0.5 * (n_frames - 1)) * frame_dt)
             if res["maps_fine"] is not None:
                 for key, arr in res["maps_fine"].items():
                     maps_fine.setdefault(key, []).append(arr)
                 maps_fine_t.append(block_centers(frames_processed, n_frames, FINE_MAP_BLOCK, frame_dt))
                 modal_fine.append(res["modal_ke_fine"])
+                modal_tr_fine.append(res["modal_transfer_fine"])
                 modal_fine_t.append(block_centers(frames_processed, n_frames, FINE_MODAL_BLOCK, frame_dt))
             del res
 
@@ -276,6 +333,12 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
                 excitation_cutoff_frame += n_frames
 
     print(f"[{datetime.now()}] Extraction complete. Stitching arrays...")
+    if force_checks:
+        print(f"[{datetime.now()}] Force port vs saved internal force: median relative difference "
+              f"{np.median(force_checks):.2e} (saved force lags the saved positions by one solver step).")
+    p_spec = transfer_acc.finalize()
+    if p_spec is not None:
+        p_spec["p_nf"] = p_spec["p_nf"] * dst_parseval(node_count - 2)
     data = {
         "time": np.arange(frames_processed) * (dt * oversamp),
         "fs": fs_native,
@@ -291,6 +354,10 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
         "modal_ke_time": np.asarray(modal_ke_t),
         "modal_ke_fine": np.concatenate(modal_fine, axis=0) if modal_fine else None,
         "modal_ke_fine_time": np.concatenate(modal_fine_t) if modal_fine_t else None,
+        "modal_transfer": np.stack(modal_tr_chunks),    # (chunks, n_modes + 1)
+        "modal_transfer_fine": np.concatenate(modal_tr_fine, axis=0) if modal_tr_fine else None,
+        "transfer_spectrum": p_spec,
+        "dt_sim": dt,
         "node_data": {
             n: {key: np.concatenate(vals) for key, vals in all_node_data[n].items()}
             for n in inspect_nodes
@@ -300,23 +367,37 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
         data[key] = np.concatenate(all_energy[key])
 
     # Free up collection lists aggressively
-    del all_node_data, all_energy, all_flow, field_chunks, modal_acc, kw_acc
+    del all_node_data, all_energy, all_flow, field_chunks, modal_acc, kw_acc, transfer_acc
     del maps, maps_fine, modal_ke_chunks, modal_fine
     gc.collect()
     return data
 
 
 def make_string_params(m_node, dl, K_se, K_bt, node_count=None, tension=None, length=None):
-    """Continuum parameters for the theory overlays (T is None -> no theory)."""
+    """Continuum parameters for the reference overlays (T is None -> none).
+
+    T_eff, EA_eff, EI_eff are what the shader applies at the rest state: with
+    rest strain s0 = h/dl - 1 and eta0 = 1 - 0.3 s0, the axial force is
+    f(e) = K_z eta^2 (e - 1), so the tension is f(e0) = K_z eta0^2 s0. For
+    longitudinal waves m u'' = f'(e0)/dl (u_{j+1} - 2u_j + u_{j-1}) gives
+    c^2 = f'(e0) h / (dl mu), i.e. an effective EA of
+    K_z (eta0^2 - 0.6 eta0 s0)(1 + s0); bending is scaled by eta0^4.
+    """
     if length is None:
         length = dl * (node_count - 1)
     n_seg = node_count - 1 if node_count else length / dl
+    K_z, EI = float(np.ravel(K_se)[2]), float(np.ravel(K_bt)[0])
+    s0 = (length / n_seg) / dl - 1.0
+    eta0 = 1.0 - 0.3 * s0
     return {
         "L": float(length),
         "mu": float(m_node * n_seg / length),
         "T": None if tension is None else float(tension),
-        "EI": float(np.ravel(K_bt)[0]),
-        "EA": float(np.ravel(K_se)[2]),
+        "EI": EI,
+        "EA": K_z,
+        "T_eff": K_z * eta0 ** 2 * s0,
+        "EA_eff": K_z * (eta0 ** 2 - 0.6 * eta0 * s0) * (1.0 + s0),
+        "EI_eff": EI * eta0 ** 4,
     }
 
 
@@ -434,6 +515,22 @@ def build_plot_tasks(data, output_dir, run_id, dt, oversamp, dl, inspect_nodes, 
                                        {"onset": p_onset, "title_prefix": phase_title,
                                         "filename": f"{energy_prefix}_{suffix}.png"}))
 
+        # Is energy created? Free vibration only (no hammer work to account for).
+        if phase_name == "Free_Vibration" and p_flow is not None and "D_all" in p_flow:
+            plot_tasks.append((plot_energy_source,
+                               (p_time, p_tke.astype(np.float64) + p_rke + p_bpe + p_spe, p_flow),
+                               {"title_prefix": phase_title, "filename": f"{energy_prefix}_energy_source.png"}))
+
+        # Transfer into each longitudinal mode.
+        if transient or phase_name == "Full_Simulation":
+            src, src_t = ((data.get("modal_transfer_fine"), data.get("modal_ke_fine_time"))
+                          if transient else (data.get("modal_transfer"), data.get("modal_ke_time")))
+            rows = _rows_in(src_t, p_time[0], p_time[-1]) if src is not None else None
+            if rows is not None:
+                plot_tasks.append((plot_modal_transfer, (src[rows], src_t[rows]),
+                                   {"onset": p_onset, "title_prefix": phase_title,
+                                    "filename": f"{energy_prefix}_modal_transfer.png"}))
+
         # Whole-string displacement and modal energy during the transient.
         if transient:
             if field_exc is not None:
@@ -506,6 +603,14 @@ def build_plot_tasks(data, output_dir, run_id, dt, oversamp, dl, inspect_nodes, 
         plot_tasks.append((plot_modal_energy, (data["modal_ke"], data["modal_ke_time"]),
                            {"title_prefix": "Full Simulation",
                             "filename": str(output_dir / f"{run_tag}_Full_Simulation_modal_energy.png")}))
+
+    # Transfer spectrum (free vibration), marked with measured resonances.
+    if data.get("transfer_spectrum") is not None:
+        f_trans = find_resonances(disp["freqs"], disp["psd_trans"])[1] if disp is not None else ()
+        f_long = find_resonances(disp["freqs"], disp["psd_long"])[1] if disp is not None else ()
+        plot_tasks.append((plot_transfer_spectrum, (data["transfer_spectrum"], f_trans, f_long),
+                           {"title_prefix": "Free Vibration",
+                            "filename": str(output_dir / f"{run_tag}_Free_Vibration_transfer_spectrum.png")}))
 
     # Dispersion relation from the streamed modal spectra (free vibration),
     # in physical units and normalised (mode number, v / c0).
@@ -591,9 +696,10 @@ def send_email(email_config, sim_path, run_id, inspect_nodes, generated_images, 
 
 
 def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia, K_se, K_bt, inspect_nodes,
-                     tension=None, length=None):
+                     tension=None, length=None, rod_params=None, uniform_reference=None):
     sim_path = Path(sim_path)
-    data = extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_nodes, length=length)
+    data = extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_nodes, length=length,
+                        rod_params=rod_params, uniform_reference=uniform_reference)
 
     output_dir = sim_path / "plots"
     output_dir.mkdir(exist_ok=True)
@@ -693,4 +799,5 @@ if __name__ == "__main__":
         inertia=np.array(rod["inertia"]), K_se=np.array(rod["K_se"]), K_bt=np.array(rod["K_bt"]),
         inspect_nodes=inspect_nodes,
         tension=rod_params.get("tension_force"), length=rod_params.get("tuned_length"),
+        rod_params=rod_params, uniform_reference=bool(rod.get("uniform_reference_spacing", False)),
     )

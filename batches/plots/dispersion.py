@@ -185,6 +185,33 @@ class StreamingKOmegaSpectra(_StreamingWelch):
         }
 
 
+class StreamingCrossSpectrum(_StreamingWelch):
+    """Time-averaged product of two coefficient series per mode, resolved in
+    frequency: Re<A_n*(f) B_n(f)>, one-sided, as a density (per Hz) whose
+    integral over f is the Hann^2-weighted segment mean of a_n(t) b_n(t)
+    (segment means removed). Fed (frames, n_modes, 2)."""
+
+    def __init__(self, fs, nperseg=8192):
+        super().__init__(fs, nperseg)
+        self.acc = None     # (n_modes, F) float64
+
+    def _segment(self, seg, nfft):
+        seg, scale = self._prepare(np.asarray(seg, dtype=np.float32))
+        spec = rfft(seg, n=nfft, axis=0)                     # (F, n_modes, 2)
+        cross = (np.conj(spec[..., 0]) * spec[..., 1]).real.astype(np.float64)
+        del spec
+        cross[1:(None if nfft % 2 else -1)] *= 2.0           # fold negative frequencies
+        if self.acc is None:
+            self.acc = np.zeros(cross.T.shape, np.float64)
+        self.acc += scale * cross.T
+
+    def finalize(self):
+        if not self._flush():
+            return None
+        return {"freqs": rfftfreq(self.nperseg, 1.0 / self.fs), "p_nf": self.acc / self.n_segments,
+                "n_segments": self.n_segments}
+
+
 def finalize_dispersion(modal_acc, kw_acc, k_grid, node_count, length):
     """Combine both accumulators into one picklable dict for plot_dispersion."""
     modal = modal_acc.finalize()
@@ -296,13 +323,26 @@ def k_from_mode_shapes(cross, rows, node_count, length, margin=0.05, min_r2=0.95
 # --------------------------------------------------------------------------
 
 def theory_transverse(k, sp):
-    """Stiff string: w^2 = (T/mu) k^2 + (EI/mu) k^4. Returns w in rad/s."""
-    return np.sqrt(sp["T"] / sp["mu"] * k ** 2 + sp["EI"] / sp["mu"] * k ** 4)
+    """Stiff string: w^2 = (T/mu) k^2 + (EI/mu) k^4, with the tension and
+    bending stiffness the shader actually applies at rest (T_eff, EI_eff,
+    see post_process.make_string_params). Returns w in rad/s."""
+    T, EI = sp.get("T_eff", sp["T"]), sp.get("EI_eff", sp["EI"])
+    return np.sqrt(T / sp["mu"] * k ** 2 + EI / sp["mu"] * k ** 4)
 
 
 def theory_longitudinal(k, sp):
-    """Longitudinal (rod) waves: w = sqrt(EA/mu) k. Returns w in rad/s."""
-    return np.sqrt(sp["EA"] / sp["mu"]) * k
+    """Longitudinal waves: w = sqrt(K/mu) k with K the tangent stiffness of the
+    shader's axial force at rest (EA_eff). Returns w in rad/s."""
+    return np.sqrt(sp.get("EA_eff", sp["EA"]) / sp["mu"]) * k
+
+
+def driven_mask(f_peaks, f_sources, tol):
+    """Peaks within tol of a source frequency (measured data only)."""
+    f_peaks = np.asarray(f_peaks, np.float64)
+    f_sources = np.asarray(f_sources, np.float64)
+    if f_peaks.size == 0 or f_sources.size == 0:
+        return np.zeros(f_peaks.shape, bool)
+    return np.min(np.abs(f_peaks[:, None] - f_sources[None, :]), axis=1) <= tol
 
 
 # --------------------------------------------------------------------------
@@ -327,14 +367,20 @@ def plot_dispersion(dispersion, string_params, normalized=False, f1=None,
                     title_prefix="", filename=""):
     """k-w map (top) and phase velocity w/k (bottom), transverse and
     longitudinal side by side. Hollow markers: k from the k-w map; filled:
-    k from mode-shape fits. Theory curves are comparison overlays only.
+    k from mode-shape fits. Reference curves use the stiffnesses the shader
+    applies at rest; they are comparison overlays only.
 
     normalized: x = mode number n = kL/pi, map y = w / w1 (w1 = measured
     fundamental, f1), velocity = v / c0 with c0 = sqrt(T/mu) resp. sqrt(EA/mu);
     the transverse velocity curve is then sqrt(1 + B n^2), the inharmonicity.
-    Longitudinal resonances whose phase velocity is >10% off the free-wave
-    speed are longitudinal motion driven by the transverse vibration; they are
-    shown grey on the map and left out of the velocity panel.
+    Peaks driven by the other polarisation are shown grey on the map and left
+    out of the velocity panel.
+
+    "Driven" is decided from measured data only: a longitudinal peak at a
+    combination frequency (f_m + f_n, |f_m - f_n|, 2 f_n) of the measured
+    transverse resonances (the coupling force is quadratic in the transverse
+    motion), a transverse peak at a measured free longitudinal resonance;
+    within one Welch frequency bin.
     """
     freqs = dispersion["freqs"]
     k_grid = dispersion["k_grid"]
@@ -346,25 +392,32 @@ def plot_dispersion(dispersion, string_params, normalized=False, f1=None,
         f1 = float(f_res[0]) if f_res.size else freqs[1]
     w1 = 2 * np.pi * f1
 
+    # Model-free driven-peak classification (see docstring).
+    from plots.energy_flow import combination_frequencies
+    tol = freqs[1] - freqs[0]
+    f_t = find_resonances(freqs, dispersion["psd_trans"])[1]
+    f_l = find_resonances(freqs, dispersion["psd_long"])[1]
+    long_driven = driven_mask(f_l, combination_frequencies(f_t), tol)
+    trans_driven = driven_mask(f_t, f_l[~long_driven], tol)
+
     fig, axes = plt.subplots(2, 2, figsize=(17, 11), sharex='col', layout='constrained',
                              gridspec_kw={"height_ratios": [3, 2]})
+    fig.get_layout_engine().set(wspace=0.12)
     for col, (which, label, theory_fn, c0_key, c0_label) in enumerate((
-            ("trans", "Transverse (Y+Z)", theory_transverse, "T", "√(T/μ) (ideal string)"),
-            ("long", "Longitudinal (X)", theory_longitudinal, "EA", "√(EA/μ)"))):
+            ("trans", "Transverse (Y+Z)", theory_transverse, "T_eff", "√(T/μ)"),
+            ("long", "Longitudinal (X)", theory_longitudinal, "EA_eff", "√(K/μ)"))):
         w_res, k_map, k_fit, ok = _analyse(dispersion, which)
         kw = dispersion[f"kw_{which}"].astype(np.float64)
-        c0 = np.sqrt(string_params[c0_key] / string_params["mu"]) if has_theory else None
+        c0_val = string_params.get(c0_key, string_params.get(c0_key[:-4]))
+        c0 = np.sqrt(c0_val / string_params["mu"]) if has_theory and c0_val else None
 
         # Axis transforms (identity in physical units).
         fx = (lambda k: k * L / np.pi) if normalized else (lambda k: k)
         fy = (lambda w: w / w1) if normalized else (lambda w: w)
         fv = (lambda v: v / c0) if (normalized and c0) else (lambda v: v)
 
-        # Longitudinal peaks off the free-wave branch: driven by transverse motion.
-        driven = np.zeros_like(ok)
-        if which == "long" and c0:
-            with np.errstate(divide='ignore', invalid='ignore'):
-                driven = ok & (np.abs(w_res / k_fit / c0 - 1.0) > 0.1)
+        driven = long_driven if which == "long" else trans_driven
+        other = "transverse" if which == "long" else "longitudinal"
         free = ok & ~driven
         k_map_free = np.where(driven, np.nan, k_map)
 
@@ -374,19 +427,22 @@ def plot_dispersion(dispersion, string_params, normalized=False, f1=None,
         k_lim = min(k_grid[-1], 1.1 * k_meas.max()) if k_meas.size else k_grid[-1]
 
         # k-w map, each frequency row normalised to its own peak (the ridge
-        # stays visible as amplitudes fall with frequency); rows with no real
-        # energy (> 80 dB below the strongest) are blanked.
+        # stays visible as amplitudes fall with frequency); rows more than
+        # 60 dB below the strongest are drawn at the floor, not amplified.
         wmask = w_axis <= w_max
         p = kw[wmask]
         row_max = p.max(axis=1, keepdims=True)
-        dead = row_max[:, 0] < 1e-8 * kw.max() if kw.max() > 0 else np.ones(p.shape[0], bool)
+        dead = row_max[:, 0] < 1e-6 * kw.max() if kw.max() > 0 else np.ones(p.shape[0], bool)
         row_max[row_max <= 0] = 1.0
         db = 10.0 * np.log10(np.maximum(p / row_max, 1e-6))
         db[dead] = -60.0
         ax = axes[0, col]
         pcm = ax.pcolormesh(fx(k_grid), fy(w_axis[wmask]), db, cmap='magma', vmin=-60, vmax=0,
                             shading='nearest')
-        fig.colorbar(pcm, ax=axes[:, col], pad=0.1, label="|U(k,ω)|² per ω row (dB re. row peak)")
+        # Colourbar right of the f (Hz) axis, outside the layout so the
+        # velocity panel underneath keeps the same width.
+        cax = ax.inset_axes([1.17, 0.0, 0.025, 1.0])
+        fig.colorbar(pcm, cax=cax, label="|U(k,ω)|² (dB re. row peak)")
 
         k_th = np.linspace(k_grid[0], k_lim, 400)[1:]
         theory = theory_fn(k_th, string_params) if has_theory else None
@@ -394,11 +450,12 @@ def plot_dispersion(dispersion, string_params, normalized=False, f1=None,
                    label="k from k–ω map", zorder=3)
         ax.scatter(fx(k_fit[free]), fy(w_res[free]), s=7, color='lime', label="k from mode-shape fit", zorder=4)
         if driven.any():
-            ax.scatter(fx(k_fit[driven]), fy(w_res[driven]), s=26, facecolors='none', edgecolors='#c3c2b7',
-                       linewidths=1.0, label="driven by transverse motion", zorder=4)
+            k_drv = np.where(np.isfinite(k_fit[driven]), k_fit[driven], k_map[driven])
+            ax.scatter(fx(k_drv), fy(w_res[driven]), s=40, facecolors='none', edgecolors='#8f8e88',
+                       linewidths=1.2, label=f"driven by {other} motion", zorder=4)
         if theory is not None:
             ax.plot(fx(k_th), fy(theory), color='white', linestyle='--', linewidth=1.0,
-                    label="Theory (reference)", zorder=5)
+                    label="reference (shader parameters)", zorder=5)
         ax.set_ylim(0, fy(w_max))
         if normalized:
             ax.set_ylabel("ω / ω₁")
@@ -409,8 +466,9 @@ def plot_dispersion(dispersion, string_params, normalized=False, f1=None,
             ax.set_ylabel("ω (rad/s)")
             sec = ax.secondary_yaxis('right', functions=(lambda v: v / (2 * np.pi), lambda v: v * 2 * np.pi))
         sec.set_ylabel("f (Hz)")
-        ax.set_title(f"{label}: {w_res.size} resonances, {int(ok.sum())} shape fits accepted")
-        ax.legend(loc='upper left', fontsize=8)
+        ax.set_title(f"{label}: {w_res.size} resonances, {int(ok.sum())} shape fits accepted, "
+                     f"{int(driven.sum())} driven", pad=26)
+        ax.legend(loc='lower left', bbox_to_anchor=(0.0, 1.0), ncol=4, frameon=False, fontsize=8)
 
         # Phase velocity (free waves only).
         ax = axes[1, col]
@@ -423,7 +481,7 @@ def plot_dispersion(dispersion, string_params, normalized=False, f1=None,
         vals = [fv(v_fit)]
         if theory is not None:
             ax.plot(fx(k_th), fv(theory / k_th), color='black', linestyle='--', linewidth=1.0,
-                    label="Theory (reference)")
+                    label="reference (shader parameters)")
             ax.axhline(fv(c0), color='tab:gray', linestyle=':', linewidth=1.0, label=c0_label)
             vals += [fv(theory / k_th), [fv(c0)]]
         vals = np.concatenate([np.ravel(v) for v in vals])
@@ -443,7 +501,7 @@ def plot_dispersion(dispersion, string_params, normalized=False, f1=None,
             ax.set_xlabel("Wavenumber k (rad/m)")
             ax.set_ylabel("Phase velocity ω/k (m/s)")
         ax.grid(True, alpha=0.3)
-        ax.legend(loc='best', fontsize=8)
+        ax.legend(loc='lower left', bbox_to_anchor=(0.0, 1.0), ncol=4, frameon=False, fontsize=8)
 
     kind = "Normalised Dispersion Relation" if normalized else "Dispersion Relation"
     fig.suptitle(f"[{title_prefix}] {kind}")

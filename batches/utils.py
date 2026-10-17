@@ -1,5 +1,54 @@
 import numpy as np
 
+
+def reference_vectors(node_count, tuned_length, legacy=False):
+    """Edge reference vectors (N-1, 3) float32, as handed to the simulation.
+
+    Every edge gets the bit-identical spacing. legacy=True reproduces the old
+    construction (differences of float32 absolute positions), whose spacings
+    scatter by ~1 ulp of L (~1e-7 m); that leaves net tension forces of
+    several N at rest, i.e. an initial state that isn't in equilibrium. Post-
+    processing uses it to evaluate runs made before the fix exactly.
+    """
+    if legacy:
+        x = np.linspace(0.0, tuned_length, node_count).astype(np.float32)
+        ref = np.zeros((node_count - 1, 3), dtype=np.float32)
+        ref[:, 0] = x[1:] - x[:-1]
+        return ref
+    ref = np.zeros((node_count - 1, 3), dtype=np.float32)
+    ref[:, 0] = np.float32(tuned_length / (node_count - 1))
+    return ref
+
+
+def rest_orientations(node_count, twists):
+    """Rest orientation quaternion (x, y, z, w) of every edge, (N-1, 4) float64:
+    director d3 along the string (x), optionally twisted about it."""
+    def twist_quaternion(angle):
+        half = 0.5 * angle
+        return np.array([np.sin(half), 0.0, 0.0, np.cos(half)])
+
+    def quat_mul(q1, q2):
+        x1, y1, z1, w1 = q1; x2, y2, z2, w2 = q2
+        return np.array([
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+            w1*w2 - x1*x2 - y1*y2 - z1*z2
+        ])
+
+    angle = np.pi / 2
+    q_base = np.array([0.0, np.sin(0.5 * angle), 0.0, np.cos(0.5 * angle)])
+
+    total_edges = node_count - 1
+    total_angle = 2.0 * np.pi * twists
+
+    orientations = [
+        quat_mul(twist_quaternion(total_angle * (i / total_edges)), q_base)
+        for i in range(total_edges)
+    ]
+    return np.array([q / np.linalg.norm(q) for q in orientations])
+
+
 def generate_straight_rod(
     node_count, tuned_length, tension_force, core_radius, winding_radius,
     E_core, G_core, rho_core, E_winding, G_winding, rho_winding, packing_factor, mu, twists
@@ -40,45 +89,16 @@ def generate_straight_rod(
 
     K_bt = np.array([EI, EI, G_core * J], dtype=np.float32)
 
-    x = np.linspace(0.0, tuned_length, node_count)
-    reference_positions = np.stack([x, np.zeros_like(x), np.zeros_like(x)], axis=1).astype(np.float32)
+    orientations = rest_orientations(node_count, twists)
 
-    def twist_quaternion(angle):
-        half = 0.5 * angle
-        return np.array([np.sin(half), 0.0, 0.0, np.cos(half)])
-
-    def quat_mul(q1, q2):
-        x1, y1, z1, w1 = q1; x2, y2, z2, w2 = q2
-        return np.array([
-            w1*x2 + x1*w2 + y1*z2 - z1*y2,
-            w1*y2 - x1*z2 + y1*w2 + z1*x2,
-            w1*z2 + x1*y2 - y1*x2 + z1*w2,
-            w1*w2 - x1*x2 - y1*y2 - z1*z2
-        ])
-
-    angle = np.pi / 2
-    q_base = np.array([0.0, np.sin(0.5 * angle), 0.0, np.cos(0.5 * angle)])
-
-    total_edges = node_count - 1
-    total_angle = 2.0 * np.pi * twists
-
-    orientations = [
-        quat_mul(twist_quaternion(total_angle * (i / total_edges)), q_base)
-        for i in range(total_edges)
-    ]
-    orientations = [q / np.linalg.norm(q) for q in orientations]
-
-    ref_vecs = np.array(
-        [reference_positions[i+1] - reference_positions[i] for i in range(node_count - 1)],
-        dtype=np.float32
-    )
+    ref_vecs = reference_vectors(node_count, tuned_length)
 
     edges = [(o, v, np.zeros(3), np.zeros(3)) for o, v in zip(orientations, ref_vecs)]
     edges.append((edges[-1][0], np.zeros(3), np.zeros(3), np.zeros(3)))
 
     nodes = [
         (np.zeros(3), np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]))
-        for _ in reference_positions
+        for _ in range(node_count)
     ]
 
     return nodes, edges, dl, mass, inertia, K_se, K_bt
