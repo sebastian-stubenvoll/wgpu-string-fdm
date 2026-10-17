@@ -15,17 +15,18 @@ import numpy as np
 # Import Plotting Modules
 from plots.pos_fft import plot_node_pos_moment_fft
 from plots.rotation import plot_angular_velocity, plot_axis_angle_over_time
-from plots.energy import (plot_energies, plot_energy_envelope, plot_energy_components,
-                          plot_energy_totals, plot_kinetic_trans_long, plot_kinetic_transfer,
-                          energy_components, plot_energy_density, plot_energy_balance,
-                          plot_motion_power, plot_energy_share, plot_modal_energy,
+from plots.energy import (plot_energies, plot_energy_components, plot_energy_totals,
+                          plot_kinetic_trans_long, plot_kinetic_transfer, energy_components,
+                          plot_energy_share, plot_modal_energy,
                           ENERGY_DENSITY_BLOCK, block_mean, block_centers)
+from plots.energy_flow import (motion_decomposition, edges_to_nodes, plot_energy_flow,
+                               plot_element_map)
 from plots.spectrogram import plot_node_spectrogram
 from plots.audio import generate_node_audio
 from plots.inharmonicity import plot_inharmonicity_comparison, plot_inharmonicity_deviation
 from plots.polarization import plot_polarization
 from plots.decay import plot_partial_decay, plot_spectral_decay
-from plots.transient import plot_spacetime_heatmap, plot_waterfall_3d
+from plots.transient import plot_spacetime_heatmap, plot_waterfall_3d, plot_node_transient
 from plots.dispersion import (modal_projection, kspace_grid, kspace_projection, StreamingModalSpectra,
                               StreamingKOmegaSpectra, finalize_dispersion, find_resonances,
                               plot_dispersion)
@@ -34,6 +35,9 @@ from plots.gallery import write_gallery
 # Dispersion analysis: modes kept per frame and Welch segment length (frames).
 DISPERSION_MODES = 256
 DISPERSION_NPERSEG = 8192
+# Finer time blocks (frames) for the transient phase, excitation chunks only.
+FINE_MAP_BLOCK = 4
+FINE_MODAL_BLOCK = 32
 
 def _quad(v, K):
     """0.5 * v^T K v over the last axis of v (..., 3), for a diagonal (3,) or
@@ -132,28 +136,45 @@ def _process_single_chunk(args):
     sums = [ke_node.sum(1), rot_edge.sum(1), bt_node.sum(1), ss_edge.sum(1),
             ke_node_l.sum(1), rot_edge_t.sum(1), bt_node_tw.sum(1), ss_edge_ex.sum(1)]
 
-    # Per-element total energy: node terms plus half of each adjacent edge, so
-    # the row sum equals the system total. Block-averaged in time.
-    edge_e = rot_edge + ss_edge
-    elem = ke_node + bt_node
-    elem[:, :-1] += 0.5 * edge_e
-    elem[:, 1:] += 0.5 * edge_e
-    energy_density = block_mean(elem, ENERGY_DENSITY_BLOCK)
+    # Clean split by kind of motion (see plots/energy_flow.py): transverse and
+    # longitudinal energies with their own kinetic and potential parts, the
+    # coupling energy and the transfer power transverse -> longitudinal.
+    spacing = length / (node_count - 1) if length is not None else dl
+    dec = motion_decomposition(pos, vel, spacing, dl, m_node, K_se_d[2])
+    e_trans = (dec["ke_t"] + (bt_node - bt_node_tw)
+               + edges_to_nodes(dec["pe_t"] + (rot_edge - rot_edge_t)))
+    e_long = dec["ke_l"] + edges_to_nodes(dec["pe_l"])
+    c_lin = dampening[0]
+    flow = {
+        "E_T": e_trans.sum(1), "E_L": e_long.sum(1), "U_c": dec["coupling"].sum(1),
+        "E_tor": rot_edge_t.sum(1) + bt_node_tw.sum(1), "P_TL": dec["p"].sum(1),
+        # Linear damping acting on the longitudinal motion (interior nodes).
+        "D_L": c_lin * np.sum(v64[:, 1:-1, 0] ** 2, axis=1),
+    }
+    flow = {k: v.astype(np.float32) for k, v in flow.items()}
 
-    # Damping power, exactly where the shader applies it: linear on interior
-    # nodes, angular on edges 1..N-3.
-    c_lin, c_ang = dampening
-    p_damp = (c_lin * np.sum(v64[:, 1:-1] ** 2, axis=(1, 2))
-              + c_ang * np.sum(w64[:, 1:-1] ** 2, axis=(1, 2)))
+    # Per-element maps, block-averaged in time; the excitation chunks also get
+    # a finer version for the transient phase.
+    per_elem = {"trans": e_trans, "long": e_long, "transfer": dec["p"]}
+    maps = {k: block_mean(v, ENERGY_DENSITY_BLOCK) for k, v in per_elem.items()}
+    maps_fine = ({k: block_mean(v, FINE_MAP_BLOCK) for k, v in per_elem.items()}
+                 if capture_field else None)
 
-    # Chunk-averaged kinetic energy per spatial mode (~half each mode's energy):
+    # Kinetic energy per spatial mode (~half each mode's energy):
     # KE_n = 0.5 * (total mass) / 2 * adot_n^2, transverse (Y+Z) and longitudinal (X).
     adot = modal_projection(vel, n_modes).astype(np.float64)
-    ke_modes = 0.25 * m_node * (node_count - 1) * np.mean(adot ** 2, axis=0)   # (n_modes, 3)
-    modal_ke = np.stack([ke_modes[:, 1] + ke_modes[:, 2], ke_modes[:, 0]], axis=1).astype(np.float32)
+    ke_modes = 0.25 * m_node * (node_count - 1) * adot ** 2                  # (F, n_modes, 3)
+    ke_modes = np.stack([ke_modes[..., 1] + ke_modes[..., 2], ke_modes[..., 0]], axis=-1)
+    modal_ke = ke_modes.mean(axis=0).astype(np.float32)                      # chunk average
+    modal_ke_fine = block_mean(ke_modes, FINE_MODAL_BLOCK) if capture_field else None
 
-    return (n_frames, out_node_data, *[np.asarray(a, dtype=np.float32) for a in sums],
-            field, spectra, energy_density, p_damp.astype(np.float32), modal_ke)
+    return {
+        "n_frames": n_frames, "node_data": out_node_data,
+        "energy": [np.asarray(a, dtype=np.float32) for a in sums],
+        "field": field, "spectra": spectra, "flow": flow,
+        "maps": maps, "maps_fine": maps_fine,
+        "modal_ke": modal_ke, "modal_ke_fine": modal_ke_fine,
+    }
 
 def _format_parameters(metadata):
     """Render parameters.json as readable, sectioned plain text for the email body."""
@@ -176,7 +197,8 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
 
     Returns a dict with 'time', 'fs', the energy arrays (ENERGY_KEYS),
     'node_data', 'field_exc', 'excitation_cutoff_frame', 'dispersion',
-    'energy_density' (+ '_time'), 'p_damp' and 'modal_ke' (+ '_time').
+    'flow' (per-frame motion energies and transfer power), the per-element
+    'maps' / 'maps_fine' (+ '_time') and 'modal_ke' / 'modal_ke_fine' (+ '_time').
     """
     sim_path = Path(sim_path)
     node_files = sorted(sim_path.glob("n_*.pkl.gz"))
@@ -203,9 +225,10 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
 
     all_node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': [], 'omega': []} for n in inspect_nodes}
     all_energy = {key: [] for key in ENERGY_KEYS}
+    all_flow = {}
     field_chunks = []
-    density_chunks, density_t, p_damp_chunks = [], [], []
-    modal_ke_chunks, modal_ke_t = [], []
+    maps, maps_t, maps_fine, maps_fine_t = {}, [], {}, []
+    modal_ke_chunks, modal_ke_t, modal_fine, modal_fine_t = [], [], [], []
     frame_dt = dt * oversamp
     # Modal spectra are accumulated as chunks arrive (in time order), so only
     # one Welch segment of modal data is ever held. Only free-vibration chunks
@@ -219,30 +242,34 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=32) as executor:
         for file_idx, res in enumerate(executor.map(_process_single_chunk, args_list)):
-            n_frames, nd_dict = res[0], res[1]
-            c_energy = res[2:10]
-            c_field, c_spectra = res[10], res[11]
-            c_density, c_p_damp, c_modal_ke = res[12], res[13], res[14]
-
+            n_frames = res["n_frames"]
             for n in inspect_nodes:
                 for key in ('pos', 'vel', 'mom', 'quats', 'omega'):
-                    all_node_data[n][key].append(nd_dict[n][key])
-
-            for key, arr in zip(ENERGY_KEYS, c_energy):
+                    all_node_data[n][key].append(res["node_data"][n][key])
+            for key, arr in zip(ENERGY_KEYS, res["energy"]):
                 all_energy[key].append(arr)
-            if c_field is not None:
-                field_chunks.append(c_field)
-            if c_spectra is not None:
-                c_modal, c_kspace, k_grid, n_nodes, grid_len = c_spectra
+            for key, arr in res["flow"].items():
+                all_flow.setdefault(key, []).append(arr)
+            if res["field"] is not None:
+                field_chunks.append(res["field"])
+            if res["spectra"] is not None:
+                c_modal, c_kspace, k_grid, n_nodes, grid_len = res["spectra"]
                 modal_acc.feed(c_modal)
                 kw_acc.feed(c_kspace)
                 spectra_meta = (k_grid, n_nodes, grid_len)
-            density_chunks.append(c_density)
-            density_t.append(block_centers(frames_processed, n_frames, ENERGY_DENSITY_BLOCK, frame_dt))
-            p_damp_chunks.append(c_p_damp)
-            modal_ke_chunks.append(c_modal_ke)
+
+            for key, arr in res["maps"].items():
+                maps.setdefault(key, []).append(arr)
+            maps_t.append(block_centers(frames_processed, n_frames, ENERGY_DENSITY_BLOCK, frame_dt))
+            modal_ke_chunks.append(res["modal_ke"])
             modal_ke_t.append((frames_processed + 0.5 * (n_frames - 1)) * frame_dt)
-            del res, c_spectra
+            if res["maps_fine"] is not None:
+                for key, arr in res["maps_fine"].items():
+                    maps_fine.setdefault(key, []).append(arr)
+                maps_fine_t.append(block_centers(frames_processed, n_frames, FINE_MAP_BLOCK, frame_dt))
+                modal_fine.append(res["modal_ke_fine"])
+                modal_fine_t.append(block_centers(frames_processed, n_frames, FINE_MODAL_BLOCK, frame_dt))
+            del res
 
             frames_processed += n_frames
             if file_idx <= 9: # Files 0 through 9 represent the first 10 dispatches
@@ -255,11 +282,15 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
         "excitation_cutoff_frame": excitation_cutoff_frame,
         "field_exc": np.concatenate(field_chunks, axis=0) if field_chunks else None,
         "dispersion": finalize_dispersion(modal_acc, kw_acc, *spectra_meta) if spectra_meta else None,
-        "energy_density": np.concatenate(density_chunks, axis=0),
-        "energy_density_time": np.concatenate(density_t),
-        "p_damp": np.concatenate(p_damp_chunks),
+        "flow": {k: np.concatenate(v) for k, v in all_flow.items()},
+        "maps": {k: np.concatenate(v, axis=0) for k, v in maps.items()},
+        "maps_time": np.concatenate(maps_t),
+        "maps_fine": {k: np.concatenate(v, axis=0) for k, v in maps_fine.items()} if maps_fine else None,
+        "maps_fine_time": np.concatenate(maps_fine_t) if maps_fine_t else None,
         "modal_ke": np.stack(modal_ke_chunks),          # (chunks, n_modes, 2)
         "modal_ke_time": np.asarray(modal_ke_t),
+        "modal_ke_fine": np.concatenate(modal_fine, axis=0) if modal_fine else None,
+        "modal_ke_fine_time": np.concatenate(modal_fine_t) if modal_fine_t else None,
         "node_data": {
             n: {key: np.concatenate(vals) for key, vals in all_node_data[n].items()}
             for n in inspect_nodes
@@ -269,8 +300,8 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
         data[key] = np.concatenate(all_energy[key])
 
     # Free up collection lists aggressively
-    del all_node_data, all_energy, field_chunks, modal_acc, kw_acc
-    del density_chunks, p_damp_chunks, modal_ke_chunks
+    del all_node_data, all_energy, all_flow, field_chunks, modal_acc, kw_acc
+    del maps, maps_fine, modal_ke_chunks, modal_fine
     gc.collect()
     return data
 
@@ -289,6 +320,22 @@ def make_string_params(m_node, dl, K_se, K_bt, node_count=None, tension=None, le
     }
 
 
+def strike_onset(time, kinetic, rel=1e-3):
+    """Time of the first frame whose kinetic energy exceeds rel * its maximum
+    (robust against the small noise while the string is still at rest)."""
+    kinetic = np.asarray(kinetic, dtype=np.float64)
+    if not kinetic.size or kinetic.max() <= 0:
+        return None
+    return float(time[int(np.argmax(kinetic > rel * kinetic.max()))])
+
+
+def _rows_in(times, t0, t1):
+    if times is None:
+        return None
+    rows = (times >= t0) & (times <= t1)
+    return rows if rows.sum() > 1 else None
+
+
 def build_plot_tasks(data, output_dir, run_id, dt, oversamp, dl, inspect_nodes, string_params):
     """Queue every plot as (func, args, kwargs) for run_plot_tasks."""
     output_dir = Path(output_dir)
@@ -297,6 +344,9 @@ def build_plot_tasks(data, output_dir, run_id, dt, oversamp, dl, inspect_nodes, 
     excitation_cutoff_frame = data["excitation_cutoff_frame"]
     stitched_node_data = data["node_data"]
     field_exc = data["field_exc"]
+    flow = data.get("flow")
+    string_len = string_params["L"]
+    run_tag = f"run_{run_id:03d}"
 
     # Fundamental: measured (lowest resonance of the dispersion spectra) when
     # available, else ideal-string theory, else unknown.
@@ -308,111 +358,126 @@ def build_plot_tasks(data, output_dir, run_id, dt, oversamp, dl, inspect_nodes, 
             f1 = float(f_res[0])
     if f1 is None and string_params.get("T") is not None:
         f1 = np.sqrt(string_params["T"] / string_params["mu"]) / (2.0 * string_params["L"])
-    # Smoothing window for the transfer/flow plots: two fundamental periods.
-    transfer_window = 2.0 / f1 if f1 else 0.02
-    # Early transient window: the first three fundamental periods.
-    early_window = 3.0 / f1 if f1 else 0.03
+    period = 1.0 / f1 if f1 else 0.01
+    # KE-based transfer plots average over two periods (removes the KE<->PE
+    # swing); the share/family/flow plots of the long phases over one.
+    transfer_window = 2.0 * period
 
-    release_time = time[excitation_cutoff_frame] if 0 < excitation_cutoff_frame < time.size else None
-    density = data.get("energy_density")
-    density_t = data.get("energy_density_time")
-    density_base = density.min(axis=0) if density is not None else None
-    string_len = string_params["L"]
-
-    phases = {
-        "Excitation": (0, excitation_cutoff_frame),
-        "Free_Vibration": (excitation_cutoff_frame, None),
-        "Full_Simulation": (0, None)
-    }
+    # Transient: from just before the strike to three fundamental periods after.
+    onset = strike_onset(time, data["t_ke"].astype(np.float64) + data["r_ke"])
+    phases = {}
+    if onset is not None:
+        t0, t1 = onset - 1e-3, onset + 3.0 * period
+        phases["Transient"] = (int(np.searchsorted(time, t0)), int(np.searchsorted(time, t1)))
+    phases["Excitation"] = (0, excitation_cutoff_frame)
+    phases["Free_Vibration"] = (excitation_cutoff_frame, None)
+    phases["Full_Simulation"] = (0, None)
+    transient_label = f"Transient (strike + 3 periods, {3 * period * 1e3:.0f} ms)"
 
     plot_tasks = []
-
     for phase_name, (start, end) in phases.items():
         p_time = time[start:end]
+        if p_time.size < 3:
+            print(f"[{datetime.now()}] Skipping empty phase '{phase_name}' (no frames in this window).")
+            continue
         p_tke, p_rke, p_bpe, p_spe = (data[k][start:end] for k in ("t_ke", "r_ke", "bt_pe", "ss_pe"))
         p_tke_l, p_rke_t = data["t_ke_l"][start:end], data["r_ke_t"][start:end]
         p_bpe_tw, p_spe_ex = data["bt_pe_tw"][start:end], data["ss_pe_ex"][start:end]
+        p_flow = {k: v[start:end] for k, v in flow.items()} if flow else None
 
-        if p_time.size == 0:
-            print(f"[{datetime.now()}] Skipping empty phase '{phase_name}' (no frames in this window).")
-            continue
+        transient = phase_name == "Transient"
+        long_phase = phase_name in ("Free_Vibration", "Full_Simulation")
+        smooth = period if long_phase else None
+        energy_prefix = str(output_dir / f"{run_tag}_{phase_name}")
+        phase_title = transient_label if transient else phase_name.replace("_", " ")
+        p_onset = onset if onset is not None and p_time[0] <= onset <= p_time[-1] else None
 
-        energy_prefix = str(output_dir / f"run_{run_id:03d}_{phase_name}")
-        phase_title = phase_name.replace("_", " ")
-
-        # Queue Global Energy Plots (Only once per phase). Totals have their
-        # own plot so the component breakdown stays readable.
-        plot_tasks.append((plot_energies, (p_time, p_tke, p_rke, p_bpe, p_spe),
-                           {"title_prefix": phase_title, "filename": f"{energy_prefix}_energy.png"}))
+        # Energy overview plots.
         plot_tasks.append((plot_energy_totals, (p_time, p_tke, p_rke, p_bpe, p_spe),
                            {"title_prefix": phase_title, "filename": f"{energy_prefix}_energy_totals.png"}))
-        plot_tasks.append((plot_energies, (p_time, p_tke, p_rke, p_bpe, p_spe),
-                           {"normalized": True, "title_prefix": phase_title, "filename": f"{energy_prefix}_energy_norm.png"}))
-        plot_tasks.append((plot_energies, (p_time, p_tke, p_rke, p_bpe, p_spe),
-                           {"mode_transfer": True, "title_prefix": phase_title, "filename": f"{energy_prefix}_energy_mode.png"}))
-
-        # Fine-grained 8-way component split (all phases).
         plot_tasks.append((plot_energy_components,
                            (p_time, p_tke, p_rke, p_bpe, p_spe, p_tke_l, p_rke_t, p_bpe_tw, p_spe_ex),
-                           {"title_prefix": phase_title, "filename": f"{energy_prefix}_energy_components.png"}))
-        plot_tasks.append((plot_kinetic_trans_long, (p_time, p_tke, p_tke_l),
-                           {"window_s": transfer_window, "title_prefix": phase_title, "filename": f"{energy_prefix}_ke_trans_long.png"}))
+                           {"window_s": smooth, "title_prefix": phase_title,
+                            "filename": f"{energy_prefix}_energy_components.png"}))
+        if p_flow is not None:
+            plot_tasks.append((plot_energy_flow, (p_time, p_flow),
+                               {"window_s": smooth, "onset": p_onset, "period": period,
+                                "title_prefix": phase_title, "filename": f"{energy_prefix}_energy_flow.png"}))
 
-        # Energy flows: bookkeeping, per-component share, per-element map.
-        p_damp = data["p_damp"][start:end]
-        p_comps = energy_components(p_tke, p_rke, p_bpe, p_spe, p_tke_l, p_rke_t, p_bpe_tw, p_spe_ex)
-        plot_tasks.append((plot_energy_balance, (p_time, p_tke, p_rke, p_bpe, p_spe, p_damp),
-                           {"release_time": release_time, "title_prefix": phase_title,
-                            "filename": f"{energy_prefix}_energy_balance.png"}))
-        plot_tasks.append((plot_energy_share, (p_time, p_comps),
-                           {"window_s": transfer_window, "title_prefix": phase_title,
-                            "filename": f"{energy_prefix}_energy_share.png"}))
-        if density is not None:
-            rows = (density_t >= p_time[0]) & (density_t <= p_time[-1])
-            if rows.sum() > 1:
-                plot_tasks.append((plot_energy_density,
-                                   (density_t[rows], density[rows], density_base, string_len),
-                                   {"title_prefix": phase_title,
-                                    "filename": f"{energy_prefix}_energy_density.png"}))
-
-        # Decay envelopes only for the long phases (free vibration + full run).
-        if phase_name in ("Free_Vibration", "Full_Simulation"):
-            plot_tasks.append((plot_energy_envelope, (p_time, p_tke, p_rke, p_bpe, p_spe),
-                               {"title_prefix": phase_title, "filename": f"{energy_prefix}_energy_envelope.png"}))
+        if not transient:
+            for kw, suffix in (({}, "energy"), ({"normalized": True}, "energy_norm"),
+                               ({"mode_transfer": True}, "energy_mode")):
+                plot_tasks.append((plot_energies, (p_time, p_tke, p_rke, p_bpe, p_spe),
+                                   {**kw, "window_s": smooth, "title_prefix": phase_title,
+                                    "filename": f"{energy_prefix}_{suffix}.png"}))
+            p_comps = energy_components(p_tke, p_rke, p_bpe, p_spe, p_tke_l, p_rke_t, p_bpe_tw, p_spe_ex)
+            plot_tasks.append((plot_energy_share, (p_time, p_comps),
+                               {"window_s": transfer_window, "title_prefix": phase_title,
+                                "filename": f"{energy_prefix}_energy_share.png"}))
+            plot_tasks.append((plot_kinetic_trans_long, (p_time, p_tke, p_tke_l),
+                               {"window_s": transfer_window, "title_prefix": phase_title,
+                                "filename": f"{energy_prefix}_ke_trans_long.png"}))
+        if long_phase:
             plot_tasks.append((plot_kinetic_transfer, (p_time, p_tke, p_tke_l),
                                {"window_s": transfer_window, "title_prefix": phase_title,
                                 "filename": f"{energy_prefix}_ke_transfer.png"}))
-            plot_tasks.append((plot_motion_power, (p_time, p_comps, p_damp),
-                               {"window_s": transfer_window, "title_prefix": phase_title,
-                                "filename": f"{energy_prefix}_motion_power.png"}))
 
-        # Queue Node-Specific Plots
+        # Per-element maps: where along the string energy sits and transfers.
+        if transient or long_phase:
+            src, src_t = ((data.get("maps_fine"), data.get("maps_fine_time")) if transient
+                          else (data.get("maps"), data.get("maps_time")))
+            rows = _rows_in(src_t, p_time[0], p_time[-1]) if src is not None else None
+            if rows is not None:
+                for kind, suffix in (("trans", "element_energy_trans"), ("long", "element_energy_long"),
+                                     ("transfer", "element_transfer")):
+                    plot_tasks.append((plot_element_map, (src_t[rows], src[kind][rows], string_len, kind),
+                                       {"onset": p_onset, "title_prefix": phase_title,
+                                        "filename": f"{energy_prefix}_{suffix}.png"}))
+
+        # Whole-string displacement and modal energy during the transient.
+        if transient:
+            if field_exc is not None:
+                stop = min(end, field_exc.shape[0])
+                if stop - start > 2:
+                    spacing = string_len / (field_exc.shape[1] - 1)
+                    args = (time[start:stop], field_exc[start:stop], spacing)
+                    plot_tasks.append((plot_spacetime_heatmap, args,
+                                       {"title_prefix": phase_title, "filename": f"{energy_prefix}_heatmap.png"}))
+                    plot_tasks.append((plot_waterfall_3d, args,
+                                       {"title_prefix": phase_title, "filename": f"{energy_prefix}_waterfall.png"}))
+            rows = _rows_in(data.get("modal_ke_fine_time"), p_time[0], p_time[-1])
+            if rows is not None:
+                plot_tasks.append((plot_modal_energy,
+                                   (data["modal_ke_fine"][rows], data["modal_ke_fine_time"][rows]),
+                                   {"title_prefix": phase_title,
+                                    "filename": f"{energy_prefix}_modal_energy.png"}))
+
+        # Node-specific plots.
         for n in inspect_nodes:
-            p_pos = stitched_node_data[n]['pos'][start:end]
-            p_vel = stitched_node_data[n]['vel'][start:end]
-            p_mom = stitched_node_data[n]['mom'][start:end]
-            p_quats = stitched_node_data[n]['quats'][start:end]
-            p_omega = stitched_node_data[n]['omega'][start:end]
-
-            node_prefix = str(output_dir / f"run_{run_id:03d}_node_{n:03d}_{phase_name}")
+            nd = stitched_node_data[n]
+            p_pos, p_vel, p_mom = nd['pos'][start:end], nd['vel'][start:end], nd['mom'][start:end]
+            p_quats, p_omega = nd['quats'][start:end], nd['omega'][start:end]
+            node_prefix = str(output_dir / f"{run_tag}_node_{n:03d}_{phase_name}")
             node_title = f"Node {n} | {phase_title}"
 
-            plot_tasks.append((plot_node_pos_moment_fft, (p_time, p_pos, p_mom, dt, oversamp),
-                               {"moments": True, "title_prefix": node_title, "filename_prefix": f"{node_prefix}_fft"}))
-
+            if transient:
+                plot_tasks.append((plot_node_transient, (p_time, p_pos, p_vel),
+                                   {"onset": p_onset, "title_prefix": node_title,
+                                    "filename": f"{node_prefix}_motion.png"}))
+            else:
+                plot_tasks.append((plot_node_pos_moment_fft, (p_time, p_pos, p_mom, dt, oversamp),
+                                   {"moments": True, "title_prefix": node_title,
+                                    "filename_prefix": f"{node_prefix}_fft"}))
             plot_tasks.append((plot_axis_angle_over_time, (p_time, p_quats),
                                {"title_prefix": node_title, "filename": f"{node_prefix}_angles.png"}))
-
             plot_tasks.append((plot_angular_velocity, (p_time, p_omega),
-                               {"title_prefix": node_title, "filename": f"{node_prefix}_omega.png", "fs": fs_native}))
+                               {"title_prefix": node_title, "filename": f"{node_prefix}_omega.png",
+                                "fs": fs_native}))
 
-            # Full-run-only analyses (audio + spectral/decay/polarization);
-            # redundant to repeat these per phase.
+            # Full-run-only analyses (audio + spectral/decay/polarization).
             if phase_name == "Full_Simulation":
                 plot_tasks.append((generate_node_audio, (p_pos, p_vel, p_mom, fs_native),
-                                   {"title_prefix": node_title,
-                                    "filename_prefix": f"{node_prefix}_audio"}))
-
+                                   {"title_prefix": node_title, "filename_prefix": f"{node_prefix}_audio"}))
                 plot_tasks.append((plot_inharmonicity_comparison, (p_time, p_pos, dt, oversamp),
                                    {"title_prefix": node_title, "filename_prefix": node_prefix}))
                 plot_tasks.append((plot_inharmonicity_deviation, (p_time, p_pos, dt, oversamp),
@@ -426,46 +491,29 @@ def build_plot_tasks(data, output_dir, run_id, dt, oversamp, dl, inspect_nodes, 
                 plot_tasks.append((plot_node_spectrogram, (p_pos, fs_native),
                                    {"title_prefix": node_title, "filename": f"{node_prefix}_spectrogram.png"}))
 
-    # Transient (whole-string) plots for the excitation window
+    # Whole-string displacement over the full excitation window
     if field_exc is not None and field_exc.shape[0] > 2:
         exc_time = time[:field_exc.shape[0]]
-        # Physical node spacing (tuned length), so x matches the energy map.
         spacing = string_len / (field_exc.shape[1] - 1)
-        trans_prefix = str(output_dir / f"run_{run_id:03d}_transient")
-        trans_title = f"Run {run_id} | Excitation"
+        trans_prefix = str(output_dir / f"{run_tag}_Excitation")
         plot_tasks.append((plot_spacetime_heatmap, (exc_time, field_exc, spacing),
-                           {"title_prefix": trans_title, "filename": f"{trans_prefix}_heatmap.png"}))
+                           {"title_prefix": "Excitation", "filename": f"{trans_prefix}_heatmap.png"}))
         plot_tasks.append((plot_waterfall_3d, (exc_time, field_exc, spacing),
-                           {"title_prefix": trans_title, "filename": f"{trans_prefix}_waterfall.png"}))
-
-        # Early window: the first three fundamental periods only.
-        n_early = int(min(field_exc.shape[0], np.searchsorted(exc_time, early_window)))
-        if n_early > 2:
-            early_title = f"Run {run_id} | First {early_window * 1e3:.0f} ms (3 periods)" if f1 \
-                else f"Run {run_id} | First {early_window * 1e3:.0f} ms"
-            plot_tasks.append((plot_spacetime_heatmap, (exc_time[:n_early], field_exc[:n_early], spacing),
-                               {"title_prefix": early_title, "filename": f"{trans_prefix}_early_heatmap.png"}))
-            plot_tasks.append((plot_waterfall_3d, (exc_time[:n_early], field_exc[:n_early], spacing),
-                               {"title_prefix": early_title, "filename": f"{trans_prefix}_early_waterfall.png"}))
-            if density is not None:
-                rows = density_t <= early_window
-                if rows.sum() > 1:
-                    plot_tasks.append((plot_energy_density,
-                                       (density_t[rows], density[rows], density_base, string_len),
-                                       {"title_prefix": early_title,
-                                        "filename": f"{trans_prefix}_early_energy_density.png"}))
+                           {"title_prefix": "Excitation", "filename": f"{trans_prefix}_waterfall.png"}))
 
     # Energy per spatial mode over the whole run
     if data.get("modal_ke") is not None and len(data["modal_ke"]) > 1:
         plot_tasks.append((plot_modal_energy, (data["modal_ke"], data["modal_ke_time"]),
-                           {"title_prefix": f"Run {run_id} | Full Simulation",
-                            "filename": str(output_dir / f"run_{run_id:03d}_modal_energy.png")}))
+                           {"title_prefix": "Full Simulation",
+                            "filename": str(output_dir / f"{run_tag}_Full_Simulation_modal_energy.png")}))
 
-    # Dispersion relation from the streamed modal spectra (free vibration)
-    if data.get("dispersion") is not None:
-        plot_tasks.append((plot_dispersion, (data["dispersion"], string_params),
-                           {"title_prefix": f"Run {run_id} | Free Vibration",
-                            "filename": str(output_dir / f"run_{run_id:03d}_dispersion.png")}))
+    # Dispersion relation from the streamed modal spectra (free vibration),
+    # in physical units and normalised (mode number, v / c0).
+    if disp is not None:
+        for normalized, suffix in ((False, "dispersion"), (True, "dispersion_normalized")):
+            plot_tasks.append((plot_dispersion, (disp, string_params),
+                               {"normalized": normalized, "f1": f1, "title_prefix": "Free Vibration",
+                                "filename": str(output_dir / f"{run_tag}_{suffix}.png")}))
 
     return plot_tasks
 

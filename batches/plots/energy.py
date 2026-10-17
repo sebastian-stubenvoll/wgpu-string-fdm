@@ -2,9 +2,6 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
-from scipy.integrate import cumulative_trapezoid
-from scipy.signal import find_peaks
 from scipy.ndimage import maximum_filter1d
 
 
@@ -12,183 +9,96 @@ def _dynamic_above_baseline(x):
     return x - np.min(x)
 
 
-def _upper_envelope(y):
-    """Upper envelope of an oscillating signal, interpolated through its peaks.
+# Categorical palette (validated colour-blind safe on a white surface, adjacent
+# pairs). Every chart assigns slots in this fixed order, starting at slot 1.
+# Aqua, yellow and magenta sit below 3:1 contrast on white, so charts using them
+# carry a legend and direct labels.
+PALETTE = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+           "#e87ba4", "#008300", "#6250d6", "#e34948")
+INK = "#0b0b0b"
+INK_MUTED = "#52514e"
+GRID_KW = dict(color="#e1e0d9", linewidth=0.6)
 
-    Falls back to the raw signal when there are too few peaks to interpolate
-    (e.g. a smooth, monotonically decaying total).
+FAMILIES = ("Translational KE", "Rotational KE", "Bend/Twist PE", "Shear/Stretch PE")
+
+
+def _style_axis(ax):
+    ax.grid(True, **GRID_KW)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+
+
+def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe,
+                  normalized=False, mode_transfer=False, window_s=None,
+                  title_prefix="", filename=""):
+    """The four energy families: absolute (default), as a stacked share of the
+    dynamic energy (normalized) or as share lines (mode_transfer).
+
+    With window_s the families are smoothed over whole periods first, which
+    removes the KE<->PE swing inside every mode and leaves the slow trends.
     """
-    y = np.asarray(y, dtype=np.float64)
-    if y.size < 3:
-        return y
-    peaks, _ = find_peaks(y)
-    if peaks.size < 2:
-        return y
-    idx = np.concatenate(([0], peaks, [y.size - 1]))
-    return np.interp(np.arange(y.size), idx, y[idx])
+    time = np.asarray(time, dtype=np.float64)
+    fam = [np.asarray(trans_ke, np.float64), np.asarray(rot_ke, np.float64),
+           _dynamic_above_baseline(np.asarray(bend_pe, np.float64)),
+           _dynamic_above_baseline(np.asarray(shear_pe, np.float64))]
+    if window_s:
+        w = _window_frames(time, window_s)
+        fam = [_smooth(f, w) for f in fam]
+    smooth_note = f", smoothed over {window_s * 1e3:.1f} ms" if window_s else ""
 
-
-def plot_energies(time, trans_ke, rot_ke, bend_pe, shear_pe, print_totals=False,
-                  normalized=False, mode_transfer=False, title_prefix="", filename=""):
-
-    trans_ke = np.asarray(trans_ke, dtype=np.float64)
-    rot_ke = np.asarray(rot_ke, dtype=np.float64)
-    bend_pe = np.asarray(bend_pe, dtype=np.float64)
-    shear_pe = np.asarray(shear_pe, dtype=np.float64)
-
-    fig = plt.figure(figsize=(12, 6))
-
+    fig, ax = plt.subplots(figsize=(12, 6))
     if normalized or mode_transfer:
-        bend_dyn = _dynamic_above_baseline(bend_pe)
-        shear_dyn = _dynamic_above_baseline(shear_pe)
-        kin = trans_ke + rot_ke
-        pot = bend_dyn + shear_dyn
-        total = kin + pot
-
+        total = np.sum(fam, axis=0)
         peak = np.max(total) if total.size else 0.0
-        active = total > (1e-3 * peak) if peak > 0 else np.zeros_like(total, dtype=bool)
-
-        def fraction(x, fill):
-            out = np.full_like(x, fill)
-            np.divide(x, total, out=out, where=active)
-            return out
-
-        active_idx = np.nonzero(active)[0]
-        if active_idx.size:
-            t0, t1 = time[active_idx[0]], time[active_idx[-1]]
-            span = max(t1 - t0, 1e-9)
-            view = (max(float(time[0]), t0 - 0.02 * span),
-                    min(float(time[-1]), t1 + 0.02 * span))
-        else:
-            view = (float(time[0]), float(time[-1]))
-
+        active = total > 1e-3 * peak if peak > 0 else np.zeros_like(total, dtype=bool)
+        fracs = []
+        for f in fam:
+            out = np.full_like(f, 0.0 if normalized else np.nan)
+            np.divide(f, total, out=out, where=active)
+            fracs.append(out)
         if normalized:
-            trans = fraction(trans_ke, 0.0)
-            rot = fraction(rot_ke, 0.0)
-            bend = fraction(bend_dyn, 0.0)
-            shear = fraction(shear_dyn, 0.0)
-
-            plt.stackplot(
-                time, trans, rot, bend, shear,
-                labels=["Translational KE", "Rotational KE",
-                        "Bend/Twist PE", "Shear/Stretch PE"],
-                colors=["tab:blue", "tab:orange", "tab:green", "tab:red"],
-            )
-            plt.ylim(0, 1)
-            plt.xlim(*view)
-            plt.ylabel("Fraction of Dynamic Energy")
-            title = f"[{title_prefix}] Energy Distribution (dynamic; ringing window)"
-        else:  
-            trans = fraction(trans_ke, np.nan)
-            rot = fraction(rot_ke, np.nan)
-            bend = fraction(bend_dyn, np.nan)
-            shear = fraction(shear_dyn, np.nan)
-
-            plt.plot(time, trans, label="Translational KE", alpha=0.5, linestyle=':')
-            plt.plot(time, rot, label="Rotational KE", alpha=0.5, linestyle=':')
-            plt.plot(time, bend, label="Bend/Twist PE", alpha=0.5, linestyle=':')
-            plt.plot(time, shear, label="Shear/Stretch PE", alpha=0.5, linestyle=':')
-            if print_totals:
-                plt.plot(time, fraction(kin, np.nan), label="Total kinetic",
-                         linewidth=2, color='blue')
-                plt.plot(time, fraction(pot, np.nan), label="Total potential",
-                         linewidth=2, color='orange')
-            plt.ylim(-0.05, 1.05)
-            plt.xlim(*view)
-            plt.ylabel("Fraction of Dynamic Energy")
-            title = f"[{title_prefix}] Energy Mode Transfer (dynamic fraction)"
+            ax.stackplot(time, *fracs, labels=FAMILIES, colors=PALETTE[:4],
+                         edgecolor="white", linewidth=0.3)
+            ax.set_ylim(0, 1)
+            title = f"[{title_prefix}] Energy Distribution (stacked share{smooth_note})"
+        else:
+            for f, label, color in zip(fracs, FAMILIES, PALETTE):
+                ax.plot(time, f, color=color, linewidth=1.2, label=label)
+            ax.set_ylim(-0.02, 1.02)
+            title = f"[{title_prefix}] Energy Share per Family{smooth_note}"
+        ax.set_ylabel("Fraction of dynamic energy")
+        ax.set_xlim(time[0], time[-1])
     else:
-        # Kinetic energy is zero at rest (no static offset) so it is shown as-is.
-        # The potentials carry a large static tension baseline; we remove it by
-        # subtracting the quiescent value (a constant), which keeps every curve
-        # >= 0 and makes the total system energy a clean, decaying mechanical energy
-        # equal to the sum of the plotted components.
-        bend_dyn = _dynamic_above_baseline(bend_pe)
-        shear_dyn = _dynamic_above_baseline(shear_pe)
+        for f, label, color in zip(fam, FAMILIES, PALETTE):
+            ax.plot(time, f, color=color, linewidth=1.0, label=label)
+        ax.set_ylabel("Energy (J)")
+        title = f"[{title_prefix}] Energy per Family (offset removed{smooth_note})"
 
-        total_kin = trans_ke + rot_ke
-        total_pot = bend_dyn + shear_dyn
-        total_energy = total_kin + total_pot
-
-        title = f"[{title_prefix}] Cosserat Rod Energy Breakdown (Offset Removed)"
-        plt.plot(time, trans_ke, label="Translational KE", alpha=0.4, linestyle=':')
-        plt.plot(time, rot_ke, label="Rotational KE", alpha=0.4, linestyle=':')
-        plt.plot(time, bend_dyn, label="Bend/Twist PE", alpha=0.4, linestyle=':')
-        plt.plot(time, shear_dyn, label="Shear/Stretch PE", alpha=0.4, linestyle=':')
-
-        if print_totals:
-            plt.plot(time, total_kin, label="Total kinetic", linewidth=2, color='blue')
-            plt.plot(time, total_pot, label="Total potential", linewidth=2, color='orange')
-            plt.plot(time, total_energy, label="Total system energy",
-                     color='gray', linestyle='--', linewidth=1.5)
-        plt.ylabel("Energy (Joules)")
-
-    plt.title(title)
-    plt.xlabel("Time (s)")
-    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    plt.grid(True, alpha=0.3)
+    ax.set_title(title)
+    ax.set_xlabel("Time (s)")
+    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), frameon=False)
+    _style_axis(ax)
     plt.tight_layout()
-
     plt.savefig(filename, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return [filename]
 
 
-def plot_energy_envelope(time, trans_ke, rot_ke, bend_pe, shear_pe,
-                         title_prefix="", filename=""):
-    """Decay overview for the long phases: the total energies as thin lines,
-    with peak-interpolated envelopes for the oscillating kinetic/potential."""
-    trans_ke = np.asarray(trans_ke, dtype=np.float64)
-    rot_ke = np.asarray(rot_ke, dtype=np.float64)
-    bend_pe = np.asarray(bend_pe, dtype=np.float64)
-    shear_pe = np.asarray(shear_pe, dtype=np.float64)
-
-    bend_dyn = _dynamic_above_baseline(bend_pe)
-    shear_dyn = _dynamic_above_baseline(shear_pe)
-
-    total_kin = trans_ke + rot_ke
-    total_pot = bend_dyn + shear_dyn
-    total_energy = total_kin + total_pot
-
-    fig = plt.figure(figsize=(12, 6))
-
-    # Faint raw totals for context, envelopes on top as the readable lines.
-    plt.plot(time, total_kin, color='blue', alpha=0.15, linewidth=0.5)
-    plt.plot(time, total_pot, color='orange', alpha=0.15, linewidth=0.5)
-
-    plt.plot(time, _upper_envelope(total_kin), color='blue', linewidth=1.0,
-             label="Kinetic (envelope)")
-    plt.plot(time, _upper_envelope(total_pot), color='orange', linewidth=1.0,
-             label="Potential (envelope)")
-    plt.plot(time, total_energy, color='gray', linestyle='--', linewidth=1.0,
-             label="Total system energy")
-
-    plt.title(f"[{title_prefix}] Energy Decay Envelopes (Offset Removed)")
-    plt.xlabel("Time (s)")
-    plt.ylabel("Energy (Joules)")
-    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-
-    plt.savefig(filename, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return [filename]
-
-
-# The eight energy components: (label, family colour, axial?). Colour by family,
-# transverse solid / axial dashed. The potential parts are split by *strain
+# The eight energy components: (label, colour, axial?), one palette slot each.
+# The potential parts are split by *strain
 # component*, not by motion: with shear stiffness far above the tension, the
 # frame follows the tangent and a transverse slope shows up as axial strain, so
 # the transverse wave's potential energy lives in "axial strain".
 COMPONENTS = (
-    ("Transversal kinetic", 'tab:blue', False),
-    ("Longitudinal kinetic", 'tab:blue', True),
-    ("Tilting rotation", 'tab:orange', False),
-    ("Torsional rotation", 'tab:orange', True),
-    ("Bending", 'tab:green', False),
-    ("Twisting", 'tab:green', True),
-    ("Shear strain", 'tab:red', False),
-    ("Axial strain (incl. transverse-wave tension)", 'tab:red', True),
+    ("Transversal kinetic", PALETTE[0], False),
+    ("Longitudinal kinetic", PALETTE[1], True),
+    ("Tilting rotation", PALETTE[2], False),
+    ("Torsional rotation", PALETTE[3], True),
+    ("Bending", PALETTE[4], False),
+    ("Twisting", PALETTE[5], True),
+    ("Shear strain", PALETTE[6], False),
+    ("Axial strain (incl. transverse-wave tension)", PALETTE[7], True),
 )
 
 
@@ -217,25 +127,29 @@ def energy_components(trans_ke, rot_ke, bend_pe, shear_pe,
 
 def plot_energy_components(time, trans_ke, rot_ke, bend_pe, shear_pe,
                            trans_ke_long, rot_ke_tor, bend_pe_twist, shear_pe_ext,
-                           title_prefix="", filename=""):
+                           window_s=None, title_prefix="", filename=""):
     """Fine-grained breakdown: each of the four energy families split into its
     transverse and axial parts (eight lines total). Only the kinetic split
     (v_x vs v_y, v_z) cleanly separates transverse from longitudinal motion;
     the potential split is by strain component (see COMPONENTS)."""
+    time = np.asarray(time, dtype=np.float64)
     comps = energy_components(trans_ke, rot_ke, bend_pe, shear_pe,
                               trans_ke_long, rot_ke_tor, bend_pe_twist, shear_pe_ext)
+    if window_s:
+        w = _window_frames(time, window_s)
+        comps = [_smooth(c, w) for c in comps]
+    smooth_note = f", smoothed over {window_s * 1e3:.1f} ms" if window_s else ""
 
-    fig = plt.figure(figsize=(12, 6))
-    for y, (label, color, axial) in zip(comps, COMPONENTS):
-        plt.plot(time, y, color=color, linewidth=1.0, linestyle='--' if axial else '-', label=label)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for y, (label, color, _) in zip(comps, COMPONENTS):
+        ax.plot(time, y, color=color, linewidth=1.0, label=label)
 
-    plt.title(f"[{title_prefix}] Energy Component Breakdown (Offset Removed)")
-    plt.xlabel("Time (s)")
-    plt.ylabel("Energy (Joules)")
-    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    plt.grid(True, alpha=0.3)
+    ax.set_title(f"[{title_prefix}] Energy Component Breakdown (offset removed{smooth_note})")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Energy (J)")
+    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), frameon=False)
+    _style_axis(ax)
     plt.tight_layout()
-
     plt.savefig(filename, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return [filename]
@@ -243,8 +157,7 @@ def plot_energy_components(time, trans_ke, rot_ke, bend_pe, shear_pe,
 
 def plot_energy_totals(time, trans_ke, rot_ke, bend_pe, shear_pe,
                        title_prefix="", filename=""):
-    """Totals only: kinetic, potential and system energy on top, and the system
-    energy alone on its own y-scale below so decay/drift is readable."""
+    """Totals only: kinetic, potential and total system energy."""
     trans_ke = np.asarray(trans_ke, dtype=np.float64)
     rot_ke = np.asarray(rot_ke, dtype=np.float64)
     total_kin = trans_ke + rot_ke
@@ -252,26 +165,15 @@ def plot_energy_totals(time, trans_ke, rot_ke, bend_pe, shear_pe,
                  + _dynamic_above_baseline(np.asarray(shear_pe, dtype=np.float64)))
     total_energy = total_kin + total_pot
 
-    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(12, 8), sharex=True,
-                                         gridspec_kw={"height_ratios": [3, 2]})
-
-    ax_top.plot(time, total_kin, color='tab:blue', linewidth=0.6, alpha=0.6,
-                label="Total kinetic")
-    ax_top.plot(time, total_pot, color='tab:orange', linewidth=0.6, alpha=0.6,
-                label="Total potential")
-    ax_top.plot(time, total_energy, color='black', linewidth=2.0, zorder=5,
-                label="Total system energy")
-    ax_top.set_ylabel("Energy (Joules)")
-    ax_top.set_title(f"[{title_prefix}] Total Energies (Offset Removed)")
-    ax_top.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    ax_top.grid(True, alpha=0.3)
-
-    ax_bot.plot(time, total_energy, color='black', linewidth=1.2)
-    ax_bot.set_ylabel("System Energy (Joules)")
-    ax_bot.set_xlabel("Time (s)")
-    ax_bot.set_title("Total system energy (own scale)")
-    ax_bot.grid(True, alpha=0.3)
-
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(time, total_kin, color=PALETTE[0], linewidth=0.8, label="Total kinetic")
+    ax.plot(time, total_pot, color=PALETTE[1], linewidth=0.8, label="Total potential")
+    ax.plot(time, total_energy, color=INK, linewidth=2.0, zorder=5, label="Total system energy")
+    ax.set_ylabel("Energy (J)")
+    ax.set_xlabel("Time (s)")
+    ax.set_title(f"[{title_prefix}] Total Energies (offset removed)")
+    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), frameon=False)
+    _style_axis(ax)
     plt.tight_layout()
     plt.savefig(filename, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -330,11 +232,9 @@ def plot_kinetic_trans_long(time, trans_ke, trans_ke_long, window_s=0.02,
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(12, 8), sharex=True,
                                          gridspec_kw={"height_ratios": [3, 2]})
 
-    ax_top.plot(time, np.maximum(transv_ke, tiny), color='tab:blue', alpha=0.2, linewidth=0.5)
-    ax_top.plot(time, np.maximum(long_ke, tiny), color='tab:purple', alpha=0.2, linewidth=0.5)
-    ax_top.plot(time, np.maximum(env_t, tiny), color='tab:blue', linewidth=1.2,
+    ax_top.plot(time, np.maximum(env_t, tiny), color=PALETTE[0], linewidth=1.2,
                 label="Transversal KE (envelope)")
-    ax_top.plot(time, np.maximum(env_l, tiny), color='tab:purple', linewidth=1.2,
+    ax_top.plot(time, np.maximum(env_l, tiny), color=PALETTE[1], linewidth=1.2,
                 label="Longitudinal KE (envelope)")
     ax_top.set_yscale('log')
     positive = np.concatenate([env_t[env_t > 0], env_l[env_l > 0]])
@@ -348,7 +248,7 @@ def plot_kinetic_trans_long(time, trans_ke, trans_ke_long, window_s=0.02,
     ratio = np.full_like(env_t, np.nan)
     np.divide(env_l, env_t, out=ratio, where=env_t > 0)
     ratio[ratio <= 0] = np.nan
-    ax_bot.plot(time, ratio, color='tab:gray', linewidth=1.0)
+    ax_bot.plot(time, ratio, color=INK_MUTED, linewidth=1.0)
     ax_bot.set_yscale('log')
     ax_bot.set_ylabel("E_long / E_trans (envelopes)")
     ax_bot.set_xlabel("Time (s)")
@@ -389,11 +289,11 @@ def plot_kinetic_transfer(time, trans_ke, trans_ke_long, window_s=0.02,
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
 
     ax = axes[0]
-    ax.plot(time, avg_t, color='tab:blue', label="\u27e8Transversal KE\u27e9")
-    ax.set_ylabel("Transversal (J)", color='tab:blue')
+    ax.plot(time, avg_t, color=PALETTE[0], label="\u27e8Transversal KE\u27e9")
+    ax.set_ylabel("Transversal (J)", color=PALETTE[0])
     ax2 = ax.twinx()
-    ax2.plot(time, avg_l, color='tab:purple', label="\u27e8Longitudinal KE\u27e9")
-    ax2.set_ylabel("Longitudinal (J)", color='tab:purple')
+    ax2.plot(time, avg_l, color=PALETTE[1], label="\u27e8Longitudinal KE\u27e9")
+    ax2.set_ylabel("Longitudinal (J)", color=PALETTE[1])
     lines = ax.get_lines() + ax2.get_lines()
     ax.legend(lines, [l.get_label() for l in lines], loc='upper right')
     ax.set_title(f"[{title_prefix}] Transversal \u2194 Longitudinal Kinetic Energy Transfer "
@@ -401,7 +301,7 @@ def plot_kinetic_transfer(time, trans_ke, trans_ke_long, window_s=0.02,
     ax.grid(True, alpha=0.3)
 
     ax = axes[1]
-    ax.plot(time, share, color='tab:gray')
+    ax.plot(time, share, color=INK_MUTED)
     ax.set_ylabel("Longitudinal share")
     ax.grid(True, alpha=0.3)
 
@@ -409,16 +309,16 @@ def plot_kinetic_transfer(time, trans_ke, trans_ke_long, window_s=0.02,
     # (both centred on zero so the sign comparison reads directly).
     ax = axes[2]
     ax.axhline(0.0, color='black', linewidth=0.8)
-    ax.plot(time, p_t, color='tab:blue', linewidth=1.0, label="d\u27e8E_trans\u27e9/dt")
-    ax.set_ylabel("Transversal power (W)", color='tab:blue')
+    ax.plot(time, p_t, color=PALETTE[0], linewidth=1.0, label="d\u27e8E_trans\u27e9/dt")
+    ax.set_ylabel("Transversal power (W)", color=PALETTE[0])
     ax2 = ax.twinx()
-    ax2.plot(time, p_l, color='tab:purple', linewidth=1.0, label="d\u27e8E_long\u27e9/dt")
+    ax2.plot(time, p_l, color=PALETTE[1], linewidth=1.0, label="d\u27e8E_long\u27e9/dt")
     # Longitudinal gains while transversal loses -> transfer trans -> long.
-    ax2.fill_between(time, 0, p_l, where=(p_l > 0) & (p_t < 0), color='tab:purple',
+    ax2.fill_between(time, 0, p_l, where=(p_l > 0) & (p_t < 0), color=PALETTE[1],
                      alpha=0.25, label="trans \u2192 long")
-    ax2.fill_between(time, 0, p_l, where=(p_l < 0) & (p_t > 0), color='tab:blue',
+    ax2.fill_between(time, 0, p_l, where=(p_l < 0) & (p_t > 0), color=PALETTE[0],
                      alpha=0.25, label="long \u2192 trans")
-    ax2.set_ylabel("Longitudinal power (W)", color='tab:purple')
+    ax2.set_ylabel("Longitudinal power (W)", color=PALETTE[1])
     for a, p in ((ax, p_t), (ax2, p_l)):
         lim = 1.1 * np.nanmax(np.abs(p)) if np.any(np.isfinite(p)) and np.nanmax(np.abs(p)) > 0 else 1.0
         a.set_ylim(-lim, lim)
@@ -442,7 +342,8 @@ def block_mean(a, block):
     """Mean over consecutive blocks of `block` rows (last block may be short)."""
     starts = np.arange(0, a.shape[0], block)
     counts = np.diff(np.append(starts, a.shape[0]))
-    return (np.add.reduceat(a, starts, axis=0) / counts[:, None]).astype(np.float32)
+    counts = counts.reshape((-1,) + (1,) * (a.ndim - 1))
+    return (np.add.reduceat(a, starts, axis=0) / counts).astype(np.float32)
 
 
 def block_centers(offset, n_frames, block, frame_dt):
@@ -450,162 +351,6 @@ def block_centers(offset, n_frames, block, frame_dt):
     starts = np.arange(0, n_frames, block)
     counts = np.diff(np.append(starts, n_frames))
     return (offset + starts + 0.5 * (counts - 1)) * frame_dt
-
-
-def plot_energy_density(time, density, baseline, length, title_prefix="", filename=""):
-    """Total energy of every node/element over time (heatmap).
-
-    density: (rows, N) block-averaged per-element energy (node terms plus half
-    of each adjacent edge), baseline: (N,) per-element static energy (its
-    minimum over the whole run) which is subtracted.
-    """
-    e = np.asarray(density, dtype=np.float64) - np.asarray(baseline, dtype=np.float64)[None, :]
-    peak = float(e.max()) if e.size else 0.0
-    if peak <= 0:
-        peak = 1.0
-    e = np.maximum(e, peak * 1e-6)
-    n = e.shape[1]
-    x = np.linspace(0.0, length, n)
-    t = np.asarray(time, dtype=np.float64)
-    dt = (t[1] - t[0]) if t.size > 1 else 1e-3
-    dx = x[1] - x[0]
-
-    fig, ax = plt.subplots(figsize=(12, 7))
-    im = ax.imshow(e, aspect='auto', origin='lower', interpolation='nearest', cmap='inferno',
-                   norm=LogNorm(vmin=peak * 1e-6, vmax=peak),
-                   extent=(x[0] - dx / 2, x[-1] + dx / 2, t[0] - dt / 2, t[-1] + dt / 2))
-    fig.colorbar(im, ax=ax, label="Energy per element (J, static part removed)")
-    ax.set_xlabel("Position along string (m)")
-    ax.set_ylabel("Time (s)")
-    ax.set_title(f"[{title_prefix}] Energy per Node/Element")
-    plt.tight_layout()
-    plt.savefig(filename, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return [filename]
-
-
-def plot_energy_balance(time, trans_ke, rot_ke, bend_pe, shear_pe, p_damp, release_time=None,
-                        title_prefix="", filename=""):
-    """Energy bookkeeping: stored energy E, cumulative damping loss D and E + D.
-
-    With all losses accounted for, E + D only changes while the hammer does
-    work; after release it should stay flat. Any remaining drift is energy the
-    bookkeeping can't explain (integrator error or energy-formula mismatch).
-    """
-    time = np.asarray(time, dtype=np.float64)
-    stored = (np.asarray(trans_ke, np.float64) + np.asarray(rot_ke, np.float64)
-              + _dynamic_above_baseline(np.asarray(bend_pe, np.float64))
-              + _dynamic_above_baseline(np.asarray(shear_pe, np.float64)))
-    dissipated = cumulative_trapezoid(np.asarray(p_damp, np.float64), time, initial=0.0)
-    budget = stored + dissipated
-
-    has_release = release_time is not None and time[0] < release_time < time[-1]
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [3, 2]})
-
-    ax = axes[0]
-    ax.plot(time, stored, color='tab:blue', linewidth=0.8, label="Stored E (offset removed)")
-    ax.plot(time, dissipated, color='tab:red', linewidth=1.2, label="Dissipated D = \u222bP_damp dt")
-    ax.plot(time, budget, color='black', linewidth=1.6, label="E + D")
-    title = f"[{title_prefix}] Energy Balance"
-    if has_release:
-        i_rel = int(np.searchsorted(time, release_time))
-        hammer_in = budget[i_rel] - budget[0]
-        ax.axvline(release_time, color='tab:gray', linestyle=':', label="End of excitation window")
-        title += f" (hammer input \u2248 {hammer_in:.3g} J)"
-    ax.set_ylabel("Energy (J)")
-    ax.set_title(title)
-    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    ax.grid(True, alpha=0.3)
-
-    # Drift of E + D relative to a reference point: the end of the excitation
-    # window if it's in range, else the phase start.
-    ax = axes[1]
-    i_ref = int(np.searchsorted(time, release_time)) if has_release else 0
-    scale = np.max(np.abs(budget)) if budget.size and np.max(np.abs(budget)) > 0 else 1.0
-    drift = 100.0 * (budget - budget[i_ref]) / scale
-    ax.plot(time[i_ref:], drift[i_ref:], color='black', linewidth=1.0)
-    ax.axhline(0.0, color='tab:gray', linewidth=0.8)
-    ax.set_ylabel("E + D drift (% of peak)")
-    ax.set_xlabel("Time (s)")
-    ax.set_title("Unaccounted energy after " + ("the excitation window" if has_release else "phase start"))
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(filename, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return [filename]
-
-
-def plot_motion_power(time, comps, p_damp, window_s=0.02, title_prefix="", filename=""):
-    """Power flowing into (+) / out of (-) each kind of motion.
-
-    Subsystem energies come from kinetic energy only (the one split that
-    cleanly separates motion types), using E ~ 2<KE> (virial theorem, averaged
-    over whole periods via window_s):
-      transverse   = 2<transversal KE + tilting rotation KE>
-      longitudinal = 2<longitudinal KE>
-      torsional    = 2<torsional rotation KE>
-    Each gets its own panel and scale; a shared panel of relative rates
-    (dE/dt)/E makes subsystems of very different sizes comparable.
-    comps: the eight energy_components() arrays (COMPONENTS order).
-    """
-    time = np.asarray(time, dtype=np.float64)
-    window = _window_frames(time, window_s)
-    systems = (
-        ("Transverse", 'tab:blue', 2.0 * (np.asarray(comps[0]) + np.asarray(comps[2]))),
-        ("Longitudinal", 'tab:purple', 2.0 * np.asarray(comps[1])),
-        ("Torsional", 'tab:orange', 2.0 * np.asarray(comps[3])),
-    )
-
-    fig, axes = plt.subplots(5, 1, figsize=(12, 15), sharex=True)
-    rel_vals = []
-    for ax, (name, color, e_raw) in zip(axes[:3], systems):
-        e = _smooth(e_raw, window)
-        p = _blank_edges(np.gradient(e, time) if time.size > 1 else np.zeros_like(e), window)
-        ax.axhline(0.0, color='black', linewidth=0.6)
-        ax.plot(time, p, color=color, linewidth=1.0)
-        if np.any(np.isfinite(p)) and np.nanmax(np.abs(p)) > 0:
-            lim = 1.1 * np.nanmax(np.abs(p))
-            ax.set_ylim(-lim, lim)
-        ax.set_ylabel("dE/dt (W)")
-        ax.set_title(f"{name} motion", fontsize=10, loc='left')
-        ax.grid(True, alpha=0.3)
-
-        # Relative rate, masked where the subsystem holds almost no energy.
-        rel = np.full_like(p, np.nan)
-        ok = np.isfinite(p) & (e > 1e-3 * np.max(e)) if e.size and np.max(e) > 0 else np.zeros_like(p, bool)
-        rel[ok] = p[ok] / e[ok]
-        axes[3].plot(time, rel, color=color, linewidth=1.0, label=name)
-        rel_vals.append(rel[np.isfinite(rel)])
-
-    ax = axes[3]
-    ax.axhline(0.0, color='black', linewidth=0.6)
-    vals = np.concatenate(rel_vals) if rel_vals else np.array([])
-    if vals.size:
-        lo, hi = np.percentile(vals, [1, 99])
-        pad = 0.1 * max(hi - lo, 1e-12)
-        ax.set_ylim(lo - pad, hi + pad)
-    ax.set_ylabel("(dE/dt) / E (1/s)")
-    ax.set_title("Relative rate (comparable across subsystems)", fontsize=10, loc='left')
-    ax.legend(loc='upper right', fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[4]
-    ax.plot(time, -_smooth(np.asarray(p_damp, np.float64), window), color='black', linewidth=1.0,
-            label="\u2212 damping power")
-    ax.axhline(0.0, color='tab:gray', linewidth=0.6)
-    ax.set_ylabel("Loss (W)")
-    ax.set_xlabel("Time (s)")
-    ax.set_title("Dissipation", fontsize=10, loc='left')
-    ax.legend(loc='upper right', fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    fig.suptitle(f"[{title_prefix}] Power per Motion Type (E \u2248 2\u27e8KE\u27e9, "
-                 f"smoothed over {window_s * 1e3:.1f} ms)")
-    plt.tight_layout()
-    plt.savefig(filename, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return [filename]
 
 
 def plot_energy_share(time, comps, window_s=0.02, title_prefix="", filename=""):
@@ -620,8 +365,8 @@ def plot_energy_share(time, comps, window_s=0.02, title_prefix="", filename=""):
     np.divide(sm, total, out=frac, where=active[None, :] & (sm > 0))
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    for y, (label, color, axial) in zip(frac, COMPONENTS):
-        ax.plot(time, y, color=color, linewidth=1.0, linestyle='--' if axial else '-', label=label)
+    for y, (label, color, _) in zip(frac, COMPONENTS):
+        ax.plot(time, y, color=color, linewidth=1.2, label=label)
     ax.set_yscale('log')
     positive = frac[np.isfinite(frac) & (frac > 0)]
     lo = max(positive.min(), 1e-10) if positive.size else 1e-10
@@ -630,8 +375,8 @@ def plot_energy_share(time, comps, window_s=0.02, title_prefix="", filename=""):
     ax.set_ylabel("Share of dynamic energy")
     ax.set_xlabel("Time (s)")
     ax.set_title(f"[{title_prefix}] Energy Share per Component (smoothed over {window_s * 1e3:.1f} ms)")
-    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    ax.grid(True, which='both', alpha=0.3)
+    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), frameon=False)
+    _style_axis(ax)
     plt.tight_layout()
     plt.savefig(filename, dpi=200, bbox_inches="tight")
     plt.close(fig)

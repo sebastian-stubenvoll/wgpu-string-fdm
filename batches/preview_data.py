@@ -13,6 +13,7 @@ from scipy.spatial.transform import Rotation as R
 from config import SIM_CONFIG, ROD_PARAMS
 from utils import generate_straight_rod
 from plots.energy import ENERGY_DENSITY_BLOCK, block_mean, block_centers
+from plots.energy_flow import motion_decomposition, edges_to_nodes
 from plots.dispersion import (modal_projection, kspace_grid, kspace_projection, StreamingModalSpectra,
                               StreamingKOmegaSpectra, finalize_dispersion)
 
@@ -66,7 +67,6 @@ def make_preview_data(node_count=128, duration=1.0, chunk=512, n_exc_chunks=10,
     C_t = np.cos(np.outer(x, k_t)) * k_t              # d/dx of mode shapes
     S2_t = -S_t * k_t ** 2                            # d2/dx2
     S_l = np.sin(np.outer(x, k_l))
-    C_l = np.cos(np.outer(x, k_l)) * k_l
 
     # Longitudinal amplitude from the geometric-nonlinearity estimate
     # E_L / E_T ~ (EA / 4T) <u'^2>: the transverse slopes stretch the string,
@@ -107,7 +107,10 @@ def make_preview_data(node_count=128, duration=1.0, chunk=512, n_exc_chunks=10,
                               "t_ke_l", "r_ke_t", "bt_pe_tw", "ss_pe_ex")}
     node_data = {n: {k: [] for k in ("pos", "vel", "mom", "quats", "omega")} for n in inspect_nodes}
     field_chunks = []
-    density_chunks, density_t, p_damp_chunks, modal_ke_chunks, modal_ke_t = [], [], [], [], []
+    flow = {}
+    maps, maps_t, maps_fine, maps_fine_t = {}, [], {}, []
+    modal_ke_chunks, modal_ke_t, modal_fine, modal_fine_t = [], [], [], []
+    fine_map_block, fine_modal_block = 4, 32
     dx = L / (node_count - 1)
     modal_acc = StreamingModalSpectra(fs, nperseg=nperseg)
     kw_acc = StreamingKOmegaSpectra(fs, nperseg=nperseg)
@@ -145,27 +148,38 @@ def make_preview_data(node_count=128, duration=1.0, chunk=512, n_exc_chunks=10,
         energy["ss_pe"].append(tens + ext)
         energy["ss_pe_ex"].append(tens - shear + ext)
 
-        # Viscous damping power, matching the modal decay: <P> = 2 sigma E = 4 sigma <KE>.
-        p_damp_chunks.append(4.0 * 0.5 * mu * half_L * (v_y ** 2 + v_z ** 2) @ sig_t)
-
         # Full grid field for this chunk only: (frames, nodes, 3) as X, Y, Z.
         pos = np.stack([a_x @ S_l.T, a_y @ S_t.T, a_z @ S_t.T], axis=2).astype(np.float32)
         vel_grid = np.stack([v_x @ S_l.T, v_y @ S_t.T, v_z @ S_t.T], axis=2)
 
-        # Per-element energy (KE + tension, bending and extension PE + an even
-        # share of the static baseline), block-averaged like the real worker.
-        elem = (0.5 * m_node * np.sum(vel_grid ** 2, axis=2)
-                + 0.5 * T * ((a_y @ C_t.T) ** 2 + (a_z @ C_t.T) ** 2) * dx
-                + 0.5 * EI * ((a_y @ S2_t.T) ** 2 + (a_z @ S2_t.T) ** 2) * dx
-                + 0.5 * EA * (a_x @ C_l.T) ** 2 * dx) * weights + static_ext / node_count
-        density_chunks.append(block_mean(elem, ENERGY_DENSITY_BLOCK))
-        density_t.append(block_centers(c * chunk, t.size, ENERGY_DENSITY_BLOCK, 1.0 / fs))
+        # Motion decomposition and transfer power, exactly as the real worker
+        # does it (the synthetic longitudinal motion is prescribed, not driven
+        # by the coupling, so the flow plot's consistency check won't close).
+        dec = motion_decomposition(pos, vel_grid, dx, dl, m_node, EA)
+        bend_node = 0.5 * EI * ((a_y @ S2_t.T) ** 2 + (a_z @ S2_t.T) ** 2) * dx * weights
+        e_trans = dec["ke_t"] + bend_node + edges_to_nodes(dec["pe_t"])
+        e_long = dec["ke_l"] + edges_to_nodes(dec["pe_l"])
+        for key, val in (("E_T", e_trans.sum(1)), ("E_L", e_long.sum(1)),
+                         ("U_c", dec["coupling"].sum(1)), ("E_tor", tor_ke + twist),
+                         ("P_TL", dec["p"].sum(1)), ("D_L", np.zeros(t.size))):
+            flow.setdefault(key, []).append(val)
+        per_elem = {"trans": e_trans, "long": e_long, "transfer": dec["p"]}
+        for key, val in per_elem.items():
+            maps.setdefault(key, []).append(block_mean(val, ENERGY_DENSITY_BLOCK))
+        maps_t.append(block_centers(c * chunk, t.size, ENERGY_DENSITY_BLOCK, 1.0 / fs))
 
-        # Chunk-averaged KE per spatial mode, exactly as the real worker does it.
+        # KE per spatial mode, exactly as the real worker does it.
         adot = modal_projection(vel_grid, n_modes).astype(np.float64)
-        ke_modes = 0.25 * m_node * (node_count - 1) * np.mean(adot ** 2, axis=0)
-        modal_ke_chunks.append(np.stack([ke_modes[:, 1] + ke_modes[:, 2], ke_modes[:, 0]], axis=1))
+        ke_modes = 0.25 * m_node * (node_count - 1) * adot ** 2
+        ke_modes = np.stack([ke_modes[..., 1] + ke_modes[..., 2], ke_modes[..., 0]], axis=-1)
+        modal_ke_chunks.append(ke_modes.mean(axis=0))
         modal_ke_t.append((c * chunk + 0.5 * (t.size - 1)) / fs)
+        if c < n_exc_chunks:
+            for key, val in per_elem.items():
+                maps_fine.setdefault(key, []).append(block_mean(val, fine_map_block))
+            maps_fine_t.append(block_centers(c * chunk, t.size, fine_map_block, 1.0 / fs))
+            modal_fine.append(block_mean(ke_modes, fine_modal_block))
+            modal_fine_t.append(block_centers(c * chunk, t.size, fine_modal_block, 1.0 / fs))
         if c >= n_exc_chunks:
             modal_acc.feed(modal_projection(pos, n_modes))
             kw_acc.feed(kspace_projection(pos, grid))
@@ -195,11 +209,15 @@ def make_preview_data(node_count=128, duration=1.0, chunk=512, n_exc_chunks=10,
         "dispersion": finalize_dispersion(modal_acc, kw_acc, grid["k"], node_count, L),
         "node_data": {n: {k: np.concatenate(v).astype(np.float32) for k, v in nd.items()}
                       for n, nd in node_data.items()},
-        "energy_density": np.concatenate(density_chunks, axis=0),
-        "energy_density_time": np.concatenate(density_t),
-        "p_damp": np.concatenate(p_damp_chunks).astype(np.float32),
+        "flow": {k: np.concatenate(v).astype(np.float32) for k, v in flow.items()},
+        "maps": {k: np.concatenate(v, axis=0) for k, v in maps.items()},
+        "maps_time": np.concatenate(maps_t),
+        "maps_fine": {k: np.concatenate(v, axis=0) for k, v in maps_fine.items()},
+        "maps_fine_time": np.concatenate(maps_fine_t),
         "modal_ke": np.stack(modal_ke_chunks).astype(np.float32),
         "modal_ke_time": np.asarray(modal_ke_t),
+        "modal_ke_fine": np.concatenate(modal_fine, axis=0).astype(np.float32),
+        "modal_ke_fine_time": np.concatenate(modal_fine_t),
     }
     for k, v in energy.items():
         data[k] = np.concatenate(v).astype(np.float32)

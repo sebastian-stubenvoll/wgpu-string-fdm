@@ -323,14 +323,28 @@ def _analyse(dispersion, which):
     return 2 * np.pi * f_res, k_map, k_fit, ok
 
 
-def plot_dispersion(dispersion, string_params, title_prefix="", filename=""):
+def plot_dispersion(dispersion, string_params, normalized=False, f1=None,
+                    title_prefix="", filename=""):
     """k-w map (top) and phase velocity w/k (bottom), transverse and
     longitudinal side by side. Hollow markers: k from the k-w map; filled:
-    k from mode-shape fits. Theory curves are comparison overlays only."""
+    k from mode-shape fits. Theory curves are comparison overlays only.
+
+    normalized: x = mode number n = kL/pi, map y = w / w1 (w1 = measured
+    fundamental, f1), velocity = v / c0 with c0 = sqrt(T/mu) resp. sqrt(EA/mu);
+    the transverse velocity curve is then sqrt(1 + B n^2), the inharmonicity.
+    Longitudinal resonances whose phase velocity is >10% off the free-wave
+    speed are longitudinal motion driven by the transverse vibration; they are
+    shown grey on the map and left out of the velocity panel.
+    """
     freqs = dispersion["freqs"]
     k_grid = dispersion["k_grid"]
     w_axis = 2 * np.pi * freqs
     has_theory = string_params.get("T") is not None
+    L = string_params["L"]
+    if f1 is None:
+        _, f_res = find_resonances(freqs, dispersion["psd_trans"])
+        f1 = float(f_res[0]) if f_res.size else freqs[1]
+    w1 = 2 * np.pi * f1
 
     fig, axes = plt.subplots(2, 2, figsize=(17, 11), sharex='col', layout='constrained',
                              gridspec_kw={"height_ratios": [3, 2]})
@@ -339,9 +353,23 @@ def plot_dispersion(dispersion, string_params, title_prefix="", filename=""):
             ("long", "Longitudinal (X)", theory_longitudinal, "EA", "√(EA/μ)"))):
         w_res, k_map, k_fit, ok = _analyse(dispersion, which)
         kw = dispersion[f"kw_{which}"].astype(np.float64)
+        c0 = np.sqrt(string_params[c0_key] / string_params["mu"]) if has_theory else None
+
+        # Axis transforms (identity in physical units).
+        fx = (lambda k: k * L / np.pi) if normalized else (lambda k: k)
+        fy = (lambda w: w / w1) if normalized else (lambda w: w)
+        fv = (lambda v: v / c0) if (normalized and c0) else (lambda v: v)
+
+        # Longitudinal peaks off the free-wave branch: driven by transverse motion.
+        driven = np.zeros_like(ok)
+        if which == "long" and c0:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                driven = ok & (np.abs(w_res / k_fit / c0 - 1.0) > 0.1)
+        free = ok & ~driven
+        k_map_free = np.where(driven, np.nan, k_map)
 
         # Data-driven ranges: a little beyond the highest measured resonance.
-        k_meas = np.concatenate([k_map[np.isfinite(k_map)], k_fit[ok]])
+        k_meas = np.concatenate([k_map_free[np.isfinite(k_map_free)], k_fit[free]])
         w_max = min(w_axis[-1], 1.1 * w_res.max()) if w_res.size else w_axis[-1]
         k_lim = min(k_grid[-1], 1.1 * k_meas.max()) if k_meas.size else k_grid[-1]
 
@@ -356,50 +384,69 @@ def plot_dispersion(dispersion, string_params, title_prefix="", filename=""):
         db = 10.0 * np.log10(np.maximum(p / row_max, 1e-6))
         db[dead] = -60.0
         ax = axes[0, col]
-        pcm = ax.pcolormesh(k_grid, w_axis[wmask], db, cmap='magma', vmin=-60, vmax=0, shading='nearest')
+        pcm = ax.pcolormesh(fx(k_grid), fy(w_axis[wmask]), db, cmap='magma', vmin=-60, vmax=0,
+                            shading='nearest')
         fig.colorbar(pcm, ax=axes[:, col], pad=0.1, label="|U(k,ω)|² per ω row (dB re. row peak)")
 
         k_th = np.linspace(k_grid[0], k_lim, 400)[1:]
         theory = theory_fn(k_th, string_params) if has_theory else None
-        ax.scatter(k_map, w_res, s=22, facecolors='none', edgecolors='cyan', linewidths=0.8,
+        ax.scatter(fx(k_map_free), fy(w_res), s=22, facecolors='none', edgecolors='cyan', linewidths=0.8,
                    label="k from k–ω map", zorder=3)
-        ax.scatter(k_fit[ok], w_res[ok], s=7, color='lime', label="k from mode-shape fit", zorder=4)
+        ax.scatter(fx(k_fit[free]), fy(w_res[free]), s=7, color='lime', label="k from mode-shape fit", zorder=4)
+        if driven.any():
+            ax.scatter(fx(k_fit[driven]), fy(w_res[driven]), s=26, facecolors='none', edgecolors='#c3c2b7',
+                       linewidths=1.0, label="driven by transverse motion", zorder=4)
         if theory is not None:
-            ax.plot(k_th, theory, color='white', linestyle='--', linewidth=1.0, label="Theory (reference)", zorder=5)
-        ax.set_ylim(0, w_max)
-        ax.set_ylabel("ω (rad/s)")
-        sec = ax.secondary_yaxis('right', functions=(lambda v: v / (2 * np.pi), lambda v: v * 2 * np.pi))
+            ax.plot(fx(k_th), fy(theory), color='white', linestyle='--', linewidth=1.0,
+                    label="Theory (reference)", zorder=5)
+        ax.set_ylim(0, fy(w_max))
+        if normalized:
+            ax.set_ylabel("ω / ω₁")
+            sec = ax.secondary_yaxis('right', functions=(lambda v: v * f1, lambda v: v / f1))
+            top = ax.secondary_xaxis('top', functions=(lambda n: n * np.pi / L, lambda k: k * L / np.pi))
+            top.set_xlabel("Wavenumber k (rad/m)")
+        else:
+            ax.set_ylabel("ω (rad/s)")
+            sec = ax.secondary_yaxis('right', functions=(lambda v: v / (2 * np.pi), lambda v: v * 2 * np.pi))
         sec.set_ylabel("f (Hz)")
         ax.set_title(f"{label}: {w_res.size} resonances, {int(ok.sum())} shape fits accepted")
         ax.legend(loc='upper left', fontsize=8)
 
-        # Phase velocity.
+        # Phase velocity (free waves only).
         ax = axes[1, col]
         with np.errstate(divide='ignore', invalid='ignore'):
-            v_map = w_res / k_map
-            v_fit = w_res[ok] / k_fit[ok]
-        ax.scatter(k_map, v_map, s=22, facecolors='none', edgecolors='tab:blue', linewidths=0.8,
+            v_map = w_res / k_map_free
+            v_fit = w_res[free] / k_fit[free]
+        ax.scatter(fx(k_map_free), fv(v_map), s=22, facecolors='none', edgecolors='tab:blue', linewidths=0.8,
                    label="k–ω map")
-        ax.scatter(k_fit[ok], v_fit, s=9, color='tab:green', label="Mode-shape fit", zorder=3)
-        vals = [v_fit]
+        ax.scatter(fx(k_fit[free]), fv(v_fit), s=9, color='tab:green', label="Mode-shape fit", zorder=3)
+        vals = [fv(v_fit)]
         if theory is not None:
-            ax.plot(k_th, theory / k_th, color='black', linestyle='--', linewidth=1.0, label="Theory (reference)")
-            c0 = np.sqrt(string_params[c0_key] / string_params["mu"])
-            ax.axhline(c0, color='tab:gray', linestyle=':', linewidth=1.0, label=c0_label)
-            vals += [theory / k_th, [c0]]
+            ax.plot(fx(k_th), fv(theory / k_th), color='black', linestyle='--', linewidth=1.0,
+                    label="Theory (reference)")
+            ax.axhline(fv(c0), color='tab:gray', linestyle=':', linewidth=1.0, label=c0_label)
+            vals += [fv(theory / k_th), [fv(c0)]]
         vals = np.concatenate([np.ravel(v) for v in vals])
         vals = vals[np.isfinite(vals)]
         if vals.size:
             lo, hi = np.min(vals), np.max(vals)
             pad = max(0.05 * (hi - lo), 0.01 * hi)
             ax.set_ylim(lo - pad, hi + pad)
-        ax.set_xlim(0, k_lim)
-        ax.set_xlabel("Wavenumber k (rad/m)")
-        ax.set_ylabel("Phase velocity ω/k (m/s)")
+        ax.set_xlim(0, fx(k_lim))
+        if normalized:
+            ax.set_xlabel("Mode number n = kL/π")
+            ax.set_ylabel("Phase velocity v / c₀")
+            if c0:
+                sv = ax.secondary_yaxis('right', functions=(lambda v, c=c0: v * c, lambda v, c=c0: v / c))
+                sv.set_ylabel("m/s")
+        else:
+            ax.set_xlabel("Wavenumber k (rad/m)")
+            ax.set_ylabel("Phase velocity ω/k (m/s)")
         ax.grid(True, alpha=0.3)
         ax.legend(loc='best', fontsize=8)
 
-    fig.suptitle(f"[{title_prefix}] Dispersion Relation")
+    kind = "Normalised Dispersion Relation" if normalized else "Dispersion Relation"
+    fig.suptitle(f"[{title_prefix}] {kind}")
     plt.savefig(filename, dpi=200, bbox_inches='tight')
     plt.close(fig)
     return [filename]

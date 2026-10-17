@@ -66,3 +66,41 @@ def plot_waterfall_3d(time, field, dl, title_prefix="", filename="", comp=None,
     plt.savefig(filename, dpi=200, bbox_inches='tight')
     plt.close(fig)
     return [filename]
+
+
+def plot_node_transient(time, pos, vel, onset=None, title_prefix="", filename=""):
+    """One node's motion right after the strike: transverse (Y, Z) and
+    longitudinal (X) displacement and velocity, each on its own panel since
+    the longitudinal motion is orders of magnitude smaller."""
+    from plots.energy import PALETTE, INK_MUTED, _style_axis
+
+    t = np.asarray(time, dtype=np.float64)
+    pos = np.asarray(pos, dtype=np.float64)
+    vel = np.asarray(vel, dtype=np.float64)
+    c_y, c_z, c_x = PALETTE[0], PALETTE[2], PALETTE[1]
+
+    fig, axes = plt.subplots(4, 1, figsize=(12, 11), sharex=True)
+    panels = (
+        (axes[0], pos, "Transverse displacement (m)", True),
+        (axes[1], pos, "Longitudinal displacement (m)", False),
+        (axes[2], vel, "Transverse velocity (m/s)", True),
+        (axes[3], vel, "Longitudinal velocity (m/s)", False),
+    )
+    for ax, arr, ylabel, transverse in panels:
+        ax.axhline(0.0, color=INK_MUTED, linewidth=0.6)
+        if transverse:
+            ax.plot(t, arr[:, 1], color=c_y, linewidth=1.0, label="Y")
+            ax.plot(t, arr[:, 2], color=c_z, linewidth=1.0, label="Z")
+            ax.legend(loc='upper right', frameon=False, fontsize=9)
+        else:
+            ax.plot(t, arr[:, 0], color=c_x, linewidth=1.0)
+        if onset is not None:
+            ax.axvline(onset, color=INK_MUTED, linestyle=':', linewidth=1.0)
+        ax.set_ylabel(ylabel)
+        _style_axis(ax)
+    axes[-1].set_xlabel("Time (s)")
+    fig.suptitle(f"[{title_prefix}] Node Motion after the Strike")
+    plt.tight_layout()
+    plt.savefig(filename, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    return [filename]

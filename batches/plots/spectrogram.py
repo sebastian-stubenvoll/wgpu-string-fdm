@@ -6,7 +6,7 @@ from scipy.signal import spectrogram
 
 
 def plot_node_spectrogram(pos, fs, title_prefix="", filename="", nperseg=4096, overlap=0.75,
-                          energy_fraction=0.99, min_fmax=500.0, f_min=20.0):
+                          energy_fraction=0.99, min_fmax=1000.0):
     """Time-frequency view of a node's transverse displacement (Y and Z):
     partial decay, beating between polarisations, phantom partials."""
     pos = np.asarray(pos, dtype=np.float64)
@@ -24,18 +24,17 @@ def plot_node_spectrogram(pos, fs, title_prefix="", filename="", nperseg=4096, o
     cum = np.cumsum(power)
     f_max = f[min(np.searchsorted(cum, energy_fraction * cum[-1]), f.size - 1)] if cum[-1] > 0 else f[-1]
     f_max = min(f[-1], max(min_fmax, 1.1 * f_max))
-    fmask = (f >= f_min) & (f <= f_max)
+    fmask = f <= f_max
 
-    peak = max(s.max() for s in specs) or 1.0
     fig, axes = plt.subplots(2, 1, figsize=(12, 9), sharex=True, layout='constrained')
     for ax, sxx, label in zip(axes, specs, ("Y", "Z")):
+        # Each panel relative to its own peak: the polarisation the hammer
+        # doesn't drive can sit ~60 dB lower and would otherwise be black.
+        peak = sxx.max() or 1.0
         db = 10.0 * np.log10(np.maximum(sxx[fmask] / peak, 1e-10))
-        pcm = ax.pcolormesh(t, f[fmask], db, cmap='magma', vmin=-90, vmax=0, shading='nearest')
-        fig.colorbar(pcm, ax=ax, label="PSD (dB re. peak)")
-        # Log frequency: harmonic partials stay separable at low frequency
-        # instead of merging into evenly spaced stripes.
-        ax.set_yscale('log')
-        ax.set_ylim(f_min, f_max)
+        pcm = ax.pcolormesh(t, f[fmask], db, cmap='magma', vmin=-80, vmax=0, shading='nearest')
+        fig.colorbar(pcm, ax=ax, label="PSD (dB re. this panel's peak)")
+        ax.set_ylim(0, f_max)
         ax.set_ylabel("Frequency (Hz)")
         ax.set_title(f"{label} displacement")
     axes[-1].set_xlabel("Time (s)")
