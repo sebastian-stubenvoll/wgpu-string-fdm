@@ -11,7 +11,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from config import SIM_CONFIG, ROD_PARAMS
-from utils import generate_straight_rod, reference_vectors, rest_orientations
+from utils import (generate_straight_rod, reference_vectors, rest_orientations, rest_frames,
+                   reference_offsets)
 from plots.energy import ENERGY_DENSITY_BLOCK, block_mean, block_centers
 from plots.energy_flow import (exact_flow, roundoff_forces, modal_transfer, edges_to_nodes,
                                dst_parseval, N_TRANSFER_MODES)
@@ -114,7 +115,9 @@ def make_preview_data(node_count=128, duration=1.0, chunk=512, n_exc_chunks=10,
     modal_tr_chunks, modal_tr_fine = [], []
     fine_map_block, fine_modal_block = 4, 32
     ref_vecs = reference_vectors(node_count, L)
-    q_rest = rest_orientations(node_count, ROD_PARAMS.get("twists", 0.0)).astype(np.float32)
+    q_rest = rest_orientations(node_count, ROD_PARAMS.get("twists", 0.0))
+    frames = rest_frames(node_count, ROD_PARAMS.get("twists", 0.0))
+    offsets = reference_offsets(ref_vecs, frames, dl)
     transfer_acc = StreamingCrossSpectrum(fs, nperseg=nperseg)
     dx = L / (node_count - 1)
     modal_acc = StreamingModalSpectra(fs, nperseg=nperseg)
@@ -163,7 +166,8 @@ def make_preview_data(node_count=128, duration=1.0, chunk=512, n_exc_chunks=10,
         # flow plot's "delivered vs. ΔE_L" lines won't agree here.
         q_e = np.broadcast_to(q_rest, (t.size, node_count - 1, 4))
         fl = exact_flow(pos, vel_grid, q_e, ref_vecs, q_rest, dl, m_node, K_se)
-        d_round = roundoff_forces(pos, q_e, ref_vecs, dl, K_se)[:, 1:-1]
+        d_abs, d_off = roundoff_forces(pos, q_e, ref_vecs, q_rest, frames, offsets, dl, K_se)
+        d_round, d_other = d_off[:, 1:-1], d_abs[:, 1:-1]
         d_perp2 = np.sum(d_round[..., 1:] ** 2, axis=-1)
         for key, val in (("KE_T", fl["ke_t"].sum(1)), ("KE_R", tilt_ke), ("KE_tor", tor_ke),
                          ("E_L", fl["ke_l"].sum(1) + fl["u_l_quad"].sum(1) + fl["u_l_lin"].sum(1)),
@@ -171,10 +175,14 @@ def make_preview_data(node_count=128, duration=1.0, chunk=512, n_exc_chunks=10,
                          ("D_L", np.zeros(t.size)), ("D_all", np.zeros(t.size)),
                          ("dF_x_rms", np.sqrt(np.mean(d_round[..., 0] ** 2, axis=1))),
                          ("dF_perp_rms", np.sqrt(np.mean(d_perp2, axis=1))),
+                         ("dF_x_rms_other", np.sqrt(np.mean(d_other[..., 0] ** 2, axis=1))),
+                         ("dF_perp_rms_other",
+                          np.sqrt(np.mean(np.sum(d_other[..., 1:] ** 2, axis=-1), axis=1))),
                          ("H_x", np.sum(d_round[..., 0] ** 2, axis=1) * dt / (2 * m_node)),
                          ("H_perp", np.sum(d_perp2, axis=1) * dt / (2 * m_node))):
             flow.setdefault(key, []).append(val)
-        per_elem = {"trans": fl["ke_t"], "long": fl["ke_l"] + edges_to_nodes(fl["u_l_quad"]),
+        per_elem = {"trans": fl["ke_t"], "long_ke": fl["ke_l"],
+                    "long": fl["ke_l"] + edges_to_nodes(fl["u_l_quad"]),
                     "transfer": fl["p_disp"] + fl["p_rot"]}
         for key, val in per_elem.items():
             maps.setdefault(key, []).append(block_mean(val, ENERGY_DENSITY_BLOCK))
@@ -239,6 +247,7 @@ def make_preview_data(node_count=128, duration=1.0, chunk=512, n_exc_chunks=10,
         "modal_transfer_fine": np.concatenate(modal_tr_fine, axis=0).astype(np.float32),
         "transfer_spectrum": transfer_acc.finalize(),
         "dt_sim": dt,
+        "relative_orientations": True,
     }
     if data["transfer_spectrum"] is not None:
         data["transfer_spectrum"]["p_nf"] *= dst_parseval(node_count - 2)

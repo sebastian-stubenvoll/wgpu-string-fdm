@@ -96,6 +96,9 @@ class SimulationRun:
             # (utils.reference_vectors); older runs used the float32 position
             # differences, which post-processing reproduces when this is absent.
             "uniform_reference_spacing": True,
+            # Edge orientations are stored as the deviation p from the rest
+            # orientation (q = q0 * p); post-processing rebuilds q from it.
+            "orientation_representation": "relative_to_rest",
         }
 
         weights = make_weights(
@@ -173,6 +176,7 @@ class SimulationRun:
                 "length": self.rod_params["tuned_length"],
                 "rod_params": self.rod_params,
                 "uniform_reference": True,
+                "relative_orientations": True,
             },
             daemon=False
         )

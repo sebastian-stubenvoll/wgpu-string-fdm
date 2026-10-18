@@ -15,10 +15,30 @@ pub struct Node {
     reference_curvature: [f32; 4],
     internal_moment: [f32; 3],
     _pad3: u32,
+    // q0_i^-1 * q0_{i+1}, see the shader
+    rest_relative_orientation: [f32; 4],
 }
 
+// The structs are uploaded with bytemuck, so the repr(C) layout must equal the WGSL storage
+// layout (vec3/vec4/mat3x3 aligned to 16 bytes, mat3x3 columns padded to 16 bytes).
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(offset_of!(Node, position) == 0);
+    assert!(offset_of!(Node, velocity) == 16);
+    assert!(offset_of!(Node, curvature) == 32);
+    assert!(offset_of!(Node, reference_curvature) == 48);
+    assert!(offset_of!(Node, internal_moment) == 64);
+    assert!(offset_of!(Node, rest_relative_orientation) == 80);
+    assert!(size_of::<Node>() == 96);
+};
+
 impl Node {
-    pub fn new(position: &[f32; 3], velocity: &[f32; 3], reference_curvature: &[f32; 4]) -> Self {
+    pub fn new(
+        position: &[f32; 3],
+        velocity: &[f32; 3],
+        reference_curvature: &[f32; 4],
+        rest_relative_orientation: &[f32; 4],
+    ) -> Self {
         Self {
             position: *position,
             _pad0: 0,
@@ -29,6 +49,7 @@ impl Node {
             reference_curvature: *reference_curvature,
             internal_moment: [0.0; 3],
             _pad3: 0,
+            rest_relative_orientation: *rest_relative_orientation,
         }
     }
 
@@ -57,7 +78,26 @@ pub struct Edge {
     _pad2: u32,
     reference_vector: [f32; 3],
     _pad3: u32,
+    // R0^T * reference_vector - dl * e3, see the shader
+    reference_offset: [f32; 3],
+    _pad4: u32,
+    // mat3x3<f32>: columns d1, d2, d3 of the rest frame, each padded to 16 bytes
+    rest_frame: [[f32; 4]; 3],
 }
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(offset_of!(Edge, orientation) == 0);
+    assert!(offset_of!(Edge, angular_velocity) == 16);
+    assert!(offset_of!(Edge, len_inv) == 28);
+    assert!(offset_of!(Edge, strain) == 32);
+    assert!(offset_of!(Edge, reference_strain) == 48);
+    assert!(offset_of!(Edge, internal_force) == 64);
+    assert!(offset_of!(Edge, reference_vector) == 80);
+    assert!(offset_of!(Edge, reference_offset) == 96);
+    assert!(offset_of!(Edge, rest_frame) == 112);
+    assert!(size_of::<Edge>() == 160);
+};
 
 impl Edge {
     pub fn new(
@@ -65,7 +105,10 @@ impl Edge {
         reference_vector: &[f32; 3],
         angular_velocity: &[f32; 3],
         reference_strain: &[f32; 3],
+        reference_offset: &[f32; 3],
+        rest_frame: &[[f32; 3]; 3],
     ) -> Self {
+        let column = |c: &[f32; 3]| [c[0], c[1], c[2], 0.0];
         Self {
             orientation: *orientation,
             angular_velocity: *angular_velocity,
@@ -78,6 +121,9 @@ impl Edge {
             _pad2: 0,
             reference_vector: *reference_vector,
             _pad3: 0,
+            reference_offset: *reference_offset,
+            _pad4: 0,
+            rest_frame: rest_frame.each_ref().map(column),
         }
     }
 

@@ -18,8 +18,11 @@ mod py_wgpu_fdm {
     impl Simulation {
         #[new]
         fn new(
-            nodes: Vec<([f32; 3], [f32; 3], [f32; 4])>,
-            edges: Vec<([f32; 4], [f32; 3], [f32; 3], [f32; 3])>,
+            // (position, velocity, reference orientation, rest relative orientation)
+            nodes: Vec<([f32; 3], [f32; 3], [f32; 4], [f32; 4])>,
+            // (orientation deviation p, reference vector, angular velocity, reference strain,
+            //  reference offset, rest frame columns [d1, d2, d3])
+            edges: Vec<([f32; 4], [f32; 3], [f32; 3], [f32; 3], [f32; 3], [[f32; 3]; 3])>,
             hammer_weights: Vec<f32>,
             oversampling_factor: usize,
             chunk_size: u32,
@@ -42,12 +45,12 @@ mod py_wgpu_fdm {
         ) -> PyResult<Self> {
             let nodes: Vec<gpu_bindings::Node> = nodes
                 .iter()
-                .map(|n| gpu_bindings::Node::new(&n.0, &n.1, &n.2))
+                .map(|n| gpu_bindings::Node::new(&n.0, &n.1, &n.2, &n.3))
                 .collect();
 
             let edges: Vec<gpu_bindings::Edge> = edges
                 .iter()
-                .map(|e| gpu_bindings::Edge::new(&e.0, &e.1, &e.2, &e.3))
+                .map(|e| gpu_bindings::Edge::new(&e.0, &e.1, &e.2, &e.3, &e.4, &e.5))
                 .collect();
 
             let uniforms = gpu_bindings::FDMUniform::new(

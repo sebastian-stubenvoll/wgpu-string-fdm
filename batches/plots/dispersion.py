@@ -455,7 +455,7 @@ def plot_dispersion(dispersion, string_params, normalized=False, f1=None,
                        linewidths=1.2, label=f"driven by {other} motion", zorder=4)
         if theory is not None:
             ax.plot(fx(k_th), fy(theory), color='white', linestyle='--', linewidth=1.0,
-                    label="reference (shader parameters)", zorder=5)
+                    label="reference", zorder=5)
         ax.set_ylim(0, fy(w_max))
         if normalized:
             ax.set_ylabel("ω / ω₁")
@@ -481,7 +481,7 @@ def plot_dispersion(dispersion, string_params, normalized=False, f1=None,
         vals = [fv(v_fit)]
         if theory is not None:
             ax.plot(fx(k_th), fv(theory / k_th), color='black', linestyle='--', linewidth=1.0,
-                    label="reference (shader parameters)")
+                    label="reference")
             ax.axhline(fv(c0), color='tab:gray', linestyle=':', linewidth=1.0, label=c0_label)
             vals += [fv(theory / k_th), [fv(c0)]]
         vals = np.concatenate([np.ravel(v) for v in vals])

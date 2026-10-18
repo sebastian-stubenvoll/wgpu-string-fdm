@@ -40,15 +40,13 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm, LinearSegmentedColormap, SymLogNorm
+from matplotlib.colors import LogNorm, SymLogNorm
+from matplotlib.ticker import EngFormatter
 from scipy.fft import dst
 
-from plots.energy import PALETTE, INK, INK_MUTED, _style_axis, _smooth, _window_frames
-
-# Colours follow the subsystem; a transfer is coloured by where the energy goes.
-C_TRANS, C_LONG, C_ROT, C_TOR = PALETTE[0], PALETTE[1], PALETTE[2], PALETTE[3]
-TRANSFER_CMAP = LinearSegmentedColormap.from_list(
-    "long_to_trans__trans_to_long", [C_TRANS, "#f0efec", C_LONG])
+from plots.energy import (PALETTE, INK, INK_MUTED, ENERGY_STYLE, INTO_LONG, OUT_OF_LONG,
+                          DIVERGING_CMAP, TRANSLATIONAL_CMAP, NEUTRAL_CMAP,
+                          _style_axis, _smooth, _window_frames)
 
 N_TRANSFER_MODES = 256
 _E3 = np.array([0.0, 0.0, 1.0])
@@ -101,6 +99,33 @@ def edge_forces(r, quats, dl, K_se, dtype=np.float64):
     eta = one - dtype(0.3) * (e - one)
     K = np.asarray(K_se, dtype=dtype)
     return rotate(q, K * (eta * eta)[..., None] * sigma)
+
+
+def rotation_deviation_inv(p):
+    """R(p)^T e3 - e3 for unit quaternions p, from the vector part only (WGSL
+    rotation_deviation_inv)."""
+    pv, w = p[..., :3], p[..., 3:]
+    e3 = _E3.astype(p.dtype)
+    return -2 * w * np.cross(pv, e3) + 2 * np.cross(pv, np.cross(pv, e3))
+
+
+def edge_forces_offset(du, p, frames, offsets, dl, K_se, dtype=np.float64):
+    """Internal edge forces f_e (lab frame) as the current compute_internals
+    evaluates them: orientation q = q0 p stored as the deviation p, rest frame
+    R0 (frames, (N-1, 3, 3), columns d1 d2 d3) and offsets R0^T ref - dl e3.
+    Algebraically identical to edge_forces(ref + du, q0 p, ...); only the
+    rounding of the intermediates differs."""
+    du = np.asarray(du, dtype=dtype)
+    p = np.asarray(p, dtype=dtype)
+    R0 = np.asarray(frames, dtype=dtype)
+    dl_ = dtype(dl)
+    w = np.asarray(offsets, dtype=dtype) + np.einsum('...nk,nkj->...nj', du, R0)
+    sigma = rotate_inv(p, w) / dl_ + rotation_deviation_inv(p)
+    length = np.sqrt(w[..., 0] ** 2 + w[..., 1] ** 2 + (dl_ + w[..., 2]) ** 2)
+    s = (dtype(2) * dl_ * w[..., 2] + np.sum(w * w, axis=-1)) / (dl_ * (length + dl_))
+    eta = dtype(1) - dtype(0.3) * s
+    K = np.asarray(K_se, dtype=dtype)
+    return np.einsum('nij,...nj->...ni', R0, rotate(p, K * (eta * eta)[..., None] * sigma))
 
 
 def node_forces(f):
@@ -188,22 +213,41 @@ def exact_flow(pos, vel, quats, ref, q_rest, dl, m_node, K_se, c_lin=0.0, block=
     return out
 
 
-def roundoff_forces(pos, quats, ref, dl, K_se, block=64):
-    """Node force in float32 (shader precision) minus the same in float64,
-    from the same float32 state: (F, N, 3). The edge vector is formed in
-    float32 like the shader (ref + (u_{j+1} - u_j))."""
+def roundoff_forces(pos, quats, ref, q_rest, frames, offsets, dl, K_se, block=64):
+    """Float32 rounding of the node force, for both shader formulations:
+    (old, new), each (F, N, 3) = float32 evaluation minus the float64
+    evaluation of the same stored float32 state.
+
+    old: absolute orientations q and r = ref + (u_{j+1} - u_j), strain as
+         R(q)^T r / dl - e3 (the shader before the offset formulation);
+    new: deviations p = q0^-1 q and the offset w = R0^T r - dl e3
+         (edge_forces_offset).
+    The stored state is float32 in both cases (q resp. p, u, ref, R0, offsets),
+    so the float64 reference is the exact force of what the GPU holds.
+    """
     F, N = pos.shape[:2]
-    out = np.zeros((F, N, 3))
+    old, new = np.zeros((F, N, 3)), np.zeros((F, N, 3))
     ref32 = np.asarray(ref, dtype=np.float32)
+    frames32 = np.asarray(frames, dtype=np.float32)
+    off32 = np.asarray(offsets, dtype=np.float32)
+    q0_inv = _qinv(np.asarray(q_rest, dtype=np.float64))
     for a in range(0, F, block):
         b = min(F, a + block)
         u = np.asarray(pos[a:b], dtype=np.float32)
-        r32 = ref32 + (u[:, 1:] - u[:, :-1])
-        q = np.asarray(quats[a:b], dtype=np.float32)
-        F32 = node_forces(edge_forces(r32, q, dl, K_se, dtype=np.float32)).astype(np.float64)
-        F64 = node_forces(edge_forces(r32.astype(np.float64), q.astype(np.float64), dl, K_se))
-        out[a:b] = F32 - F64
-    return out
+        du32 = u[:, 1:] - u[:, :-1]
+        q64 = np.asarray(quats[a:b], dtype=np.float64)
+        q32 = q64.astype(np.float32)
+        F32 = node_forces(edge_forces(ref32 + du32, q32, dl, K_se, dtype=np.float32))
+        F64 = node_forces(edge_forces(ref32.astype(np.float64) + du32.astype(np.float64),
+                                      q32.astype(np.float64), dl, K_se))
+        old[a:b] = F32.astype(np.float64) - F64
+
+        p = _qmul(q0_inv, q64)
+        p32 = (p / np.linalg.norm(p, axis=-1, keepdims=True)).astype(np.float32)
+        F32 = node_forces(edge_forces_offset(du32, p32, frames32, off32, dl, K_se, dtype=np.float32))
+        F64 = node_forces(edge_forces_offset(du32, p32, frames32, off32, dl, K_se))
+        new[a:b] = F32.astype(np.float64) - F64
+    return old, new
 
 
 def modal_transfer(v_x, f_c, n_modes=N_TRANSFER_MODES):
@@ -255,7 +299,7 @@ def _legend_above(ax, ncol=4):
     ax.legend(loc='lower left', bbox_to_anchor=(0.0, 1.0), ncol=ncol, frameon=False, fontsize=9)
     title = ax.get_title(loc='left')
     if title:
-        ax.set_title(title, loc='left', fontsize=10, pad=8 + 15 * rows)
+        ax.set_title(title, loc='left', fontsize=ax.title.get_fontsize(), pad=8 + 15 * rows)
 
 
 def _cumulative(y, t):
@@ -266,95 +310,116 @@ def _cumulative(y, t):
     return out
 
 
-def plot_energy_flow(time, flow, window_s=None, onset=None, period=None,
-                     title_prefix="", filename=""):
-    """How much energy goes from transverse/rotational into longitudinal motion,
-    and when. flow: per-frame KE_T, KE_R, KE_tor, E_L, P_disp, P_rot, D_L.
-    window_s smooths kinetic energies and the transfer power (long phases)."""
-    t = np.asarray(time, dtype=np.float64)
-    get = lambda k: np.asarray(flow[k], np.float64)
-    e_l, d_l = get("E_L"), get("D_L")
-    p_disp, p_rot = get("P_disp"), get("P_rot")
-    p_raw = p_disp + p_rot
-    sm = (lambda y: _smooth(y, _window_frames(t, window_s))) if window_s else (lambda y: y)
+def _single(figsize=(12, 5.5)):
+    fig, ax = plt.subplots(figsize=figsize)
+    return fig, ax
 
-    fig, axes = plt.subplots(3, 1, figsize=(12, 11), sharex=True,
-                             gridspec_kw={"height_ratios": [3, 2, 2]})
 
-    # 1. Energies (exact): longitudinal total, the others kinetic only.
-    ax = axes[0]
-    series = (("Longitudinal (kinetic + potential)", C_LONG, e_l),
-              ("Transverse kinetic", C_TRANS, sm(get("KE_T"))),
-              ("Rotational kinetic (tilt)", C_ROT, sm(get("KE_R"))),
-              ("Torsional kinetic", C_TOR, sm(get("KE_tor"))))
-    for label, color, y in series:
-        ax.plot(t, np.where(y > 0, y, np.nan), color=color, linewidth=1.4, label=label)
-    _direct_label(ax, t, series[0][2], "Longitudinal", C_LONG)
-    _direct_label(ax, t, series[1][2], "Transverse KE", C_TRANS)
-    ax.set_yscale('log')
-    peak = max(np.nanmax(e_l), np.nanmax(series[1][2]), 1e-30)
-    ax.set_ylim(peak * 1e-6, peak * 3)
-    ax.set_ylabel("Energy (J)")
-    ax.set_title("Energy per kind of motion" + (f" (kinetic smoothed over {window_s * 1e3:.1f} ms)"
-                                                 if window_s else ""), fontsize=10, loc='left')
-    _legend_above(ax, ncol=2)
-    _style_axis(ax)
+def _finish(fig, ax, title, filename, onset=None, legend_cols=None, unit=None):
+    """Title, then the legend above the axes (which lifts the title), shared
+    styling and saving. unit: engineering tick labels (e.g. 20 µW) on a linear
+    y axis, instead of a separate exponent that would collide with the legend."""
     if onset is not None:
-        for a in axes:
-            a.axvline(onset, color=INK_MUTED, linestyle=':', linewidth=1.0)
-
-    # 2. Transfer power, filled by where the energy goes.
-    ax = axes[1]
-    p = sm(p_raw)
-    ax.axhline(0.0, color=INK_MUTED, linewidth=0.8)
-    ax.fill_between(t, 0, p, where=p > 0, color=C_LONG, alpha=0.55, linewidth=0,
-                    label="into longitudinal")
-    ax.fill_between(t, 0, p, where=p < 0, color=C_TRANS, alpha=0.55, linewidth=0,
-                    label="back into transverse / rotation")
-    ax.plot(t, p, color=INK, linewidth=0.6)
-    ax.set_ylabel("Transfer power (W)")
-    sub = "Transfer power into longitudinal motion"
-    if window_s:
-        sub += f" (smoothed over {window_s * 1e3:.1f} ms)"
-    if onset is not None and period:
-        sel = (t >= onset) & (t <= onset + period)
-        if sel.sum() > 1:
-            rate = np.trapezoid(p_raw[sel], t[sel]) / (t[sel][-1] - t[sel][0])
-            sub += f";  mean over first period after strike: {rate * 1e3:.3g} mW"
-    ax.set_title(sub, fontsize=10, loc='left')
-    _legend_above(ax, ncol=2)
+        ax.axvline(onset, color=INK_MUTED, linestyle=':', linewidth=1.0)
+    if unit:
+        ax.yaxis.set_major_formatter(EngFormatter(unit=unit))
+    ax.set_title(title, loc='left', fontsize=11)
+    if legend_cols:
+        _legend_above(ax, ncol=legend_cols)
     _style_axis(ax)
-
-    # 3. Cumulative energy delivered, by channel, against what E_L did.
-    ax = axes[2]
-    c_disp, c_rot = _cumulative(p_disp, t), _cumulative(p_rot, t)
-    ax.plot(t, e_l - e_l[0] + _cumulative(d_l, t), color=INK, linewidth=1.6,
-            label="ΔE_L + ∫ damping (what happened)")
-    ax.plot(t, c_disp + c_rot, color=C_LONG, linewidth=1.2, linestyle='--',
-            label="∫ transfer (what the force law delivers)")
-    ax.plot(t, c_disp, color=PALETTE[4], linewidth=1.0, label="via transverse displacement")
-    ax.plot(t, c_rot, color=PALETTE[6], linewidth=1.0, label="via rotation / shear")
-    ax.axhline(0.0, color=INK_MUTED, linewidth=0.6)
-    ax.set_ylabel("Energy (J)")
-    ax.set_xlabel("Time (s)")
-    ax.set_title("Energy delivered to longitudinal motion\n"
-                 "(a gap black ↔ dashed is not explained by the force law: sampling, float32, integrator)",
-                 fontsize=10, loc='left')
-    _legend_above(ax, ncol=2)
-    _style_axis(ax)
-
-    fig.suptitle(f"[{title_prefix}] Energy Flow into Longitudinal Motion")
     plt.tight_layout()
     plt.savefig(filename, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return [filename]
 
 
+def _polarity_fill(ax, x, y, step=None):
+    """Fill by sign: into longitudinal motion (positive) / out of it."""
+    kw = dict(alpha=0.6, linewidth=0, step=step)
+    ax.fill_between(x, 0, y, where=y > 0, color=INTO_LONG, label="into longitudinal", **kw)
+    ax.fill_between(x, 0, y, where=y < 0, color=OUT_OF_LONG, label="out of longitudinal", **kw)
+    ax.plot(x, y, color=INK, linewidth=0.6, drawstyle='steps-mid' if step else 'default')
+    ax.axhline(0.0, color=INK_MUTED, linewidth=0.6)
+
+
+def plot_energy_flow(time, flow, window_s=None, onset=None, title_prefix="", filename=""):
+    """Energy per kind of motion: E_L (exact longitudinal energy, KE + PE) and
+    the kinetic energies of the other motions. window_s smooths the kinetic
+    energies (long phases)."""
+    t = np.asarray(time, dtype=np.float64)
+    get = lambda k: np.asarray(flow[k], np.float64)
+    sm = (lambda y: _smooth(y, _window_frames(t, window_s))) if window_s else (lambda y: y)
+    series = (("Longitudinal (KE + PE)", get("E_L")),
+              ("Transverse KE", sm(get("KE_T"))),
+              ("Tilt KE", sm(get("KE_R"))),
+              ("Torsion KE", sm(get("KE_tor"))))
+
+    fig, ax = _single((12, 6))
+    for label, y in series:
+        ax.plot(t, np.where(y > 0, y, np.nan), linewidth=1.4, label=label, **ENERGY_STYLE[label])
+    for label, y in series[:2]:
+        _direct_label(ax, t, y, label, ENERGY_STYLE[label]["color"])
+    ax.set_yscale('log')
+    peak = max(np.nanmax(series[0][1]), np.nanmax(series[1][1]), 1e-30)
+    ax.set_ylim(peak * 1e-6, peak * 3)
+    ax.set_ylabel("Energy (J)")
+    ax.set_xlabel("Time (s)")
+    title = f"[{title_prefix}] Energy per Kind of Motion"
+    if window_s:
+        title += f" (KE smoothed over {window_s * 1e3:.1f} ms)"
+    return _finish(fig, ax, title, filename, onset, legend_cols=4)
+
+
+def plot_transfer_power(time, flow, window_s=None, onset=None, period=None,
+                        title_prefix="", filename=""):
+    """Transfer power P_c = P_disp + P_rot into longitudinal motion."""
+    t = np.asarray(time, dtype=np.float64)
+    p_raw = np.asarray(flow["P_disp"], np.float64) + np.asarray(flow["P_rot"], np.float64)
+    p = _smooth(p_raw, _window_frames(t, window_s)) if window_s else p_raw
+
+    fig, ax = _single()
+    _polarity_fill(ax, t, p)
+    ax.set_ylabel("Transfer power")
+    ax.set_xlabel("Time (s)")
+    title = f"[{title_prefix}] Transfer Power into Longitudinal Motion"
+    if window_s:
+        title += f" (smoothed over {window_s * 1e3:.1f} ms)"
+    if onset is not None and period:
+        sel = (t >= onset) & (t <= onset + period)
+        if sel.sum() > 1:
+            rate = np.trapezoid(p_raw[sel], t[sel]) / (t[sel][-1] - t[sel][0])
+            title += f"; first-period mean {rate * 1e3:.3g} mW"
+    return _finish(fig, ax, title, filename, onset, legend_cols=2, unit='W')
+
+
+def plot_transfer_cumulative(time, flow, onset=None, title_prefix="", filename=""):
+    """Cumulative transfer by channel against the change of E_L plus damping."""
+    t = np.asarray(time, dtype=np.float64)
+    get = lambda k: np.asarray(flow[k], np.float64)
+    e_l = get("E_L")
+    c_disp, c_rot = _cumulative(get("P_disp"), t), _cumulative(get("P_rot"), t)
+
+    fig, ax = _single()
+    ax.plot(t, e_l - e_l[0] + _cumulative(get("D_L"), t), color=INK, linewidth=1.6,
+            label="ΔE_L + ∫D_L dt")
+    ax.plot(t, c_disp + c_rot, color=INTO_LONG, linewidth=1.2, linestyle='--', label="∫P_c dt")
+    ax.plot(t, c_disp, color=PALETTE[4], linewidth=1.0, label="∫P_disp dt")
+    ax.plot(t, c_rot, color=PALETTE[5], linewidth=1.0, label="∫P_rot dt")
+    ax.axhline(0.0, color=INK_MUTED, linewidth=0.6)
+    ax.set_ylabel("Energy")
+    ax.set_xlabel("Time (s)")
+    return _finish(fig, ax, f"[{title_prefix}] Energy Delivered to Longitudinal Motion",
+                   filename, onset, legend_cols=4, unit='J')
+
+
 MAP_KINDS = {
-    "trans": ("Transverse kinetic energy per node (J)", "Blues", "Transverse Kinetic Energy along the String"),
-    "long": ("Longitudinal energy per node (J)", "Oranges", "Longitudinal Energy along the String"),
-    "transfer": ("Transfer power per node (W)\n← into transverse | into longitudinal →",
-                 TRANSFER_CMAP, "Local Transfer into Longitudinal Motion"),
+    "trans": ("Transverse KE per node (J)", TRANSLATIONAL_CMAP, "Transverse Kinetic Energy along the String"),
+    "long_ke": ("Longitudinal KE per node (J)", TRANSLATIONAL_CMAP,
+                "Longitudinal Kinetic Energy along the String"),
+    "long": ("Longitudinal energy (KE + PE) per node (J)", NEUTRAL_CMAP,
+             "Longitudinal Energy along the String"),
+    "transfer": ("Transfer power per node (W)", DIVERGING_CMAP,
+                 "Local Transfer into Longitudinal Motion"),
 }
 
 
@@ -367,9 +432,8 @@ def _extent(x, t):
 def plot_element_map(time, values, length, kind, onset=None, title_prefix="", filename=""):
     """Position x time map of one per-node quantity (block-averaged rows).
 
-    kind: 'trans' / 'long' (energy, log colour scale) or 'transfer' (power,
-    diverging, symmetric limits at the 99th percentile of |p|, plus the
-    time-integrated transfer per position underneath).
+    kind: 'trans' / 'long_ke' / 'long' (energy, log colour scale) or 'transfer'
+    (power, diverging, symmetric limits at the 99th percentile of |p|).
     """
     label, cmap, title = MAP_KINDS[kind]
     v = np.asarray(values, dtype=np.float64)
@@ -377,11 +441,7 @@ def plot_element_map(time, values, length, kind, onset=None, title_prefix="", fi
     x = np.linspace(0.0, length, v.shape[1])
     extent = _extent(x, t)
 
-    if kind == "transfer":
-        fig, (ax, ax2) = plt.subplots(2, 1, figsize=(12, 9), sharex=True,
-                                      gridspec_kw={"height_ratios": [4, 1.3]})
-    else:
-        fig, ax = plt.subplots(figsize=(12, 7))
+    fig, ax = plt.subplots(figsize=(12, 7))
     if kind == "transfer":
         lim = np.percentile(np.abs(v), 99) if v.size else 1.0
         lim = lim if lim > 0 else 1.0
@@ -398,35 +458,35 @@ def plot_element_map(time, values, length, kind, onset=None, title_prefix="", fi
         ax.annotate("strike onset", (x[-1], onset), xytext=(-4, 3), textcoords='offset points',
                     ha='right', fontsize=8, color=INK)
     ax.set_ylabel("Time (s)")
+    ax.set_xlabel("Position along string (m)")
     ax.set_title(f"[{title_prefix}] {title}")
-
-    if kind == "transfer":
-        dt = (t[1] - t[0]) if t.size > 1 else 0.0
-        e = v.sum(axis=0) * dt                                # block means x block length
-        ax2.fill_between(x, 0, e, where=e > 0, color=C_LONG, alpha=0.6, linewidth=0, step='mid')
-        ax2.fill_between(x, 0, e, where=e < 0, color=C_TRANS, alpha=0.6, linewidth=0, step='mid')
-        ax2.plot(x, e, color=INK, linewidth=0.6, drawstyle='steps-mid')
-        ax2.axhline(0.0, color=INK_MUTED, linewidth=0.6)
-        ax2.set_ylabel("∫ transfer dt (J)")
-        ax2.set_title("Net energy delivered to longitudinal motion at each position over this window",
-                      fontsize=9, loc='left')
-        _style_axis(ax2)
-        # Keep the line panel as wide as the map (the map has a colorbar).
-        fig.colorbar(im, ax=ax2, pad=0.02).ax.set_visible(False)
-        ax2.set_xlabel("Position along string (m)")
-    else:
-        ax.set_xlabel("Position along string (m)")
     plt.tight_layout()
     plt.savefig(filename, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return [filename]
 
 
+def plot_element_transfer_integral(time, values, length, title_prefix="", filename=""):
+    """Time-integrated transfer power per position over the window."""
+    v = np.asarray(values, dtype=np.float64)
+    t = np.asarray(time, dtype=np.float64)
+    x = np.linspace(0.0, length, v.shape[1])
+    dt = (t[1] - t[0]) if t.size > 1 else 0.0
+    e = v.sum(axis=0) * dt                                # block means x block length
+
+    fig, ax = _single((12, 4.5))
+    _polarity_fill(ax, x, e, step='mid')
+    ax.set_ylabel("∫p_c dt")
+    ax.set_xlabel("Position along string (m)")
+    return _finish(fig, ax, f"[{title_prefix}] Energy Delivered to Longitudinal Motion per Position",
+                   filename, legend_cols=2, unit='J')
+
+
 def _symlog_map(ax, fig, z, x, y, label):
     z = np.asarray(z, np.float64)
     lim = np.percentile(np.abs(z), 99.5) if z.size else 1.0
     lim = lim if lim > 0 else 1.0
-    im = ax.pcolormesh(x, y, z, shading='nearest', cmap=TRANSFER_CMAP,
+    im = ax.pcolormesh(x, y, z, shading='nearest', cmap=DIVERGING_CMAP,
                        norm=SymLogNorm(linthresh=lim * 1e-3, vmin=-lim, vmax=lim, base=10))
     fig.colorbar(im, ax=ax, label=label, pad=0.02)
     return im
@@ -434,45 +494,48 @@ def _symlog_map(ax, fig, z, x, y, label):
 
 def plot_modal_transfer(p_modes, times, onset=None, title_prefix="", filename=""):
     """Power into each longitudinal mode over time. p_modes: (blocks, n+1),
-    the last column = all higher modes (rows sum to the total transfer)."""
+    the last column = all higher modes (not shown here, see the sum plot)."""
     p = np.asarray(p_modes, np.float64)
     t = np.asarray(times, np.float64)
     n = p.shape[1] - 1
-    fig, (ax, ax2) = plt.subplots(2, 1, figsize=(12, 9), sharex=True,
-                                  gridspec_kw={"height_ratios": [4, 1.3]})
-    im = _symlog_map(ax, fig, p[:, :n].T, t, np.arange(1, n + 1),
-                     "Power into mode (W)\n← out of | into longitudinal mode →")
+    fig, ax = plt.subplots(figsize=(12, 7))
+    _symlog_map(ax, fig, p[:, :n].T, t, np.arange(1, n + 1), "Power into mode (W)")
     rows = np.abs(p[:, :n]).max(axis=0)
     if rows.size and rows.max() > 0:
         live = np.nonzero(rows > 1e-4 * rows.max())[0]
         ax.set_ylim(0.5, min(n, int(live[-1]) + 3) + 0.5)
     ax.set_ylabel("Longitudinal mode number n")
-    ax.set_title(f"[{title_prefix}] Transfer into each Longitudinal Mode (sine basis, exact split)")
+    ax.set_xlabel("Time (s)")
+    ax.set_title(f"[{title_prefix}] Transfer into each Longitudinal Mode")
     if onset is not None:
         ax.axvline(onset, color=INK, linestyle=':', linewidth=1.0)
-
-    total = p.sum(axis=1)
-    ax2.plot(t, total, color=INK, linewidth=1.0, label="all modes (= total transfer)")
-    ax2.plot(t, p[:, n], color=PALETTE[6], linewidth=1.0, label=f"modes above {n}")
-    ax2.axhline(0.0, color=INK_MUTED, linewidth=0.6)
-    ax2.set_ylabel("Power (W)")
-    ax2.set_xlabel("Time (s)")
-    _legend_above(ax2, ncol=2)
-    _style_axis(ax2)
-    fig.colorbar(im, ax=ax2, pad=0.02).ax.set_visible(False)
     plt.tight_layout()
     plt.savefig(filename, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return [filename]
 
 
+def plot_modal_transfer_sum(p_modes, times, onset=None, title_prefix="", filename=""):
+    """Sum over all modes (= P_c) and the part above the mapped modes."""
+    p = np.asarray(p_modes, np.float64)
+    t = np.asarray(times, np.float64)
+    n = p.shape[1] - 1
+    fig, ax = _single((12, 4.5))
+    ax.plot(t, p.sum(axis=1), color=INK, linewidth=1.0, label="all modes")
+    ax.plot(t, p[:, n], color=INK_MUTED, linewidth=1.0, linestyle=':', label=f"n > {n}")
+    ax.axhline(0.0, color=INK_MUTED, linewidth=0.6)
+    ax.set_ylabel("Power")
+    ax.set_xlabel("Time (s)")
+    return _finish(fig, ax, f"[{title_prefix}] Transfer into Longitudinal Modes, Sum", filename, onset, legend_cols=2, unit='W')
+
+
 def plot_transfer_spectrum(spec, f_trans=(), f_long=(), title_prefix="", filename=""):
     """Time-averaged transfer power per frequency, summed over modes (top) and
     per longitudinal mode (bottom). The average is Welch's: Hann^2-weighted
     50%-overlap segments, so its integral equals the plain time mean of the
-    transfer only where the transfer is stationary. Marked from measured data only: the
-    longitudinal resonances and the combination frequencies of the transverse
-    resonances (forced transfer)."""
+    transfer only where the transfer is stationary. Marked from measured data
+    only: the longitudinal resonances and the combination frequencies of the
+    transverse resonances."""
     freqs = np.asarray(spec["freqs"], np.float64)
     pnf = np.asarray(spec["p_nf"], np.float64)          # (n_modes, F) W/Hz
     p_f = pnf.sum(axis=0)
@@ -484,32 +547,24 @@ def plot_transfer_spectrum(spec, f_trans=(), f_long=(), title_prefix="", filenam
 
     fig, (ax, ax2) = plt.subplots(2, 1, figsize=(13, 10), sharex=True,
                                   gridspec_kw={"height_ratios": [2, 3]})
-    ax.axhline(0.0, color=INK_MUTED, linewidth=0.6)
-    y = p_f[sel]
-    ax.fill_between(freqs[sel], 0, y, where=y > 0, color=C_LONG, alpha=0.6, linewidth=0,
-                    label="into longitudinal")
-    ax.fill_between(freqs[sel], 0, y, where=y < 0, color=C_TRANS, alpha=0.6, linewidth=0,
-                    label="back into transverse / rotation")
-    ax.plot(freqs[sel], y, color=INK, linewidth=0.6)
+    _polarity_fill(ax, freqs[sel], p_f[sel])
     for i, f in enumerate([f for f in f_long if f <= f_max]):
-        ax.axvline(f, color=C_LONG, linestyle=':', linewidth=1.0,
-                   label="longitudinal resonance (measured)" if i == 0 else None)
+        ax.axvline(f, color=INK, linestyle=':', linewidth=1.0,
+                   label="longitudinal resonance" if i == 0 else None)
         ax2.axvline(f, color=INK, linestyle=':', linewidth=0.6)
     comb = [f for f in combination_frequencies(f_trans) if f <= f_max]
     if comb:
         ax.plot(comb, np.full(len(comb), 1.0), transform=ax.get_xaxis_transform(), linestyle='none',
-                marker='v', markersize=5, color=C_TRANS, clip_on=False,
-                label="f_m ± f_n of transverse resonances (measured)")
+                marker='v', markersize=5, color=INK_MUTED, clip_on=False,
+                label="f_m ± f_n, 2f_n (transverse resonances)")
     ax.set_ylabel("Transfer power density (W/Hz)")
     mean_p = np.sum(p_f) * (freqs[1] - freqs[0])
-    ax.set_title("Time-averaged transfer per frequency\n"
-                 f"(integral = mean transfer, Welch-weighted: {mean_p * 1e3:.3g} mW)", fontsize=10, loc='left')
+    ax.set_title(f"Integral {mean_p * 1e3:.3g} mW", fontsize=10, loc='left')
     _legend_above(ax, ncol=2)
     _style_axis(ax)
 
     n = pnf.shape[0]
-    im = _symlog_map(ax2, fig, pnf[:, sel], freqs[sel], np.arange(1, n + 1),
-                     "W/Hz  (← out of | into mode →)")
+    im = _symlog_map(ax2, fig, pnf[:, sel], freqs[sel], np.arange(1, n + 1), "W/Hz")
     n_show = n
     rows = np.abs(pnf[:, sel]).max(axis=1)
     if rows.max() > 0:
@@ -522,61 +577,59 @@ def plot_transfer_spectrum(spec, f_trans=(), f_long=(), title_prefix="", filenam
     ax2.set_xlim(0, f_max)
     fig.colorbar(im, ax=ax, pad=0.02).ax.set_visible(False)
 
-    fig.suptitle(f"[{title_prefix}] Transfer Spectrum: at which Frequencies Energy Enters Longitudinal Motion")
+    fig.suptitle(f"[{title_prefix}] Transfer Spectrum")
     plt.tight_layout()
     plt.savefig(filename, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return [filename]
 
 
-def plot_energy_source(time, total_energy, flow, title_prefix="", filename=""):
-    """Is energy created? total_energy: the shader's quadratic-form total per
-    frame. flow: D_all, E_L, P_disp, P_rot, D_L, dF_x_rms, dF_perp_rms,
-    H_x, H_perp (roundoff heating estimates, W)."""
+def plot_energy_balance(time, total_energy, flow, title_prefix="", filename=""):
+    """Quadratic-form total energy change plus dissipated energy."""
+    t = np.asarray(time, np.float64)
+    e = np.asarray(total_energy, np.float64)
+    resid = e - e[0] + _cumulative(np.asarray(flow["D_all"], np.float64), t)
+    fig, ax = _single()
+    ax.plot(t, resid, color=INK, linewidth=1.2)
+    ax.axhline(0.0, color=INK_MUTED, linewidth=0.6)
+    ax.set_ylabel("E(t) − E(t₀) + ∫D dt")
+    ax.set_xlabel("Time (s)")
+    return _finish(fig, ax, f"[{title_prefix}] Total Energy Balance", filename, unit='J')
+
+
+def plot_energy_unexplained(time, flow, title_prefix="", filename=""):
+    """Change of E_L not accounted for by transfer and damping, with the
+    accumulated per-step float32 heating estimate of the run's formulation."""
     t = np.asarray(time, np.float64)
     get = lambda k: np.asarray(flow[k], np.float64)
-    fig, axes = plt.subplots(3, 1, figsize=(12, 11), sharex=True)
-
-    ax = axes[0]
-    e = np.asarray(total_energy, np.float64)
-    resid = e - e[0] + _cumulative(get("D_all"), t)
-    ax.plot(t, resid, color=INK, linewidth=1.2, label="E(t) − E(t₀) + ∫ damping")
-    ax.axhline(0.0, color=INK_MUTED, linewidth=0.6)
-    ax.set_ylabel("Energy (J)")
-    ax.set_title("Total energy balance (shader's quadratic-form energy; flat = conserved, "
-                 f"start {e[0]:.3g} J)", fontsize=10, loc='left')
-    _legend_above(ax, ncol=1)
-    _style_axis(ax)
-
-    ax = axes[1]
     e_l = get("E_L")
     gap = e_l - e_l[0] + _cumulative(get("D_L") - get("P_disp") - get("P_rot"), t)
-    ax.plot(t, gap, color=C_LONG, linewidth=1.2,
-            label="longitudinal energy not explained by the force law")
-    ax.plot(t, _cumulative(get("H_x"), t), color=INK, linewidth=1.0, linestyle='--',
-            label="float32 roundoff heating, x (if independent per step)")
-    ax.plot(t, _cumulative(get("H_perp"), t), color=C_TRANS, linewidth=1.0, linestyle='--',
-            label="float32 roundoff heating, transverse")
+    fig, ax = _single()
+    ax.plot(t, gap, color=INK, linewidth=1.2, label="ΔE_L + ∫(D_L − P_c) dt")
+    ax.plot(t, _cumulative(get("H_x"), t), color=INK_MUTED, linewidth=1.0, linestyle='--',
+            label="float32 heating, x")
+    ax.plot(t, _cumulative(get("H_perp"), t), color=INK_MUTED, linewidth=1.0, linestyle=':',
+            label="float32 heating, y, z")
     ax.axhline(0.0, color=INK_MUTED, linewidth=0.6)
-    ax.set_ylabel("Energy (J)")
-    ax.set_title("Unexplained longitudinal energy,\nand what float32 rounding could inject",
-                 fontsize=10, loc='left')
-    _legend_above(ax, ncol=2)
-    _style_axis(ax)
-
-    ax = axes[2]
-    ax.plot(t, get("dF_x_rms"), color=C_LONG, linewidth=1.0, label="x (longitudinal)")
-    ax.plot(t, get("dF_perp_rms"), color=C_TRANS, linewidth=1.0, label="y, z (transverse)")
-    ax.set_yscale('log')
-    ax.set_ylabel("RMS node force (N)")
+    ax.set_ylabel("Energy")
     ax.set_xlabel("Time (s)")
-    ax.set_title("Float32 rounding of the node force\n(post-processing port of the shader, same "
-                 "inputs; the GPU's own rounding differs in detail)", fontsize=10, loc='left')
-    _legend_above(ax, ncol=2)
-    _style_axis(ax)
+    return _finish(fig, ax, f"[{title_prefix}] Longitudinal Energy Residual", filename, legend_cols=3, unit='J')
 
-    fig.suptitle(f"[{title_prefix}] Energy Source Diagnostic")
-    plt.tight_layout()
-    plt.savefig(filename, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return [filename]
+
+def plot_roundoff_force(time, flow, relative=True, title_prefix="", filename=""):
+    """RMS float32 rounding of the node force for both shader formulations."""
+    t = np.asarray(time, np.float64)
+    get = lambda k: np.asarray(flow[k], np.float64)
+    run, other = ("offset", "absolute") if relative else ("absolute", "offset")
+    fig, ax = _single()
+    for suffix, name, ls in (("", run, '-'), ("_other", other, ':')):
+        if f"dF_x_rms{suffix}" not in flow:
+            continue
+        ax.plot(t, get(f"dF_x_rms{suffix}"), color=INK, linewidth=1.0, linestyle=ls,
+                label=f"x, {name}")
+        ax.plot(t, get(f"dF_perp_rms{suffix}"), color=INK_MUTED, linewidth=1.0, linestyle=ls,
+                label=f"y, z, {name}")
+    ax.set_yscale('log')
+    ax.set_ylabel("RMS node force error (N)")
+    ax.set_xlabel("Time (s)")
+    return _finish(fig, ax, f"[{title_prefix}] Float32 Rounding of the Node Force", filename, legend_cols=4)

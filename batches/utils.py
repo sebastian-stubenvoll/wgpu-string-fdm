@@ -20,6 +20,39 @@ def reference_vectors(node_count, tuned_length, legacy=False):
     return ref
 
 
+def quat_mul(q1, q2):
+    """Hamilton product of quaternions (x, y, z, w), broadcasting over leading axes."""
+    x1, y1, z1, w1 = np.moveaxis(np.asarray(q1, dtype=np.float64), -1, 0)
+    x2, y2, z2, w2 = np.moveaxis(np.asarray(q2, dtype=np.float64), -1, 0)
+    return np.stack([
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        w1*w2 - x1*x2 - y1*y2 - z1*z2
+    ], axis=-1)
+
+
+def quat_conj(q):
+    q = np.array(q, dtype=np.float64)
+    q[..., :3] *= -1.0
+    return q
+
+
+def quat_matrix(q):
+    """Rotation matrix of unit quaternions (x, y, z, w); columns are R e1, R e2, R e3."""
+    x, y, z, w = np.moveaxis(np.asarray(q, dtype=np.float64), -1, 0)
+    return np.stack([
+        np.stack([1 - 2*(y*y + z*z), 2*(x*y + z*w), 2*(x*z - y*w)], axis=-1),
+        np.stack([2*(x*y - z*w), 1 - 2*(x*x + z*z), 2*(y*z + x*w)], axis=-1),
+        np.stack([2*(x*z + y*w), 2*(y*z - x*w), 1 - 2*(x*x + y*y)], axis=-1),
+    ], axis=-1)
+
+
+def _twist_angles(node_count, twists):
+    total_edges = node_count - 1
+    return 2.0 * np.pi * twists * (np.arange(total_edges) / total_edges)
+
+
 def rest_orientations(node_count, twists):
     """Rest orientation quaternion (x, y, z, w) of every edge, (N-1, 4) float64:
     director d3 along the string (x), optionally twisted about it."""
@@ -27,26 +60,59 @@ def rest_orientations(node_count, twists):
         half = 0.5 * angle
         return np.array([np.sin(half), 0.0, 0.0, np.cos(half)])
 
-    def quat_mul(q1, q2):
-        x1, y1, z1, w1 = q1; x2, y2, z2, w2 = q2
-        return np.array([
-            w1*x2 + x1*w2 + y1*z2 - z1*y2,
-            w1*y2 - x1*z2 + y1*w2 + z1*x2,
-            w1*z2 + x1*y2 - y1*x2 + z1*w2,
-            w1*w2 - x1*x2 - y1*y2 - z1*z2
-        ])
-
     angle = np.pi / 2
     q_base = np.array([0.0, np.sin(0.5 * angle), 0.0, np.cos(0.5 * angle)])
 
-    total_edges = node_count - 1
-    total_angle = 2.0 * np.pi * twists
-
-    orientations = [
-        quat_mul(twist_quaternion(total_angle * (i / total_edges)), q_base)
-        for i in range(total_edges)
-    ]
+    orientations = [quat_mul(twist_quaternion(phi), q_base)
+                    for phi in _twist_angles(node_count, twists)]
     return np.array([q / np.linalg.norm(q) for q in orientations])
+
+
+def rest_frames(node_count, twists):
+    """Rest directors R0 = R(q0) of every edge, (N-1, 3, 3) float64, columns d1, d2, d3.
+
+    Written out in closed form (base rotation of 90 deg about y, then the twist
+    phi about x): d1 = (0, sin phi, -cos phi), d2 = (0, cos phi, sin phi),
+    d3 = (1, 0, 0). The zeros and the ones are then exact, also after rounding
+    to float32, which the quaternion route only gets to ~1e-16.
+    """
+    phi = _twist_angles(node_count, twists)
+    c, s = np.cos(phi), np.sin(phi)
+    zero, one = np.zeros_like(phi), np.ones_like(phi)
+    d1 = np.stack([zero, s, -c], axis=-1)
+    d2 = np.stack([zero, c, s], axis=-1)
+    d3 = np.stack([one, zero, zero], axis=-1)
+    frames = np.stack([d1, d2, d3], axis=-1)
+    assert np.allclose(frames, quat_matrix(rest_orientations(node_count, twists)), atol=1e-12)
+    return frames
+
+
+def rest_relative_orientations(node_count, twists):
+    """q0_i^-1 * q0_{i+1} for i = 0..N-3, (N-2, 4) float64.
+
+    Consecutive rest frames differ by the twist step about the material axis d3:
+    (0, 0, sin(dphi/2), cos(dphi/2)), written out so its zero components are exact.
+    The twist is uniform, so dphi is computed once and every node gets the
+    bit-identical quaternion (differences of the absolute angles would scatter
+    by an ulp), and the rest curvature and moment are the same on every node.
+    """
+    half = np.full(node_count - 2, 0.5 * (2.0 * np.pi * twists / (node_count - 1)))
+    rel = np.stack([np.zeros_like(half), np.zeros_like(half), np.sin(half), np.cos(half)], axis=-1)
+    q0 = rest_orientations(node_count, twists)
+    assert np.allclose(rel, quat_mul(quat_conj(q0[:-1]), q0[1:]), atol=1e-12)
+    return rel
+
+
+def reference_offsets(ref_vecs, frames, dl):
+    """R0^T ref - dl e3 per edge (N-1, 3), float64, with dl as the simulation's float32 value.
+
+    The shader adds R0^T (u_{i+1} - u_i) to this to get the small vector
+    R0^T r - dl e3, from which it evaluates strain and stretch without
+    subtracting anything close to 1 from 1.
+    """
+    a = np.einsum('nkj,nk->nj', frames, np.asarray(ref_vecs, dtype=np.float64))   # R0^T ref
+    a[:, 2] -= float(np.float32(dl))
+    return a
 
 
 def generate_straight_rod(
@@ -89,16 +155,23 @@ def generate_straight_rod(
 
     K_bt = np.array([EI, EI, G_core * J], dtype=np.float32)
 
-    orientations = rest_orientations(node_count, twists)
-
+    # Edge orientations are stored as the deviation p from the rest orientation
+    # q0 (q = q0 * p), so they start at the identity; the rest frame itself is
+    # handed over as directors and as the relative rest rotation per node.
+    identity = np.array([0.0, 0.0, 0.0, 1.0])
+    frames = rest_frames(node_count, twists)
     ref_vecs = reference_vectors(node_count, tuned_length)
+    offsets = reference_offsets(ref_vecs, frames, dl)
 
-    edges = [(o, v, np.zeros(3), np.zeros(3)) for o, v in zip(orientations, ref_vecs)]
-    edges.append((edges[-1][0], np.zeros(3), np.zeros(3), np.zeros(3)))
+    edges = [(identity, v, np.zeros(3), np.zeros(3), o, [f[:, 0], f[:, 1], f[:, 2]])
+             for v, o, f in zip(ref_vecs, offsets, frames)]
+    # Ghost edge (never strained; its frame is only read for safety)
+    edges.append((identity, np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), edges[-1][5]))
 
+    rel = rest_relative_orientations(node_count, twists)
     nodes = [
-        (np.zeros(3), np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]))
-        for _ in range(node_count)
+        (np.zeros(3), np.zeros(3), identity, rel[i] if i < len(rel) else identity)
+        for i in range(node_count)
     ]
 
     return nodes, edges, dl, mass, inertia, K_se, K_bt

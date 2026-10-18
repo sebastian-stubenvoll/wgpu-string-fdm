@@ -14,11 +14,18 @@ struct Node {
         
     internal_moment: vec3<f32>, // 12 bytes
     // 4 bytes of implicit padding
+
+    rest_relative_orientation: vec4<f32>, // 16 bytes
+    // q0_i^-1 * q0_{i+1}: rotation from the rest frame of edge i to that of edge i+1.
+    // Precomputed in double precision, so it is never rebuilt from two rounded absolute
+    // orientations.
 }
 
 struct Edge {
 // alignment is 16 bytes
     orientation: vec4<f32>, // 16 bytes
+    // Deviation p from the rest orientation q0: the edge orientation is q = q0 * p.
+    // p stays near the identity, so its vector part keeps full relative precision.
 
     angular_velocity: vec3<f32>, // 12 bytes
     len_inv: f32, // 4 bytes
@@ -34,6 +41,14 @@ struct Edge {
 
     reference_vector: vec3<f32>,
     // 4 bytes of implicit padding
+
+    reference_offset: vec3<f32>, // 12 bytes
+    // 4 bytes of implicit padding
+    // R0^T * reference_vector - dl * e3 (MF of the rest frame), precomputed in double precision.
+    // Adding the rotated displacement difference gives R0^T * r - dl * e3, a small vector.
+
+    rest_frame: mat3x3<f32>, // 48 bytes (3 columns of 16 bytes)
+    // Rest directors [d1 d2 d3] in lab coordinates, R0 = R(q0).
 }
 
 struct Uniforms {
@@ -133,17 +148,14 @@ fn create_references(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + global_id.x;
     let future = (c.future * uniforms.node_count) + global_id.x;
     if (global_id.x < uniforms.node_count - 1) {
-        let r = edges[current].reference_vector + (nodes[current + 1].displacement - nodes[current].displacement);
-        let tangent_LF = r * uniforms.dl_inv;
-        let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
-        let current_strain_MF = tangent_MF - vec3<f32>(0.0, 0.0, 1.0);
-        
+        let current_strain_MF = material_strain(edges[current].orientation, edge_offset(current));
+
         edges[current].reference_strain = current_strain_MF;
         edges[future].reference_strain = current_strain_MF;
     }
 
     if (global_id.x < uniforms.node_count - 2) {
-        let relative_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
+        let relative_orientation = relative_rotation(current);
 
         nodes[current].reference_orientation = relative_orientation;
         nodes[future].reference_orientation = relative_orientation;
@@ -184,25 +196,24 @@ fn hammer_half_step() {
 fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + global_id.x;
     let future = (c.future * uniforms.node_count) + global_id.x;
-    var len_inv: f32;
+    var stretch: f32;
 
     if (global_id.x < uniforms.node_count - 1) {
 
-        let r = edges[current].reference_vector + (nodes[current + 1].displacement - nodes[current].displacement);
-        let tangent_LF = r * uniforms.dl_inv;
-        let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
+        // Same quantities as R(q)^T r / dl - e3 and |r| / dl - 1, evaluated from the small
+        // offset w = R0^T r - dl e3 so that nothing close to 1 is subtracted from 1.
+        let w = edge_offset(current);
+        let current_strain_MF = material_strain(edges[current].orientation, w);
+        let len = offset_length(w);
+        edges[current].len_inv = 1.0 / len;
 
-        let current_strain_MF = tangent_MF - vec3<f32>(0.0, 0.0, 1.0);
-        len_inv = 1.0 / length(r);
-        edges[current].len_inv = len_inv;
-
-        let e = 1.0/ (len_inv * uniforms.dl);
-        let eta = 1.0 - 0.3 * (e - 1.0);
+        stretch = offset_stretch(w, len); // e - 1
+        let eta = 1.0 - 0.3 * stretch;
         let stiffness_se_dyn = uniforms.stiffness_se * eta * eta;
 
         let sigma_eff = current_strain_MF - edges[current].reference_strain; // (MF)
         edges[future].strain = sigma_eff;
-        edges[current].internal_force = rotate(edges[current].orientation, (stiffness_se_dyn * sigma_eff)) ; // (LF)
+        edges[current].internal_force = to_lab(current, stiffness_se_dyn * sigma_eff); // (LF)
     }
 
     if ( global_id.x < uniforms.node_count - 2) {
@@ -211,15 +222,13 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // Therefore this convention causes the i-th region to contain node i+1. This must be accounted for when
         // defining the descrete difference/average operators (i.e. here one must use backwards differences)!
         
-        let r = edges[current+1].reference_vector + (nodes[current + 2].displacement - nodes[current + 1].displacement);
-        let next_len_inv = 1.0 / length(r);
-        let e1 = 1.0 / (len_inv * uniforms.dl);
-        let e2 = 1.0 / (next_len_inv * uniforms.dl);
-        let epsilon = 0.5 * (e1 + e2);
-        let eta_voronoi = 1.0 - 0.3 * (epsilon - 1.0);
+        let w_next = edge_offset(current + 1);
+        let next_stretch = offset_stretch(w_next, offset_length(w_next));
+        // epsilon - 1 with epsilon = (e1 + e2) / 2
+        let eta_voronoi = 1.0 - 0.3 * (0.5 * (stretch + next_stretch));
         let stiffness_bt_dyn = uniforms.stiffness_bt * eta_voronoi * eta_voronoi * eta_voronoi * eta_voronoi;
 
-        var relative_orientation = qmul(qinv(edges[current].orientation), edges[current+1].orientation);
+        var relative_orientation = relative_rotation(current);
 
         // Select closest quaternion pole
         if (dot(relative_orientation, nodes[current].reference_orientation) < 0.0) {
@@ -270,7 +279,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 // at its far end, calculating this here is fine. 
                 // In fact, the ghost edge makes these accesses always safe and the ghost torque is never applied.
                 // For hammer_offset_y = 0 this becomes 0.
-                ext_couple = rotate_inv(edges[current].orientation, cross(vec3<f32>(0.0, c.hammer_offset_y, 0.0), ext_force));
+                ext_couple = to_material(current, cross(vec3<f32>(0.0, c.hammer_offset_y, 0.0), ext_force));
 
                 let fixed_point_force = i32(weighted_force * 10000.0);
                 atomicAdd(&hammer.force_accumulator, fixed_point_force);
@@ -297,9 +306,9 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
     
     if (global_id.x > (0 + uniforms.clamp_offset) && global_id.x < (uniforms.node_count - 2 - uniforms.clamp_offset)) {
         
-        let r = edges[current].reference_vector + (nodes[current + 1].displacement - nodes[current].displacement);
-        let tangent_LF = r * uniforms.dl_inv;
-        let tangent_MF = rotate_inv(edges[current].orientation, tangent_LF);
+        // tangent_MF = R(q)^T r / dl = e3 + strain_MF; kept split, see the couple term below.
+        let w = edge_offset(current);
+        let strain_MF = material_strain(edges[current].orientation, w);
 
         let damping_torque = - c.angular_dampening * edges[current].angular_velocity;
 
@@ -316,8 +325,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
             average = 0.5 * uniforms.dl * (cross(nodes[current].curvature, nodes[current].internal_moment) + cross(nodes[current- 1].curvature, nodes[current- 1].internal_moment));
         }
 
-        let e = 1.0 / (edges[current].len_inv * uniforms.dl);
-        let eta = 1.0 - 0.3 * (e - 1.0);
+        let eta = 1.0 - 0.3 * offset_stretch(w, offset_length(w));
         let inertia_dyn = uniforms.inertia * eta * eta;
         let inertia_inv_dyn = uniforms.inertia_inv * ( 1.0 / (eta * eta));
 
@@ -326,10 +334,14 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let e_dot = dot(relative_velocity, tangent_unit) * uniforms.dl_inv;
 
         let unsteady_dilatation = (0.6 * e_dot / eta) * inertia_dyn * edges[current].angular_velocity;
-    
+
+        // cross(tangent_MF, n) with tangent_MF = e3 + strain_MF, split by linearity
+        let n_MF = to_material(current, edges[current].internal_force);
+        let shear_couple = cross(vec3<f32>(0.0, 0.0, 1.0), n_MF) + cross(strain_MF, n_MF);
+
         let phi_tt =( difference
                             + average
-                            + (cross(tangent_MF, rotate_inv(edges[current].orientation, edges[current].internal_force)) * uniforms.dl)
+                            + (shear_couple * uniforms.dl)
                             + ext_couple
                             + damping_torque
                             + cross((inertia_dyn * edges[current].angular_velocity), edges[current].angular_velocity) 
@@ -400,6 +412,50 @@ fn rotate_inv(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
     let rotated = qmul(qmul(q_inv, u), q);
 
     return rotated.xyz;
+}
+
+// R(q)^T v for edge i, with q = q0 * p: first into the rest frame, then by the deviation.
+fn to_material(i: u32, v: vec3<f32>) -> vec3<f32> {
+    // v * M == transpose(M) * v
+    return rotate_inv(edges[i].orientation, v * edges[i].rest_frame);
+}
+
+// R(q) v for edge i, with q = q0 * p.
+fn to_lab(i: u32, v: vec3<f32>) -> vec3<f32> {
+    return edges[i].rest_frame * rotate(edges[i].orientation, v);
+}
+
+// w = R0^T r - dl e3 for edge i, with r = reference_vector + (u_{i+1} - u_i).
+fn edge_offset(i: u32) -> vec3<f32> {
+    return edges[i].reference_offset
+        + ((nodes[i + 1].displacement - nodes[i].displacement) * edges[i].rest_frame);
+}
+
+// R(p)^T e3 - e3 for a unit quaternion p, built from its vector part only.
+fn rotation_deviation_inv(p: vec4<f32>) -> vec3<f32> {
+    let e3 = vec3<f32>(0.0, 0.0, 1.0);
+    return -2.0 * p.w * cross(p.xyz, e3) + 2.0 * cross(p.xyz, cross(p.xyz, e3));
+}
+
+// Strain R(q)^T r / dl - e3, written as R(p)^T w / dl + (R(p)^T e3 - e3).
+fn material_strain(p: vec4<f32>, w: vec3<f32>) -> vec3<f32> {
+    return rotate_inv(p, w) * uniforms.dl_inv + rotation_deviation_inv(p);
+}
+
+// |r| = |dl e3 + w|
+fn offset_length(w: vec3<f32>) -> f32 {
+    return length(vec3<f32>(w.x, w.y, uniforms.dl + w.z));
+}
+
+// e - 1 = |r| / dl - 1 = (2 dl w_z + |w|^2) / (dl (|r| + dl))
+fn offset_stretch(w: vec3<f32>, len: f32) -> f32 {
+    return (2.0 * uniforms.dl * w.z + dot(w, w)) / (uniforms.dl * (len + uniforms.dl));
+}
+
+// q_i^-1 * q_{i+1} = p_i^-1 * (q0_i^-1 * q0_{i+1}) * p_{i+1}
+fn relative_rotation(i: u32) -> vec4<f32> {
+    return qmul(qmul(qinv(edges[i].orientation), nodes[i].rest_relative_orientation),
+                edges[i + 1].orientation);
 }
 
 fn integrate_exponential(q: vec4<f32>, omega: vec3<f32>, dt: f32) -> vec4<f32> {

@@ -21,8 +21,11 @@ from plots.energy import (plot_energies, plot_energy_components, plot_energy_tot
                           ENERGY_DENSITY_BLOCK, block_mean, block_centers)
 from plots.energy_flow import (exact_flow, roundoff_forces, modal_transfer, edge_forces, edges_to_nodes,
                                dst_parseval,
-                               plot_energy_flow, plot_element_map, plot_modal_transfer,
-                               plot_transfer_spectrum, plot_energy_source, N_TRANSFER_MODES)
+                               plot_energy_flow, plot_transfer_power, plot_transfer_cumulative,
+                               plot_element_map, plot_element_transfer_integral,
+                               plot_modal_transfer, plot_modal_transfer_sum, plot_transfer_spectrum,
+                               plot_energy_balance, plot_energy_unexplained, plot_roundoff_force,
+                               N_TRANSFER_MODES)
 from plots.spectrogram import plot_node_spectrogram
 from plots.audio import generate_node_audio
 from plots.inharmonicity import plot_inharmonicity_comparison, plot_inharmonicity_deviation
@@ -32,7 +35,8 @@ from plots.transient import plot_spacetime_heatmap, plot_waterfall_3d, plot_node
 from plots.dispersion import (modal_projection, kspace_grid, kspace_projection, StreamingModalSpectra,
                               StreamingKOmegaSpectra, StreamingCrossSpectrum, finalize_dispersion,
                               find_resonances, plot_dispersion)
-from utils import reference_vectors, rest_orientations
+from utils import (reference_vectors, rest_orientations, rest_frames, reference_offsets,
+                   quat_mul)
 from plots.gallery import write_gallery
 
 # Dispersion analysis: modes kept per frame and Welch segment length (frames).
@@ -59,7 +63,8 @@ def _diag(K):
 # Parallel Extraction Worker
 def _process_single_chunk(args):
     (nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl, capture_field, want_spectra,
-     n_modes, length, dampening, ref_vecs, q_rest, dt_sim) = args
+     n_modes, length, dampening, reference, dt_sim) = args
+    ref_vecs, q_rest = reference["ref"], reference["q_rest"]
 
     with gzip.open(nf, "rb") as f:
         n_chunk = pickle.load(f)
@@ -71,6 +76,10 @@ def _process_single_chunk(args):
     # = [angular velocity, ., strain]. The last edge is the ghost edge.
     nodes = np.asarray(n_chunk, dtype=np.float32)
     quats = np.asarray([[e[0] for e in frame] for frame in e_chunk], dtype=np.float32)
+    if reference["relative"]:
+        # The GPU stores each orientation as its deviation p from the rest
+        # orientation q0 (q = q0 * p); everything below works with q.
+        quats = quat_mul(reference["q_rest_ghost"], quats)
     evecs = np.asarray([[e[1] for e in frame] for frame in e_chunk], dtype=np.float32)
     del n_chunk, e_chunk
     n_frames, node_count = nodes.shape[:2]
@@ -143,7 +152,11 @@ def _process_single_chunk(args):
     c_lin, c_ang = dampening
     q_e = quats[:, :-1]
     fl = exact_flow(pos, vel, q_e, ref_vecs, q_rest, dl, m_node, K_se_d, c_lin)
-    d_round = roundoff_forces(pos, q_e, ref_vecs, dl, K_se_d)[:, 1:-1]
+    d_old, d_new = roundoff_forces(pos, q_e, ref_vecs, q_rest, reference["frames"],
+                                   reference["offsets"], dl, K_se_d)
+    # The formulation the run actually used is the one whose rounding matters.
+    d_round, d_other = (d_new, d_old) if reference["relative"] else (d_old, d_new)
+    d_round, d_other = d_round[:, 1:-1], d_other[:, 1:-1]
     d_perp2 = np.sum(d_round[..., 1:] ** 2, axis=-1)
     flow = {
         "KE_T": fl["ke_t"].sum(1), "KE_R": (rot_edge - rot_edge_t).sum(1), "KE_tor": rot_edge_t.sum(1),
@@ -153,16 +166,21 @@ def _process_single_chunk(args):
         "D_all": c_lin * np.sum(v64[:, 1:-1] ** 2, axis=(1, 2)) + c_ang * np.sum(w64 ** 2, axis=(1, 2)),
         "dF_x_rms": np.sqrt(np.mean(d_round[..., 0] ** 2, axis=1)),
         "dF_perp_rms": np.sqrt(np.mean(d_perp2, axis=1)),
+        # The same for the other shader formulation (offset vs absolute orientation)
+        "dF_x_rms_other": np.sqrt(np.mean(d_other[..., 0] ** 2, axis=1)),
+        "dF_perp_rms_other": np.sqrt(np.mean(np.sum(d_other[..., 1:] ** 2, axis=-1), axis=1)),
         # Heating if the rounding were independent each solver step: dF^2 dt / (2m) per node.
         "H_x": np.sum(d_round[..., 0] ** 2, axis=1) * dt_sim / (2.0 * m_node),
         "H_perp": np.sum(d_perp2, axis=1) * dt_sim / (2.0 * m_node),
     }
     flow = {k: v.astype(np.float32) for k, v in flow.items()}
-    del d_round, d_perp2
+    del d_old, d_new, d_round, d_other, d_perp2
 
-    # Force-port check against the saved internal force. The saved value is
-    # one solver step behind the saved positions (buffer swap), so expect
-    # agreement to ~omega * dt_sim, not to rounding.
+    # Force-port check against the saved internal force. The saved value was
+    # computed at the mid-step state two solver steps before the saved one
+    # (buffer swap), i.e. 1.5 steps behind the saved positions, so expect
+    # agreement to the change over 1.5 steps, not to rounding. Saved every
+    # step, the port matches that mid-step state to float32 rounding.
     f_port = edge_forces(r, q_e, dl, K_se_d)
     f_saved = evecs[:, :-1, 1].astype(np.float64)
     force_check = float(np.median(np.linalg.norm(f_saved - f_port, axis=-1)
@@ -171,7 +189,8 @@ def _process_single_chunk(args):
 
     # Per-element maps, block-averaged in time; the excitation chunks also get
     # a finer version for the transient phase.
-    per_elem = {"trans": fl["ke_t"], "long": fl["ke_l"] + edges_to_nodes(fl["u_l_quad"]),
+    per_elem = {"trans": fl["ke_t"], "long_ke": fl["ke_l"],
+                "long": fl["ke_l"] + edges_to_nodes(fl["u_l_quad"]),
                 "transfer": fl["p_disp"] + fl["p_rot"]}
     maps = {k: block_mean(v, ENERGY_DENSITY_BLOCK) for k, v in per_elem.items()}
     maps_fine = ({k: block_mean(v, FINE_MAP_BLOCK) for k, v in per_elem.items()}
@@ -217,24 +236,41 @@ def _format_parameters(metadata):
 ENERGY_KEYS = ("t_ke", "r_ke", "bt_pe", "ss_pe", "t_ke_l", "r_ke_t", "bt_pe_tw", "ss_pe_ex")
 
 # Core Memory-Efficient Extraction
-def rod_reference(node_count, length, dl, rod_params=None, uniform_reference=None):
+def rod_reference(node_count, length, dl, rod_params=None, uniform_reference=None,
+                  relative_orientations=False):
     """Edge reference vectors and rest orientations exactly as the simulation
     got them (utils.generate_straight_rod). uniform_reference=False (runs made
-    before the bit-identical spacing) reproduces the old float32 spacings."""
+    before the bit-identical spacing) reproduces the old float32 spacings.
+    relative_orientations: the run stored orientations as deviations from the
+    rest orientation (runs made with the offset formulation of the shader).
+
+    Returns a dict: ref (N-1, 3), q_rest (N-1, 4) the rest orientation as the
+    GPU effectively holds it (float32 absolute quaternions for older runs, the
+    exact rest orientation for relative runs, where p = identity at rest),
+    q_rest_ghost (N, 4) float64 incl. the ghost edge, frames (N-1, 3, 3),
+    offsets (N-1, 3) and relative.
+    """
     L = length if length is not None else dl * (node_count - 1)
     ref = reference_vectors(node_count, L, legacy=not uniform_reference)
     twists = (rod_params or {}).get("twists")
     if twists is None:
         print(f"[{datetime.now()}] Warning: rod twist unknown; assuming untwisted rest orientations.")
         twists = 0.0
-    # The GPU holds the orientations in float32.
-    q_rest = rest_orientations(node_count, twists).astype(np.float32)
-    return ref, q_rest
+    q0 = rest_orientations(node_count, twists)
+    frames = rest_frames(node_count, twists)
+    return {
+        "ref": ref,
+        "q_rest": q0 if relative_orientations else q0.astype(np.float32),
+        "q_rest_ghost": np.concatenate([q0, q0[-1:]], axis=0),
+        "frames": frames,
+        "offsets": reference_offsets(ref, frames, dl),
+        "relative": bool(relative_orientations),
+    }
 
 
 def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_nodes, length=None,
                  n_modes=DISPERSION_MODES, nperseg=DISPERSION_NPERSEG, rod_params=None,
-                 uniform_reference=None):
+                 uniform_reference=None, relative_orientations=False):
     """Read all chunks in parallel and reduce them to the arrays the plots need.
 
     Returns a dict with 'time', 'fs', the energy arrays (ENERGY_KEYS),
@@ -265,13 +301,16 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
     if node_count is None:
         with gzip.open(node_files[0], "rb") as f:
             node_count = len(pickle.load(f)[0])
-    ref_vecs, q_rest = rod_reference(node_count, length, dl, rod_params, uniform_reference)
+    reference = rod_reference(node_count, length, dl, rod_params, uniform_reference,
+                              relative_orientations)
+    ref_vecs = reference["ref"]
     print(f"[{datetime.now()}] Edge reference spacing: "
           f"{'uniform' if uniform_reference else 'legacy float32 differences'} "
-          f"({np.unique(ref_vecs[:, 0]).size} distinct values).")
+          f"({np.unique(ref_vecs[:, 0]).size} distinct values); orientations stored "
+          f"{'relative to the rest frame' if relative_orientations else 'absolute'}.")
     args_list = [(nf, ef, inspect_nodes, m_node, inertia, K_se, K_bt, dl,
                   idx < n_exc_chunks, idx >= n_exc_chunks, n_modes, length, dampening,
-                  ref_vecs, q_rest, dt)
+                  reference, dt)
                  for idx, (nf, ef) in enumerate(zip(node_files, edge_files))]
 
     all_node_data = {n: {'pos': [], 'vel': [], 'mom': [], 'quats': [], 'omega': []} for n in inspect_nodes}
@@ -335,7 +374,14 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
     print(f"[{datetime.now()}] Extraction complete. Stitching arrays...")
     if force_checks:
         print(f"[{datetime.now()}] Force port vs saved internal force: median relative difference "
-              f"{np.median(force_checks):.2e} (saved force lags the saved positions by one solver step).")
+              f"{np.median(force_checks):.2e} (the saved force is 1.5 solver steps older than the saved positions).")
+    if "dF_x_rms" in all_flow:
+        med = {k: float(np.median(np.concatenate(all_flow[k])))
+               for k in ("dF_x_rms", "dF_perp_rms", "dF_x_rms_other", "dF_perp_rms_other")}
+        run, other = ("offset", "absolute") if relative_orientations else ("absolute", "offset")
+        print(f"[{datetime.now()}] Float32 node-force rounding (median RMS over frames): "
+              f"{run} formulation (this run) x {med['dF_x_rms']:.2e} N, y/z {med['dF_perp_rms']:.2e} N; "
+              f"{other} formulation x {med['dF_x_rms_other']:.2e} N, y/z {med['dF_perp_rms_other']:.2e} N.")
     p_spec = transfer_acc.finalize()
     if p_spec is not None:
         p_spec["p_nf"] = p_spec["p_nf"] * dst_parseval(node_count - 2)
@@ -358,6 +404,7 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
         "modal_transfer_fine": np.concatenate(modal_tr_fine, axis=0) if modal_tr_fine else None,
         "transfer_spectrum": p_spec,
         "dt_sim": dt,
+        "relative_orientations": bool(relative_orientations),
         "node_data": {
             n: {key: np.concatenate(vals) for key, vals in all_node_data[n].items()}
             for n in inspect_nodes
@@ -482,8 +529,15 @@ def build_plot_tasks(data, output_dir, run_id, dt, oversamp, dl, inspect_nodes, 
                             "filename": f"{energy_prefix}_energy_components.png"}))
         if p_flow is not None:
             plot_tasks.append((plot_energy_flow, (p_time, p_flow),
-                               {"window_s": smooth, "onset": p_onset, "period": period,
+                               {"window_s": smooth, "onset": p_onset,
                                 "title_prefix": phase_title, "filename": f"{energy_prefix}_energy_flow.png"}))
+            plot_tasks.append((plot_transfer_power, (p_time, p_flow),
+                               {"window_s": smooth, "onset": p_onset, "period": period,
+                                "title_prefix": phase_title,
+                                "filename": f"{energy_prefix}_transfer_power.png"}))
+            plot_tasks.append((plot_transfer_cumulative, (p_time, p_flow),
+                               {"onset": p_onset, "title_prefix": phase_title,
+                                "filename": f"{energy_prefix}_transfer_cumulative.png"}))
 
         if not transient:
             for kw, suffix in (({}, "energy"), ({"normalized": True}, "energy_norm"),
@@ -509,17 +563,32 @@ def build_plot_tasks(data, output_dir, run_id, dt, oversamp, dl, inspect_nodes, 
                           else (data.get("maps"), data.get("maps_time")))
             rows = _rows_in(src_t, p_time[0], p_time[-1]) if src is not None else None
             if rows is not None:
-                for kind, suffix in (("trans", "element_energy_trans"), ("long", "element_energy_long"),
+                for kind, suffix in (("trans", "element_energy_trans"),
+                                     ("long_ke", "element_energy_long_ke"),
+                                     ("long", "element_energy_long"),
                                      ("transfer", "element_transfer")):
+                    if kind not in src:
+                        continue
                     plot_tasks.append((plot_element_map, (src_t[rows], src[kind][rows], string_len, kind),
                                        {"onset": p_onset, "title_prefix": phase_title,
                                         "filename": f"{energy_prefix}_{suffix}.png"}))
+                plot_tasks.append((plot_element_transfer_integral,
+                                   (src_t[rows], src["transfer"][rows], string_len),
+                                   {"title_prefix": phase_title,
+                                    "filename": f"{energy_prefix}_element_transfer_integral.png"}))
 
         # Is energy created? Free vibration only (no hammer work to account for).
         if phase_name == "Free_Vibration" and p_flow is not None and "D_all" in p_flow:
-            plot_tasks.append((plot_energy_source,
+            plot_tasks.append((plot_energy_balance,
                                (p_time, p_tke.astype(np.float64) + p_rke + p_bpe + p_spe, p_flow),
-                               {"title_prefix": phase_title, "filename": f"{energy_prefix}_energy_source.png"}))
+                               {"title_prefix": phase_title, "filename": f"{energy_prefix}_energy_balance.png"}))
+            plot_tasks.append((plot_energy_unexplained, (p_time, p_flow),
+                               {"title_prefix": phase_title,
+                                "filename": f"{energy_prefix}_energy_unexplained.png"}))
+            plot_tasks.append((plot_roundoff_force, (p_time, p_flow),
+                               {"relative": data.get("relative_orientations", False),
+                                "title_prefix": phase_title,
+                                "filename": f"{energy_prefix}_roundoff_force.png"}))
 
         # Transfer into each longitudinal mode.
         if transient or phase_name == "Full_Simulation":
@@ -530,6 +599,9 @@ def build_plot_tasks(data, output_dir, run_id, dt, oversamp, dl, inspect_nodes, 
                 plot_tasks.append((plot_modal_transfer, (src[rows], src_t[rows]),
                                    {"onset": p_onset, "title_prefix": phase_title,
                                     "filename": f"{energy_prefix}_modal_transfer.png"}))
+                plot_tasks.append((plot_modal_transfer_sum, (src[rows], src_t[rows]),
+                                   {"onset": p_onset, "title_prefix": phase_title,
+                                    "filename": f"{energy_prefix}_modal_transfer_sum.png"}))
 
         # Whole-string displacement and modal energy during the transient.
         if transient:
@@ -696,10 +768,12 @@ def send_email(email_config, sim_path, run_id, inspect_nodes, generated_images, 
 
 
 def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia, K_se, K_bt, inspect_nodes,
-                     tension=None, length=None, rod_params=None, uniform_reference=None):
+                     tension=None, length=None, rod_params=None, uniform_reference=None,
+                     relative_orientations=False):
     sim_path = Path(sim_path)
     data = extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_nodes, length=length,
-                        rod_params=rod_params, uniform_reference=uniform_reference)
+                        rod_params=rod_params, uniform_reference=uniform_reference,
+                        relative_orientations=relative_orientations)
 
     output_dir = sim_path / "plots"
     output_dir.mkdir(exist_ok=True)
@@ -800,4 +874,5 @@ if __name__ == "__main__":
         inspect_nodes=inspect_nodes,
         tension=rod_params.get("tension_force"), length=rod_params.get("tuned_length"),
         rod_params=rod_params, uniform_reference=bool(rod.get("uniform_reference_spacing", False)),
+        relative_orientations=rod.get("orientation_representation") == "relative_to_rest",
     )
