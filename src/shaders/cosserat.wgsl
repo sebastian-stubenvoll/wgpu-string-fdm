@@ -6,7 +6,8 @@ struct Node {
     // 4 bytes of implicit padding
 
     curvature: vec3<f32>, // 12 bytes
-    // 4 bytes of implicit padding
+    bend_stretch: f32, // 4 bytes (offset 44): eta' eta_v^3 kappa^T K_bt kappa of this bending region,
+                       // the stretch derivative of its bending/twist energy (variational force law)
    
     reference_orientation: vec4<f32>, // 16 bytes
     // this is the quaterion encoding the rotation needed to transform
@@ -71,8 +72,19 @@ struct Uniforms {
     // 4 bytes of implicit padding
     inertia_inv: vec3<f32>, // 12 bytes, 
     // 4 bytes of implicit padding
-    
+
+    // Viscous damping coefficients: torque -angular_damping * omega (per material axis: tilt, tilt,
+    // torsion; N m s) and force -linear_damping * v (N s / m). Derived from physical decay rates in
+    // batches/utils.damping_coefficients.
+    angular_damping: vec3<f32>, // offset 96
+    linear_damping: f32,        // offset 108
+
+    // 0: legacy force law (stiffness eta^2 K without its derivative, runs before 2026-10-18)
+    // 1: variational (the force is the gradient of the stored energy, see compute_internals)
+    force_law: u32,             // offset 112
 }
+
+const ETA_SLOPE: f32 = -0.3; // eta(e) = 1 + ETA_SLOPE (e - 1)
 
 struct HammerState {
     displacement: f32,
@@ -92,10 +104,10 @@ struct PushConstants {
     output_index: u32,
     hammering: u32, // 0 == false
 
-    linear_dampening: f32,
-    angular_dampening: f32,
+    write_output: u32, // advance_frame: 1 if this dispatch ends the output frame (formerly linear damping)
+    _reserved1: f32, // formerly angular damping (now in Uniforms)
     hammer_offset_y: f32,
-    _pad0: u32,
+    steps: u32, // solver steps per output frame (advance_frame only)
 }
 
 var <push_constant> c: PushConstants;
@@ -167,7 +179,12 @@ fn create_references(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @compute
 @workgroup_size(64) 
 fn half_step(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let current = (c.current * uniforms.node_count) + global_id.x;
+    half_step_body(global_id.x, c.current * uniforms.node_count);
+}
+
+fn half_step_body(gid: u32, current_base: u32) {
+    let global_id = vec3<u32>(gid, 0u, 0u);
+    let current = current_base + gid;
 
     // Half step position update (drift)
     if (global_id.x > (0 + uniforms.clamp_offset) && global_id.x < (uniforms.node_count - 2 - uniforms.clamp_offset)) {
@@ -188,14 +205,23 @@ fn half_step(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @compute
 @workgroup_size(1) 
 fn hammer_half_step() {
+    hammer_half_step_body();
+}
+
+fn hammer_half_step_body() {
     hammer.displacement = hammer.displacement + (hammer.velocity * uniforms.dt * 0.5);
 }
 
 @compute
 @workgroup_size(64) 
 fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let current = (c.current * uniforms.node_count) + global_id.x;
-    let future = (c.future * uniforms.node_count) + global_id.x;
+    compute_internals_body(global_id.x, c.current * uniforms.node_count, c.future * uniforms.node_count);
+}
+
+fn compute_internals_body(gid: u32, current_base: u32, future_base: u32) {
+    let global_id = vec3<u32>(gid, 0u, 0u);
+    let current = current_base + gid;
+    let future = future_base + gid;
     var stretch: f32;
 
     if (global_id.x < uniforms.node_count - 1) {
@@ -213,7 +239,18 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         let sigma_eff = current_strain_MF - edges[current].reference_strain; // (MF)
         edges[future].strain = sigma_eff;
-        edges[current].internal_force = to_lab(current, stiffness_se_dyn * sigma_eff); // (LF)
+        var n_MF = stiffness_se_dyn * sigma_eff;
+        if (uniforms.force_law == 1u) {
+            // Gradient of W = 1/2 eta(e)^2 sigma^T K sigma dl and of the rotational kinetic energy
+            // T = 1/2 omega^T I eta(e)^2 omega with respect to the edge vector, through e = |r|/dl:
+            // eta eta' (sigma^T K sigma - omega^T I omega / dl) along the edge tangent.
+            let omega = edges[current].angular_velocity;
+            let slope = ETA_SLOPE * eta * (dot(uniforms.stiffness_se * sigma_eff, sigma_eff)
+                                           - dot(uniforms.inertia * omega, omega) * uniforms.dl_inv);
+            let tangent_unit_MF = (vec3<f32>(0.0, 0.0, 1.0) + current_strain_MF) * (uniforms.dl / len);
+            n_MF = n_MF + slope * tangent_unit_MF;
+        }
+        edges[current].internal_force = to_lab(current, n_MF); // (LF)
     }
 
     if ( global_id.x < uniforms.node_count - 2) {
@@ -242,6 +279,10 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let kappa = 2.0 * uniforms.dl_inv * effective_orientation.xyz;
         nodes[current].curvature = kappa;
         nodes[current].internal_moment = stiffness_bt_dyn * kappa;
+        if (uniforms.force_law == 1u) {
+            // d/de of 1/2 eta_v^4 kappa^T K_bt kappa dl for each of the two edges (eta_v uses their mean)
+            nodes[current].bend_stretch = ETA_SLOPE * dot(kappa, stiffness_bt_dyn * kappa) / eta_voronoi;
+        }
     }
 }
 
@@ -249,8 +290,13 @@ fn compute_internals(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @compute
 @workgroup_size(64) 
 fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let current = (c.current * uniforms.node_count) + global_id.x;
-    let future = (c.future * uniforms.node_count) + global_id.x;
+    compute_forces_body(global_id.x, c.current * uniforms.node_count, c.future * uniforms.node_count);
+}
+
+fn compute_forces_body(gid: u32, current_base: u32, future_base: u32) {
+    let global_id = vec3<u32>(gid, 0u, 0u);
+    let current = current_base + gid;
+    let future = future_base + gid;
 
     var ext_force = vec3<f32>(0.0);
     var ext_couple = vec3<f32>(0.0);
@@ -290,10 +336,24 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
 
         
-        let damping_force = - c.linear_dampening * nodes[current].velocity;
+        let damping_force = - uniforms.linear_damping * nodes[current].velocity;
         
+        var bend_stretch_force = vec3<f32>(0.0);
+        if (uniforms.force_law == 1u) {
+            // Edge e carries (c_e + c_{e-1}) along its tangent, c_i = nodes[i].bend_stretch of the
+            // bending regions containing it (regions exist for i = 0 .. N-3; others are zero).
+            let j = global_id.x;
+            var c_here = nodes[current].bend_stretch + nodes[current - 1].bend_stretch;     // edge j
+            var c_prev = nodes[current - 1].bend_stretch;                                    // edge j-1
+            if (j >= 2u) { c_prev = c_prev + nodes[current - 2].bend_stretch; }
+            if (j == uniforms.node_count - 2u) { c_here = nodes[current - 1].bend_stretch; }
+            let t_here = (edges[current].reference_vector + nodes[current + 1].displacement - nodes[current].displacement) * edges[current].len_inv;
+            let t_prev = (edges[current - 1].reference_vector + nodes[current].displacement - nodes[current - 1].displacement) * edges[current - 1].len_inv;
+            bend_stretch_force = c_here * t_here - c_prev * t_prev;
+        }
+
         // Only calculate for interior edges, so naive difference operator is fine here!
-        let v_tt = (edges[current].internal_force - edges[current- 1].internal_force + ext_force + damping_force) * uniforms.mass_inv;
+        let v_tt = (edges[current].internal_force - edges[current- 1].internal_force + bend_stretch_force + ext_force + damping_force) * uniforms.mass_inv;
 
         // Full step velocity update (kick)
         nodes[future].velocity = nodes[current].velocity + (v_tt * uniforms.dt);
@@ -310,7 +370,7 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let w = edge_offset(current);
         let strain_MF = material_strain(edges[current].orientation, w);
 
-        let damping_torque = - c.angular_dampening * edges[current].angular_velocity;
+        let damping_torque = - uniforms.angular_damping * edges[current].angular_velocity;
 
         var difference: vec3<f32>;
         var average: vec3<f32>;
@@ -365,6 +425,10 @@ fn compute_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @compute
 @workgroup_size(1) 
 fn hammer_update() {
+    hammer_update_body();
+}
+
+fn hammer_update_body() {
     let total_force = f32(atomicLoad(&hammer.force_accumulator)) / 10000.0;
     let hammer_acceleration = - total_force * hammer.mass_inv;
     hammer.velocity = hammer.velocity + (hammer_acceleration * uniforms.dt);
@@ -375,10 +439,72 @@ fn hammer_update() {
 @compute
 @workgroup_size(64) 
 fn save_output(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = (c.output_index * uniforms.node_count) + global_id.x;
-    let current = (c.current * uniforms.node_count) + global_id.x;
+    save_output_body(global_id.x, c.current * uniforms.node_count);
+}
+
+fn save_output_body(gid: u32, current_base: u32) {
+    let i = (c.output_index * uniforms.node_count) + gid;
+    let current = current_base + gid;
     output_nodes[i] = nodes[current];
     output_edges[i] = edges[current];
+}
+
+// One output frame in one dispatch: a single workgroup runs all c.steps solver steps of the frame
+// and writes the output frame. The phases are exactly the passes of compute_reference (half_step,
+// hammer_half_step, compute_internals, compute_forces, hammer_update), separated by storage
+// barriers instead of pass boundaries; no phase reads what the same phase writes, so every
+// element sees the same values in the same order as with separate passes.
+// Two workgroup sizes: 1024 threads (one per node at N = 1024) where the adapter allows it, 256 otherwise.
+@compute
+@workgroup_size(1024)
+fn advance_frame_1024(@builtin(local_invocation_index) t: u32) {
+    advance_frame_body(t, 1024u);
+}
+
+@compute
+@workgroup_size(256)
+fn advance_frame_256(@builtin(local_invocation_index) t: u32) {
+    advance_frame_body(t, 256u);
+}
+
+fn advance_frame_body(t: u32, threads: u32) {
+    var current_base = c.current * uniforms.node_count;
+    var future_base = c.future * uniforms.node_count;
+
+    for (var step = 0u; step < c.steps; step++) {
+        for (var i = t; i < uniforms.node_count; i += threads) {
+            half_step_body(i, current_base);
+        }
+        if (t == 0u) {
+            hammer_half_step_body();
+        }
+        storageBarrier();
+
+        for (var i = t; i < uniforms.node_count; i += threads) {
+            compute_internals_body(i, current_base, future_base);
+        }
+        storageBarrier();
+
+        for (var i = t; i < uniforms.node_count; i += threads) {
+            compute_forces_body(i, current_base, future_base);
+        }
+        storageBarrier();
+
+        if (t == 0u) {
+            hammer_update_body();
+        }
+        storageBarrier();
+
+        let swap = current_base;
+        current_base = future_base;
+        future_base = swap;
+    }
+
+    if (c.write_output == 1u) {
+        for (var i = t; i < uniforms.node_count; i += threads) {
+            save_output_body(i, current_base);
+        }
+    }
 }
 
 fn qinv(q: vec4<f32>) -> vec4<f32> {

@@ -83,10 +83,28 @@ def rotate_inv(q, v):
     return _qmul(_qmul(_qinv(q), _as_quat(v)), q)[..., :3]
 
 
-def edge_forces(r, quats, dl, K_se, dtype=np.float64):
+ETA_SLOPE = -0.3
+
+
+def _variational_slope(eta, sigma, K, omega, inertia, dl, dtype):
+    """eta eta' (sigma^T K sigma - omega^T I omega / dl): the stretch derivative of the stored
+    energy 1/2 eta^2 sigma^T K sigma dl and of the rotational kinetic energy 1/2 omega^T I eta^2
+    omega, per unit of tangent (variational force law)."""
+    slope = np.sum(K * sigma * sigma, axis=-1)
+    if omega is not None:
+        om = np.asarray(omega, dtype=dtype)
+        slope = slope - np.sum(np.asarray(inertia, dtype=dtype) * om * om, axis=-1) / dtype(dl)
+    return dtype(ETA_SLOPE) * eta * slope
+
+
+def edge_forces(r, quats, dl, K_se, dtype=np.float64, force_law="legacy", omega=None, inertia=None):
     """Internal edge forces f_e (lab frame) exactly as compute_internals, for
     edge vectors r (..., 3) and orientations quats (..., 4). dtype=float32
-    reproduces the shader's precision (up to operation order and FMA)."""
+    reproduces the shader's precision (up to operation order and FMA).
+    force_law="variational" adds eta eta' (sigma^T K sigma - omega^T I omega / dl) along the
+    tangent (pass the edges' angular velocities and the per-edge inertia for the kinetic part).
+    This is the edge force the shader stores; the bending-region part is in
+    bend_stretch_forces."""
     r = np.asarray(r, dtype=dtype)
     q = np.asarray(quats, dtype=dtype)
     one = dtype(1.0)
@@ -98,7 +116,11 @@ def edge_forces(r, quats, dl, K_se, dtype=np.float64):
     e = one / (len_inv * dl_)
     eta = one - dtype(0.3) * (e - one)
     K = np.asarray(K_se, dtype=dtype)
-    return rotate(q, K * (eta * eta)[..., None] * sigma)
+    n = K * (eta * eta)[..., None] * sigma
+    if force_law == "variational":
+        tangent_unit = tangent_MF * (dl_ * len_inv)[..., None]
+        n = n + _variational_slope(eta, sigma, K, omega, inertia, dl, dtype)[..., None] * tangent_unit
+    return rotate(q, n)
 
 
 def rotation_deviation_inv(p):
@@ -109,7 +131,8 @@ def rotation_deviation_inv(p):
     return -2 * w * np.cross(pv, e3) + 2 * np.cross(pv, np.cross(pv, e3))
 
 
-def edge_forces_offset(du, p, frames, offsets, dl, K_se, dtype=np.float64):
+def edge_forces_offset(du, p, frames, offsets, dl, K_se, dtype=np.float64, force_law="legacy",
+                       omega=None, inertia=None):
     """Internal edge forces f_e (lab frame) as the current compute_internals
     evaluates them: orientation q = q0 p stored as the deviation p, rest frame
     R0 (frames, (N-1, 3, 3), columns d1 d2 d3) and offsets R0^T ref - dl e3.
@@ -125,7 +148,58 @@ def edge_forces_offset(du, p, frames, offsets, dl, K_se, dtype=np.float64):
     s = (dtype(2) * dl_ * w[..., 2] + np.sum(w * w, axis=-1)) / (dl_ * (length + dl_))
     eta = dtype(1) - dtype(0.3) * s
     K = np.asarray(K_se, dtype=dtype)
-    return np.einsum('nij,...nj->...ni', R0, rotate(p, K * (eta * eta)[..., None] * sigma))
+    n = K * (eta * eta)[..., None] * sigma
+    if force_law == "variational":
+        tangent_unit = (_E3.astype(dtype) + sigma) * (dl_ / length)[..., None]
+        n = n + _variational_slope(eta, sigma, K, omega, inertia, dl, dtype)[..., None] * tangent_unit
+    return np.einsum('nij,...nj->...ni', R0, rotate(p, n))
+
+
+def curvatures(quats, dl):
+    """Curvature of every bending region (edges i, i+1), (..., N-2, 3), as the shader computes it
+    with identity reference orientations: 2/dl times the vector part of q_i^-1 q_(i+1), on the
+    pole closest to the identity."""
+    q = np.asarray(quats, dtype=np.float64)
+    rel = _qmul(_qinv(q[..., :-1, :]), q[..., 1:, :])
+    rel = np.where(rel[..., 3:] < 0, -rel, rel)
+    return 2.0 / float(dl) * rel[..., :3]
+
+
+def edge_stretch(r, dl):
+    """e - 1 per edge from the edge vectors."""
+    return np.linalg.norm(np.asarray(r, dtype=np.float64), axis=-1) / float(dl) - 1.0
+
+
+def bend_stretch_forces(r, quats, dl, K_bt):
+    """Edge forces (lab, (..., N-1, 3)) from the stretch dependence of the bending/twist energy
+    1/2 eta_v^4 kappa^T K_bt kappa dl of each region (variational force law): edge e carries
+    (c_e + c_(e-1)) along its tangent, c_i = eta' eta_v,i^3 kappa_i^T K_bt kappa_i."""
+    r = np.asarray(r, dtype=np.float64)
+    s = edge_stretch(r, dl)
+    kap = curvatures(quats, dl)
+    eta_v = 1.0 + ETA_SLOPE * 0.5 * (s[..., :-1] + s[..., 1:])
+    c = ETA_SLOPE * eta_v ** 3 * np.sum(np.asarray(K_bt, np.float64) * kap * kap, axis=-1)
+    c_edge = np.zeros(s.shape)
+    c_edge[..., :-1] += c
+    c_edge[..., 1:] += c
+    t_hat = r / np.linalg.norm(r, axis=-1, keepdims=True)
+    return c_edge[..., None] * t_hat
+
+
+def stored_energy(r, quats, dl, K_se, K_bt):
+    """Stored energy per frame (..., ): sum over edges of 1/2 eta^2 sigma^T K_se sigma dl plus sum
+    over bending regions of 1/2 eta_v^4 kappa^T K_bt kappa dl (reference strain and reference
+    curvature zero). The variational force law is its exact negative gradient."""
+    r = np.asarray(r, dtype=np.float64)
+    q = np.asarray(quats, dtype=np.float64)
+    sigma = rotate_inv(q, r / float(dl)) - _E3
+    s = edge_stretch(r, dl)
+    eta = 1.0 + ETA_SLOPE * s
+    W_s = 0.5 * eta ** 2 * np.sum(np.asarray(K_se, np.float64) * sigma * sigma, axis=-1) * dl
+    kap = curvatures(q, dl)
+    eta_v = 1.0 + ETA_SLOPE * 0.5 * (s[..., :-1] + s[..., 1:])
+    W_b = 0.5 * eta_v ** 4 * np.sum(np.asarray(K_bt, np.float64) * kap * kap, axis=-1) * dl
+    return W_s.sum(axis=-1) + W_b.sum(axis=-1)
 
 
 def node_forces(f):
@@ -135,8 +209,13 @@ def node_forces(f):
     return out
 
 
-def _g_derivs(s0):
-    """g', g'', g''', g'''' at s0 for g(s) = s^2/2 - 0.2 s^3 + 0.0225 s^4."""
+def _g_derivs(s0, force_law="legacy"):
+    """First to fourth derivative at s0 of the longitudinal potential g per K_z dl of one edge:
+    legacy      g(s) = s^2/2 - 0.2 s^3 + 0.0225 s^4  (potential of K_z eta^2 s)
+    variational g(s) = 1/2 eta^2 s^2 = s^2/2 - 0.3 s^3 + 0.045 s^4  (the stored energy itself)."""
+    if force_law == "variational":
+        return (s0 - 0.9 * s0 ** 2 + 0.18 * s0 ** 3, 1.0 - 1.8 * s0 + 0.54 * s0 ** 2,
+                -1.8 + 1.08 * s0, 1.08)
     return (s0 - 0.6 * s0 ** 2 + 0.09 * s0 ** 3, 1.0 - 1.2 * s0 + 0.27 * s0 ** 2,
             -1.2 + 0.54 * s0, 0.54)
 
@@ -155,7 +234,8 @@ def dst_parseval(n_interior):
     return 1.0 / (2.0 * (n_interior + 1))
 
 
-def exact_flow(pos, vel, quats, ref, q_rest, dl, m_node, K_se, c_lin=0.0, block=64):
+def exact_flow(pos, vel, quats, ref, q_rest, dl, m_node, K_se, c_lin=0.0, block=64,
+               force_law="legacy", omega=None, inertia=None, K_bt=None):
     """Longitudinal energy and the transfer power into it, per node/edge.
 
     pos, vel: (F, N, 3) displacement and velocity (x longitudinal); quats:
@@ -167,19 +247,29 @@ def exact_flow(pos, vel, quats, ref, q_rest, dl, m_node, K_se, c_lin=0.0, block=
       p_disp, p_rot  (F, N)    transfer power by channel (W)
       f_c            (F, N)    coupling force along x (N)
       d_l            (F, N)    longitudinal damping power (W)
+      u_l_bend       (F, N-2)  variational law only: change of each bending region's energy
+                               in the longitudinal-only state (non-zero for a pre-twisted
+                               string, whose rest twist energy depends on stretch)
+    force_law="variational" evaluates the variational shader force (pass omega (F, N-1, 3),
+    the per-edge inertia and K_bt); states B and C have no rotation, so no kinetic term.
     """
     F, N = pos.shape[:2]
     ref = np.asarray(ref, dtype=np.float64)
     q_rest = np.asarray(q_rest, dtype=np.float64)
     K_z = float(np.ravel(K_se)[2])
     s0 = ref[:, 0] / dl - 1.0
-    g1, g2, g3, g4 = _g_derivs(s0)
+    g1, g2, g3, g4 = _g_derivs(s0, force_law)
+    variational = force_law == "variational"
+    if variational:
+        kap0 = curvatures(q_rest, dl)                                       # rest curvature
+        B0 = np.sum(np.asarray(K_bt, np.float64) * kap0 * kap0, axis=-1)    # per region
 
     w = np.ones(N)
     w[[0, -1]] = 0.5
     out = {k: np.zeros((F, N)) for k in ("ke_t", "ke_l", "p_disp", "p_rot", "f_c", "d_l")}
     out["u_l_quad"] = np.zeros((F, N - 1))
     out["u_l_lin"] = np.zeros((F, N - 1))
+    out["u_l_bend"] = np.zeros((F, N - 2))
 
     for a in range(0, F, block):
         b = min(F, a + block)
@@ -197,15 +287,34 @@ def exact_flow(pos, vel, quats, ref, q_rest, dl, m_node, K_se, c_lin=0.0, block=
         # edge along x at its rest orientation, and its potential (Taylor
         # series of the quartic g around s0 is exact; no cancellation).
         d = du[..., 0] / dl                                   # s - s0
-        e_c = 1.0 + s0 + d
-        f_c_edge = K_z * (1.0 - 0.3 * (e_c - 1.0)) ** 2 * (e_c - 1.0)
+        s_c = s0 + d                                          # stretch in the longitudinal-only state
+        eta_c = 1.0 - 0.3 * s_c
+        f_c_edge = K_z * eta_c ** 2 * s_c
+        if variational:
+            f_c_edge = f_c_edge + K_z * eta_c * ETA_SLOPE * s_c ** 2
+            # rest twist energy of each region at the state-C stretches, and its stretch derivative
+            eta_v = 1.0 + ETA_SLOPE * 0.5 * (s_c[:, :-1] + s_c[:, 1:])
+            eta_v0 = 1.0 + ETA_SLOPE * 0.5 * (s0[:-1] + s0[1:])
+            out["u_l_bend"][a:b] = 0.5 * (eta_v ** 4 - eta_v0 ** 4) * B0 * dl
+            c = ETA_SLOPE * eta_v ** 3 * B0
+            f_c_edge[:, :-1] += c
+            f_c_edge[:, 1:] += c
         out["u_l_lin"][a:b] = K_z * dl * g1 * d
         out["u_l_quad"][a:b] = K_z * dl * (0.5 * g2 * d ** 2 + g3 * d ** 3 / 6.0 + g4 * d ** 4 / 24.0)
 
         Fx_C = np.zeros((b - a, N))
         Fx_C[:, 1:-1] = f_c_edge[:, 1:] - f_c_edge[:, :-1]
-        Fx_B = node_forces(edge_forces(r, np.broadcast_to(q_rest, q.shape), dl, K_se))[..., 0]
-        Fx_A = node_forces(edge_forces(r, q, dl, K_se))[..., 0]
+        q_r = np.broadcast_to(q_rest, q.shape)
+        if variational:
+            om = np.asarray(omega[a:b], dtype=np.float64)
+            f_B = edge_forces(r, q_r, dl, K_se, force_law=force_law) + bend_stretch_forces(r, q_r, dl, K_bt)
+            f_A = (edge_forces(r, q, dl, K_se, force_law=force_law, omega=om, inertia=inertia)
+                   + bend_stretch_forces(r, q, dl, K_bt))
+        else:
+            f_B = edge_forces(r, q_r, dl, K_se)
+            f_A = edge_forces(r, q, dl, K_se)
+        Fx_B = node_forces(f_B)[..., 0]
+        Fx_A = node_forces(f_A)[..., 0]
 
         out["p_disp"][a:b] = v[..., 0] * (Fx_B - Fx_C)
         out["p_rot"][a:b] = v[..., 0] * (Fx_A - Fx_B)

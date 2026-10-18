@@ -9,7 +9,8 @@ from datetime import datetime
 import numpy as np
 
 from py_wgpu_fdm import Simulation
-from utils import generate_straight_rod, make_weights
+from utils import (generate_straight_rod, make_weights, damping_coefficients,
+                   legacy_damping_coefficients)
 from post_process import process_and_plot
 
 class SimulationRun:
@@ -82,8 +83,10 @@ class SimulationRun:
             json.dump(metadata, f, default=np_encoder, indent=4)
 
     def build(self):
+        # Runs from before the variational force law carry no "force_law" entry.
+        self.config.setdefault("force_law", "legacy")
         nodes, edges, dl, mass, inertia, K_se, K_bt = generate_straight_rod(
-            self.config["node_count"], **self.rod_params
+            self.config["node_count"], **self.rod_params, force_law=self.config["force_law"]
         )
         
         self.rod_derived = {
@@ -105,6 +108,14 @@ class SimulationRun:
             self.config["node_count"], self.config["hammer_node"], self.config["hammer_width"]
         )
 
+        if "damping" in self.config:
+            c_lin, c_ang = damping_coefficients(self.config["damping"], mass, inertia, K_bt=K_bt,
+                                                dl=dl, length=self.rod_params["tuned_length"])
+        else:
+            c_lin, c_ang = legacy_damping_coefficients(self.config["dampening"])
+        # Recorded in parameters.json (config) for post-processing.
+        self.config["damping_coefficients"] = {"linear": c_lin, "angular": list(c_ang)}
+
         # Rust prints the selected GPU adapter on its own stdout; flush ours
         # first so the two streams don't interleave when output is redirected.
         sys.stdout.flush()
@@ -122,7 +133,9 @@ class SimulationRun:
             stiffness_bt=K_bt,
             inertia=inertia,
             clamp_offset=0,
-            dampening=self.config["dampening"],
+            linear_damping=c_lin,
+            angular_damping=c_ang,
+            force_law=1 if self.config["force_law"] == "variational" else 0,
         )
         self.sim.initialize()
         # self.sim.create_references()

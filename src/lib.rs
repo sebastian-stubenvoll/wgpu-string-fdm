@@ -33,7 +33,10 @@ mod py_wgpu_fdm {
             stiffness_bt: [f32; 3],
             inertia: [f32; 3],
             clamp_offset: u32,
-            dampening: [f32; 2],
+            linear_damping: f32,
+            angular_damping: [f32; 3],
+            // 0: legacy, 1: variational
+            force_law: u32,
             hammer_displacement: f32,
             hammer_velocity: f32,
             hammer_mass: f32,
@@ -64,6 +67,9 @@ mod py_wgpu_fdm {
                 &stiffness_bt,
                 &inertia,
                 clamp_offset,
+                linear_damping,
+                &angular_damping,
+                force_law,
             );
 
             let hammer = gpu_bindings::Hammer::new(
@@ -84,7 +90,6 @@ mod py_wgpu_fdm {
                 hammer_offset_y,
                 uniforms,
                 oversampling_factor,
-                dampening,
             ));
 
             match state {
@@ -97,6 +102,11 @@ mod py_wgpu_fdm {
 
         fn compute(&mut self) {
             self.state.compute().unwrap();
+        }
+
+        /// The original multi-pass solver loop, for checking `compute` against.
+        fn compute_reference(&mut self) {
+            self.state.compute_reference().unwrap();
         }
 
         fn save(
@@ -150,8 +160,8 @@ mod py_wgpu_fdm {
             Ok(())
         }
 
-        fn set_dampening(&mut self, dampening: [f32; 2]) -> PyResult<()> {
-            _ = self.state.set_dampening(dampening);
+        fn set_damping(&mut self, linear_damping: f32, angular_damping: [f32; 3]) -> PyResult<()> {
+            _ = self.state.set_damping(linear_damping, angular_damping);
             Ok(())
         }
     }

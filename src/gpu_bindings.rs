@@ -11,7 +11,7 @@ pub struct Node {
     velocity: [f32; 3],
     _pad1: u32,
     curvature: [f32; 3],
-    _pad2: u32,
+    bend_stretch: f32,
     reference_curvature: [f32; 4],
     internal_moment: [f32; 3],
     _pad3: u32,
@@ -26,6 +26,7 @@ const _: () = {
     assert!(offset_of!(Node, position) == 0);
     assert!(offset_of!(Node, velocity) == 16);
     assert!(offset_of!(Node, curvature) == 32);
+    assert!(offset_of!(Node, bend_stretch) == 44);
     assert!(offset_of!(Node, reference_curvature) == 48);
     assert!(offset_of!(Node, internal_moment) == 64);
     assert!(offset_of!(Node, rest_relative_orientation) == 80);
@@ -45,7 +46,7 @@ impl Node {
             velocity: *velocity,
             _pad1: 0,
             curvature: [0.0; 3],
-            _pad2: 0,
+            bend_stretch: 0.0,
             reference_curvature: *reference_curvature,
             internal_moment: [0.0; 3],
             _pad3: 0,
@@ -150,12 +151,30 @@ pub struct FDMUniform {
     stiffness_se: [f32; 3],
     clamp_offset: u32,
     stiffness_bt: [f32; 3],
-    dampening: f32,
+    _pad1: u32,
     inertia: [f32; 3],
     _pad2: u32,
     inertia_inv: [f32; 3],
     _pad3: u32,
+    // per material axis (tilt, tilt, torsion), see the shader
+    angular_damping: [f32; 3],
+    linear_damping: f32,
+    // 0 legacy, 1 variational (see the shader)
+    force_law: u32,
+    _pad4: [u32; 3],
 }
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(offset_of!(FDMUniform, stiffness_se) == 32);
+    assert!(offset_of!(FDMUniform, stiffness_bt) == 48);
+    assert!(offset_of!(FDMUniform, inertia) == 64);
+    assert!(offset_of!(FDMUniform, inertia_inv) == 80);
+    assert!(offset_of!(FDMUniform, angular_damping) == 96);
+    assert!(offset_of!(FDMUniform, linear_damping) == 108);
+    assert!(offset_of!(FDMUniform, force_law) == 112);
+    assert!(size_of::<FDMUniform>() == 128);
+};
 
 impl FDMUniform {
     pub fn new(
@@ -169,6 +188,9 @@ impl FDMUniform {
         stiffness_bt: &[f32; 3],
         intertia: &[f32; 3],
         clamp_offset: u32,
+        linear_damping: f32,
+        angular_damping: &[f32; 3],
+        force_law: u32,
     ) -> Self {
         assert!(!edges.is_empty());
         assert_eq!(
@@ -196,11 +218,15 @@ impl FDMUniform {
             stiffness_se: *stiffness_se,
             clamp_offset,
             stiffness_bt: *stiffness_bt,
-            dampening: 0.0,
+            _pad1: 0,
             inertia: *intertia,
             _pad2: 0,
             inertia_inv: intertia.map(|i| 1.0 / i),
             _pad3: 0,
+            angular_damping: *angular_damping,
+            linear_damping,
+            force_law,
+            _pad4: [0; 3],
         }
     }
 }
@@ -213,10 +239,10 @@ struct PushConstants {
     output_index: u32,
     hammering: u32,
 
-    linear_dampening: f32,
-    angular_dampening: f32,
+    write_output: u32,
+    _reserved1: f32,
     hammer_offset_y: f32,
-    _pad0: u32,
+    steps: u32, // solver steps per output frame, read by advance_frame
 }
 
 #[repr(C)]
@@ -299,6 +325,7 @@ pub struct State {
     compute_forces_pipeline: wgpu::ComputePipeline,
     hammer_update_pipeline: wgpu::ComputePipeline,
     output_pipeline: wgpu::ComputePipeline,
+    advance_frame_pipeline: wgpu::ComputePipeline,
     device: wgpu::Device,
     fdm_uniform: FDMUniform,
     fdm_uniform_buffer: wgpu::Buffer,
@@ -324,7 +351,6 @@ impl State {
         hammer_offset_y: f32,
         uniforms: FDMUniform,
         oversampling_factor: usize,
-        dampening: [f32; 2],
     ) -> Result<State, Box<dyn Error>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             #[cfg(not(target_arch = "wasm32"))]
@@ -353,6 +379,18 @@ impl State {
         // Flush now so the adapter is visible even if request_device fails below.
         let _ = std::io::stdout().flush();
 
+        // The frame kernel runs as one workgroup: 1024 threads where the adapter allows it.
+        let adapter_limits = adapter.limits();
+        let frame_threads: u32 = if adapter_limits.max_compute_invocations_per_workgroup >= 1024
+            && adapter_limits.max_compute_workgroup_size_x >= 1024
+        {
+            1024
+        } else {
+            256
+        };
+        println!("  Frame kernel: one workgroup of {frame_threads} threads");
+        let _ = std::io::stdout().flush();
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -362,6 +400,8 @@ impl State {
                     } else {
                         wgpu::Limits {
                             max_push_constant_size: 32,
+                            max_compute_invocations_per_workgroup: frame_threads,
+                            max_compute_workgroup_size_x: frame_threads,
                             ..wgpu::Limits::default()
                         }
                     },
@@ -472,10 +512,10 @@ impl State {
             output_index: 0,
             hammering: 0,
 
-            linear_dampening: dampening[0],
-            angular_dampening: dampening[1],
+            write_output: 1,
+            _reserved1: 0.0,
             hammer_offset_y: hammer_offset_y,
-            _pad0: 0,
+            steps: oversampling_factor as u32,
         };
 
         let compute_bind_group_layout =
@@ -683,6 +723,14 @@ impl State {
             compilation_options: Default::default(),
         });
 
+        let advance_frame_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Advance Frame Pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: if frame_threads == 1024 { "advance_frame_1024" } else { "advance_frame_256" },
+            compilation_options: Default::default(),
+        });
+
         Ok(Self {
             device,
             queue,
@@ -704,6 +752,7 @@ impl State {
             compute_forces_pipeline,
             hammer_update_pipeline,
             output_pipeline,
+            advance_frame_pipeline,
             nodes_buffer_size,
             edges_buffer_size,
             oversampling_factor,
@@ -771,7 +820,75 @@ impl State {
         Ok(())
     }
 
+    /// One chunk (chunk_size output frames). Each frame is one dispatch of the single-workgroup
+    /// `advance_frame` kernel, which runs all `oversampling_factor` solver steps of the frame with
+    /// storage barriers between the phases, then writes the output frame. All frames go into one
+    /// compute pass; wgpu synchronizes consecutive dispatches. Same arithmetic as
+    /// `compute_reference`, with 1 dispatch per frame instead of 5 passes per solver step.
     pub fn compute(&mut self) -> Result<(), Box<dyn Error>> {
+        // No single GPU job may run long: a GPU that also drives a display resets work that blocks
+        // its graphics queue (amdgpu "ring gfx timeout", seen at 320 steps in one dispatch, ~18 ms on an
+        // RX 460; none at 160). Each extra dispatch boundary costs about as much as 32 steps there.
+        // So a frame is split into dispatches of at most MAX_STEPS_PER_DISPATCH steps (only the
+        // last writes the output frame), and frames are submitted in batches.
+        const FRAMES_PER_SUBMIT: u32 = 16;
+        const MAX_STEPS_PER_DISPATCH: usize = 160;
+        let mut frame = 0;
+        while frame < self.fdm_uniform.chunk_size {
+            let batch = FRAMES_PER_SUBMIT.min(self.fdm_uniform.chunk_size - frame);
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Advance Frames Encoder"),
+                });
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Advance Frames Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                compute_pass.set_pipeline(&self.advance_frame_pipeline);
+                for _ in 0..batch {
+                    let mut remaining = self.oversampling_factor;
+                    while remaining > 0 {
+                        let steps = remaining.min(MAX_STEPS_PER_DISPATCH);
+                        self.push_constants.steps = steps as u32;
+                        self.push_constants.write_output = (steps == remaining) as u32;
+                        compute_pass
+                            .set_push_constants(0, bytemuck::cast_slice(&[self.push_constants]));
+                        compute_pass.dispatch_workgroups(1, 1, 1);
+
+                        // The kernel swaps current/future once per step.
+                        if steps % 2 == 1 {
+                            (
+                                self.push_constants.current_index,
+                                self.push_constants.future_index,
+                            ) = (
+                                self.push_constants.future_index,
+                                self.push_constants.current_index,
+                            );
+                        }
+                        remaining -= steps;
+                    }
+                    self.push_constants.output_index =
+                        (self.push_constants.output_index + 1) % self.fdm_uniform.chunk_size;
+                }
+            }
+            let index = self.queue.submit(iter::once(encoder.finish()));
+            // Wait for each batch: wgpu-core 0.21 waits on a fence for at most 5 s
+            // (CLEANUP_WAIT_MS) and then treats the submission as finished anyway, so if a whole
+            // chunk were queued and took longer, save() would map its staging buffer before the
+            // copy ran and return stale frames. One batch takes a fraction of a second.
+            self.device
+                .poll(wgpu::Maintain::WaitForSubmissionIndex(index));
+            frame += batch;
+        }
+        Ok(())
+    }
+
+    /// The original multi-pass loop (5 compute passes per solver step), kept as the reference
+    /// that `compute` is checked against.
+    pub fn compute_reference(&mut self) -> Result<(), Box<dyn Error>> {
         // The 64 comes from the @workgroup_size(64) inside the shaders
         let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
 
@@ -956,10 +1073,12 @@ impl State {
     }
 
     fn write_uniforms(&mut self) -> Result<(), Box<dyn Error>> {
-        let mut buffer = encase::UniformBuffer::new(Vec::new());
-        buffer.write(&self.fdm_uniform)?;
-        self.queue
-            .write_buffer(&self.fdm_uniform_buffer, 0, &buffer.into_inner());
+        // Same bytes as the initial upload: the repr(C) layout is asserted to match the WGSL one.
+        self.queue.write_buffer(
+            &self.fdm_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[self.fdm_uniform]),
+        );
         Ok(())
     }
 
@@ -970,11 +1089,13 @@ impl State {
         self.write_uniforms()
     }
 
-    pub fn set_dampening(&mut self, dampening: [f32; 2]) -> Result<(), Box<dyn Error>> {
-        [
-            self.push_constants.linear_dampening,
-            self.push_constants.angular_dampening,
-        ] = dampening;
-        Ok(())
+    pub fn set_damping(
+        &mut self,
+        linear_damping: f32,
+        angular_damping: [f32; 3],
+    ) -> Result<(), Box<dyn Error>> {
+        self.fdm_uniform.linear_damping = linear_damping;
+        self.fdm_uniform.angular_damping = angular_damping;
+        self.write_uniforms()
     }
 }

@@ -151,7 +151,9 @@ def _process_single_chunk(args):
     # rounding of the node force for the energy-source diagnostic.
     c_lin, c_ang = dampening
     q_e = quats[:, :-1]
-    fl = exact_flow(pos, vel, q_e, ref_vecs, q_rest, dl, m_node, K_se_d, c_lin)
+    law = reference.get("force_law", "legacy")
+    fl = exact_flow(pos, vel, q_e, ref_vecs, q_rest, dl, m_node, K_se_d, c_lin, force_law=law,
+                    omega=omega, inertia=I_d, K_bt=K_bt_d)
     d_old, d_new = roundoff_forces(pos, q_e, ref_vecs, q_rest, reference["frames"],
                                    reference["offsets"], dl, K_se_d)
     # The formulation the run actually used is the one whose rounding matters.
@@ -160,10 +162,11 @@ def _process_single_chunk(args):
     d_perp2 = np.sum(d_round[..., 1:] ** 2, axis=-1)
     flow = {
         "KE_T": fl["ke_t"].sum(1), "KE_R": (rot_edge - rot_edge_t).sum(1), "KE_tor": rot_edge_t.sum(1),
-        "E_L": fl["ke_l"].sum(1) + fl["u_l_quad"].sum(1) + fl["u_l_lin"].sum(1),
+        "E_L": fl["ke_l"].sum(1) + fl["u_l_quad"].sum(1) + fl["u_l_lin"].sum(1) + fl["u_l_bend"].sum(1),
         "P_disp": fl["p_disp"].sum(1), "P_rot": fl["p_rot"].sum(1), "D_L": fl["d_l"].sum(1),
         # Damping power of the whole state (linear on interior nodes, angular on edges).
-        "D_all": c_lin * np.sum(v64[:, 1:-1] ** 2, axis=(1, 2)) + c_ang * np.sum(w64 ** 2, axis=(1, 2)),
+        "D_all": c_lin * np.sum(v64[:, 1:-1] ** 2, axis=(1, 2))
+                 + np.sum(np.asarray(c_ang) * w64 ** 2, axis=(1, 2)),
         "dF_x_rms": np.sqrt(np.mean(d_round[..., 0] ** 2, axis=1)),
         "dF_perp_rms": np.sqrt(np.mean(d_perp2, axis=1)),
         # The same for the other shader formulation (offset vs absolute orientation)
@@ -181,7 +184,7 @@ def _process_single_chunk(args):
     # (buffer swap), i.e. 1.5 steps behind the saved positions, so expect
     # agreement to the change over 1.5 steps, not to rounding. Saved every
     # step, the port matches that mid-step state to float32 rounding.
-    f_port = edge_forces(r, q_e, dl, K_se_d)
+    f_port = edge_forces(r, q_e, dl, K_se_d, force_law=law, omega=omega, inertia=I_d)
     f_saved = evecs[:, :-1, 1].astype(np.float64)
     force_check = float(np.median(np.linalg.norm(f_saved - f_port, axis=-1)
                                   / np.maximum(np.linalg.norm(f_port, axis=-1), 1e-30)))
@@ -296,13 +299,20 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
     if length is None:
         print(f"[{datetime.now()}] Warning: tuned length unknown; edge stretch (and the eta-scaled "
               "energies) will assume rest spacing dl, which ignores the string's pre-strain.")
-    dampening = tuple(config.get("dampening", (0.0, 0.0)))
+    if "damping_coefficients" in config:
+        dc = config["damping_coefficients"]
+        dampening = (float(dc["linear"]), tuple(float(x) for x in dc["angular"]))
+    else:   # runs before per-axis damping: one angular coefficient for all axes
+        c_lin, c_ang = config.get("dampening", (0.0, 0.0))
+        dampening = (float(c_lin), (float(c_ang),) * 3)
     node_count = config.get("node_count")
     if node_count is None:
         with gzip.open(node_files[0], "rb") as f:
             node_count = len(pickle.load(f)[0])
     reference = rod_reference(node_count, length, dl, rod_params, uniform_reference,
                               relative_orientations)
+    # Runs before the variational force law carry no "force_law" entry.
+    reference["force_law"] = config.get("force_law", "legacy")
     ref_vecs = reference["ref"]
     print(f"[{datetime.now()}] Edge reference spacing: "
           f"{'uniform' if uniform_reference else 'legacy float32 differences'} "
@@ -420,7 +430,8 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
     return data
 
 
-def make_string_params(m_node, dl, K_se, K_bt, node_count=None, tension=None, length=None):
+def make_string_params(m_node, dl, K_se, K_bt, node_count=None, tension=None, length=None,
+                       force_law="legacy", twists=None):
     """Continuum parameters for the reference overlays (T is None -> none).
 
     T_eff, EA_eff, EI_eff are what the shader applies at the rest state: with
@@ -429,6 +440,9 @@ def make_string_params(m_node, dl, K_se, K_bt, node_count=None, tension=None, le
     longitudinal waves m u'' = f'(e0)/dl (u_{j+1} - 2u_j + u_{j-1}) gives
     c^2 = f'(e0) h / (dl mu), i.e. an effective EA of
     K_z (eta0^2 - 0.6 eta0 s0)(1 + s0); bending is scaled by eta0^4.
+    Variational force law: f(e) = K_z (eta^2 s + eta eta' s^2) plus, for a pre-twisted string,
+    2 eta' eta^3 B0 from the rest twist energy (B0 = GJ kappa0^2), so T_eff and EA_eff include
+    those terms (EA_eff from f'(e0): K_z (eta0^2 - 1.2 eta0 s0 + 0.09 s0^2) + 0.54 eta0^2 B0).
     """
     if length is None:
         length = dl * (node_count - 1)
@@ -436,14 +450,24 @@ def make_string_params(m_node, dl, K_se, K_bt, node_count=None, tension=None, le
     K_z, EI = float(np.ravel(K_se)[2]), float(np.ravel(K_bt)[0])
     s0 = (length / n_seg) / dl - 1.0
     eta0 = 1.0 - 0.3 * s0
+    if force_law == "variational":
+        B0 = 0.0
+        if twists and node_count:
+            kappa0 = 2.0 * np.sin(np.pi * twists / (node_count - 1)) / dl
+            B0 = float(np.ravel(K_bt)[2]) * kappa0 ** 2
+        T_eff = K_z * (eta0 ** 2 * s0 - 0.3 * eta0 * s0 ** 2) - 0.6 * eta0 ** 3 * B0
+        EA_eff = (K_z * (eta0 ** 2 - 1.2 * eta0 * s0 + 0.09 * s0 ** 2) + 0.54 * eta0 ** 2 * B0) * (1.0 + s0)
+    else:
+        T_eff = K_z * eta0 ** 2 * s0
+        EA_eff = K_z * (eta0 ** 2 - 0.6 * eta0 * s0) * (1.0 + s0)
     return {
         "L": float(length),
         "mu": float(m_node * n_seg / length),
         "T": None if tension is None else float(tension),
         "EI": EI,
         "EA": K_z,
-        "T_eff": K_z * eta0 ** 2 * s0,
-        "EA_eff": K_z * (eta0 ** 2 - 0.6 * eta0 * s0) * (1.0 + s0),
+        "T_eff": T_eff,
+        "EA_eff": EA_eff,
         "EI_eff": EI * eta0 ** 4,
     }
 
@@ -778,7 +802,9 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     output_dir = sim_path / "plots"
     output_dir.mkdir(exist_ok=True)
     string_params = make_string_params(m_node, dl, K_se, K_bt, node_count=config.get("node_count"),
-                                       tension=tension, length=length)
+                                       tension=tension, length=length,
+                                       force_law=config.get("force_law", "legacy"),
+                                       twists=(rod_params or {}).get("twists"))
 
     plot_tasks = build_plot_tasks(data, output_dir, run_id, config.get("dt", 1e-5),
                                   config.get("oversampling_factor", 100), dl, inspect_nodes, string_params)

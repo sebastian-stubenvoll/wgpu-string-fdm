@@ -14,7 +14,15 @@ SIM_CONFIG = {
     "inspect_nodes": [25, 512, 800],
     "hammer_width": 15,
     "oversampling_factor": int(1.0 / (dt * 50_000)),
-    "dampening": [1e-6, 1e-6],
+    # Damping as physical quantities (see utils.damping_coefficients): transverse mode n decays
+    # at b1 + b2 k_n^2, measured for piano note C2 (Bensa et al., JASA 114(2), 2003, Table I);
+    # torsion from the quality factor of wound steel bass strings (Wollman, Smith & Wolfe,
+    # ISMA 2010: Q ~ 15-20). Runs before 2026-10-18 used the equivalent of
+    # {"b1": 1.0454e-2, "b2": 1.0454e-2, "torsion_rate": 9.2713e3} (run-002 rod).
+    "damping": {"b1": 0.25, "b2": 7.5e-5, "torsion_q": 17.5},
+    # "variational": the internal force is the gradient of the stored energy (includes the
+    # stretch derivative of the cross-section scaling eta); "legacy": runs before 2026-10-18.
+    "force_law": "variational",
 }
 
 ROD_PARAMS = {
