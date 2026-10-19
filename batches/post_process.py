@@ -12,6 +12,10 @@ import gc
 
 import numpy as np
 
+# Worker processes for extraction and plotting (32 suits the container; each extraction worker holds
+# about 0.75 GB with 512-node chunks, so a 16 GB desktop needs a handful).
+POST_WORKERS = int(os.environ.get("POST_WORKERS", 32))
+
 # Import Plotting Modules
 from plots.pos_fft import plot_node_pos_moment_fft
 from plots.rotation import plot_angular_velocity, plot_axis_angle_over_time
@@ -76,9 +80,12 @@ def _process_single_chunk(args):
     # = [angular velocity, ., strain]. The last edge is the ghost edge.
     nodes = np.asarray(n_chunk, dtype=np.float32)
     quats = np.asarray([[e[0] for e in frame] for frame in e_chunk], dtype=np.float32)
+    p_dev = None
     if reference["relative"]:
         # The GPU stores each orientation as its deviation p from the rest
-        # orientation q0 (q = q0 * p); everything below works with q.
+        # orientation q0 (q = q0 * p); everything below works with q, except the
+        # exact-flow forces, which use p as the shader does.
+        p_dev = quats[:, :-1].copy()
         quats = quat_mul(reference["q_rest_ghost"], quats)
     evecs = np.asarray([[e[1] for e in frame] for frame in e_chunk], dtype=np.float32)
     del n_chunk, e_chunk
@@ -152,8 +159,9 @@ def _process_single_chunk(args):
     c_lin, c_ang = dampening
     q_e = quats[:, :-1]
     law = reference.get("force_law", "legacy")
+    offset_form = None if p_dev is None else (p_dev, reference["frames"], reference["offsets"])
     fl = exact_flow(pos, vel, q_e, ref_vecs, q_rest, dl, m_node, K_se_d, c_lin, force_law=law,
-                    omega=omega, inertia=I_d, K_bt=K_bt_d)
+                    omega=omega, inertia=I_d, K_bt=K_bt_d, offset_form=offset_form)
     d_old, d_new = roundoff_forces(pos, q_e, ref_vecs, q_rest, reference["frames"],
                                    reference["offsets"], dl, K_se_d)
     # The formulation the run actually used is the one whose rounding matters.
@@ -342,7 +350,7 @@ def extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_node
     excitation_cutoff_frame = 0
     frames_processed = 0
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=32) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=POST_WORKERS) as executor:
         for file_idx, res in enumerate(executor.map(_process_single_chunk, args_list)):
             n_frames = res["n_frames"]
             for n in inspect_nodes:
@@ -719,7 +727,8 @@ def build_plot_tasks(data, output_dir, run_id, dt, oversamp, dl, inspect_nodes, 
     return plot_tasks
 
 
-def run_plot_tasks(plot_tasks, max_workers=32):
+def run_plot_tasks(plot_tasks, max_workers=None):
+    max_workers = max_workers or POST_WORKERS
     """Execute plotting tasks in parallel; returns the generated file paths."""
     print(f"[{datetime.now()}] Dispatching {len(plot_tasks)} plotting tasks to concurrent workers...")
     generated_images = []
@@ -791,10 +800,256 @@ def send_email(email_config, sim_path, run_id, inspect_nodes, generated_images, 
         print(f"[{datetime.now()}] Failed to send email: {e}")
 
 
+def bow_post_process(sim_path, output_dir):
+    """Bowed runs: regime, playing frequency, contact temperature and the bow figures
+    (plots/bowing.py) from the bow output b_*.pkl.gz and the bridge-end edge force.
+    Writes bow_summary.json to output_dir and returns the figure paths."""
+    from plots import bowing as bp
+    import bowing
+    sim_path, output_dir = Path(sim_path), Path(output_dir)
+    files = sorted(sim_path.glob("b_*.pkl.gz"))
+    if not files:
+        return []
+    P = json.load(open(sim_path / "parameters.json"))
+    cfg, bow_params, bow_derived = P["config"], P["bow_params"], P["bow_derived"]
+    frames = []
+    bridge = []
+    for bf in files:
+        with gzip.open(bf, "rb") as f:
+            frames.extend(pickle.load(f))
+        compact = sim_path / bf.name.replace("b_", "s_").replace(".pkl.gz", ".npz")
+        if compact.exists():          # runs with save_state = False
+            bridge.extend(np.load(compact)["bridge_force"][:, 1])
+            continue
+        with gzip.open(sim_path / bf.name.replace("b_", "e_"), "rb") as f:
+            e_chunk = pickle.load(f)
+        # transverse force in the first edge (lab y, the bowing direction): the bridge force
+        bridge.extend(fr[0][1][1][1] for fr in e_chunk)
+        del e_chunk
+    B = bp.bow_arrays(frames)
+    bridge = np.asarray(bridge, np.float64)
+    fdt = cfg["dt"] * cfg["oversampling_factor"]
+    t = (np.arange(len(frames)) + 1) * fdt
+    stuck = np.all(B["sticking"] > 0.5, axis=1)
+    mid = B["slip_velocity"].shape[1] // 2
+    v_rel = B["slip_velocity"][:, mid]
+    v_surface = B["velocity"] + B["slip_velocity"].mean(axis=1)      # mean over the contact nodes
+    # playing frequency: bridge-force fundamental over the second half (zero-padded peak)
+    half = t > t[-1] / 2
+    x = bridge[half] - bridge[half].mean()
+    spec = np.abs(np.fft.rfft(x * np.hanning(len(x)), 16 * len(x)))
+    fr = np.fft.rfftfreq(16 * len(x), fdt)
+    rod = P["rod_derived"]
+    f_free = 1.0 / (2.0 * P["rod_params"]["tuned_length"]) * np.sqrt(
+        P["rod_params"]["tension_force"] * P["rod_params"]["tuned_length"] / (rod["m_node"] * (cfg["node_count"] - 1)))
+    band = (fr > 0.7 * f_free) & (fr < 1.3 * f_free)
+    f_play = float(fr[band][np.argmax(spec[band])])
+    period = 1.0 / f_play
+    summary = {"playing_frequency": f_play, "flexible_string_f1": f_free,
+               **bp.regime(t, v_surface, B["velocity"], stuck, period)}
+    summary["stuck_fraction_per_node"] = np.mean(B["sticking"][t >= t[-1] - 21 * period] > 0.5, axis=0).tolist()
+    N_c = B["normal_force"] * np.asarray(bow_derived["contact_weights"])[mid]
+    on = N_c > 0
+    mu_eff = np.where(on, np.abs(B["force"][:, mid]) / np.where(on, N_c, 1.0), np.nan)
+    last = t > t[-1] - 10 * period
+    summary["mu_eff_max_last_10_periods"] = float(np.nanmax(mu_eff[last]))
+    thermal = bow_params.get("friction") == "thermal"
+    if thermal:
+        T = B["temperature"][:, mid]
+        summary["temperature_range_last_10_periods"] = [float(T[last].min()), float(T[last].max())]
+    with open(output_dir / "bow_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[{datetime.now()}] Bow: {summary['regime']}, playing frequency {f_play:.2f} Hz, stuck fraction {summary['stuck_fraction']:.3f}"
+        + (f", contact temperature {summary['temperature_range_last_10_periods'][0]:.1f}-"
+           f"{summary['temperature_range_last_10_periods'][1]:.1f} K" if thermal else ""))
+    w = t > t[-1] - 3 * period
+    out = [bp.plot_time_series(t[w], v_surface[w], "String velocity at the bow", "Velocity (m/s)",
+                               output_dir / "bow_string_velocity.png", reference=bow_params["velocity"],
+                               reference_label="bow"),
+           bp.plot_time_series(t[w], bridge[w], "Bridge force", "Force (N)", output_dir / "bow_bridge_force.png"),
+           bp.plot_regime(t, v_surface, B["velocity"], stuck, period, "Flybacks per period", output_dir / "bow_regime.png")]
+    if thermal:
+        out.append(bp.plot_time_series(t[w], B["temperature"][w, mid], "Contact temperature",
+                                       "Temperature above ambient (K)", output_dir / "bow_temperature.png"))
+        vs = np.linspace(0.0, max(0.05, float(np.nanmax(np.abs(v_rel[last])))), 400)
+        curve = (np.concatenate([-vs[::-1], vs]), bowing.friction_curve(np.concatenate([-vs[::-1], vs])))
+        label = "steady sliding"
+    else:
+        vs = np.linspace(0.0, max(0.05, float(np.nanmax(np.abs(v_rel[last])))), 400)
+        curve = (np.concatenate([-vs[::-1], vs]), bowing.friction_curve(np.concatenate([-vs[::-1], vs])))
+        label = "friction curve"
+    out.append(bp.plot_friction_plane(v_rel[last], mu_eff[last], "Friction coefficient", output_dir / "bow_friction.png",
+                                      curve=curve, curve_label=label))
+    return [str(o) for o in out]
+
+
+def pluck_post_process(sim_path, output_dir):
+    """Plucked runs: release time and displacement, contact forces, works, twist at the pick node,
+    and the pluck figures (plots/plucking.py) from the pick records p_*.pkl.gz, the pick node's
+    displacement and the bridge-end edge force. Writes pluck_summary.json to output_dir and returns
+    the figure paths."""
+    from plots import plucking as pp
+    import plucking
+    sim_path, output_dir = Path(sim_path), Path(output_dir)
+    P = json.load(open(sim_path / "parameters.json"))
+    if not P.get("pick_params"):
+        return []
+    files = sorted(sim_path.glob("p_*.pkl.gz"))
+    if not files:
+        return []
+    cfg, derived = P["config"], P["pick_derived"]
+    j = int(derived["pick_node"])
+    frames, bridge, disp, twist = [], [], [], []
+    for pf in files:
+        with gzip.open(pf, "rb") as f:
+            frames.extend(pickle.load(f))
+        compact = sim_path / pf.name.replace("p_", "s_").replace(".pkl.gz", ".npz")
+        if compact.exists():          # runs with save_state = False
+            c = np.load(compact)
+            bridge.extend(c["bridge_force"][:, 1])
+            disp.extend(c["contact_displacement"][:, 0, :])
+            twist.extend(np.full(len(c["bridge_force"]), np.nan))
+            continue
+        with gzip.open(sim_path / pf.name.replace("p_", "e_"), "rb") as f:
+            e_chunk = pickle.load(f)
+        bridge.extend(fr[0][1][1][1] for fr in e_chunk)
+        # twist of edge j: the axial (material 3) component of the rotation vector of its
+        # deviation p from the rest orientation
+        for fr in e_chunk:
+            q = np.asarray(fr[j][0], np.float64)
+            s = np.linalg.norm(q[:3])
+            twist.append(0.0 if s == 0 else 2.0 * np.arctan2(s, abs(q[3])) * np.sign(q[3]) * q[2] / s)
+        del e_chunk
+        with gzip.open(sim_path / pf.name.replace("p_", "n_"), "rb") as f:
+            n_chunk = pickle.load(f)
+        disp.extend(fr[j][0] for fr in n_chunk)
+        del n_chunk
+    A = plucking.pick_arrays(frames)
+    bridge, disp, twist = np.asarray(bridge, np.float64), np.asarray(disp, np.float64), np.asarray(twist)
+    dt = cfg["dt"]
+    fdt = dt * cfg["oversampling_factor"]
+    t = (np.arange(len(frames)) + 1) * fdt
+    on = A["in_contact"]
+    summary = {"contact": bool(on.any())}
+    if on.any():
+        # contact intervals (frames): the rigid pick touches and leaves the string a few times while
+        # it accelerates, then pushes it in one long contact that ends in the release; a slow pick can
+        # be struck again by the returning string. The release is the end of the contact interval
+        # with the largest normal impulse; its exact solver step is the last contact step recorded at
+        # the end of the following frame.
+        edges_ = np.diff(np.r_[0, on.astype(int), 0])
+        starts, ends = np.nonzero(edges_ == 1)[0], np.nonzero(edges_ == -1)[0] - 1
+        impulse = [A["normal_force"][a:b + 1].sum() for a, b in zip(starts, ends)]
+        main = int(np.argmax(impulse))
+        last = int(ends[main])
+        release_step = int(A["last_contact_step"][min(last + 1, len(t) - 1)])
+        summary.update({
+            "first_contact_time": float(A["first_contact_step"][-1] * dt),
+            "release_time": float(release_step * dt),
+            "release_frame": last,
+            "main_contact_start_time": float(starts[main] * fdt),
+            "contact_intervals_before_release": main,
+            "contacts_after_release": [[float(a * fdt), float((b + 1) * fdt)] for a, b in zip(starts[main + 1:], ends[main + 1:])],
+            "release_displacement_y": float(disp[last, 1]),
+            "release_displacement_z": float(disp[last, 2]),
+            "max_normal_force": float(A["normal_force"][on].max()),
+            "stuck_fraction_in_contact": float(A["sticking"][on].mean()),
+            "max_penetration": float(A["max_penetration"][-1]),
+            "pick_work": float(A["body_work"].sum()),
+            "friction_heat": float(-A["friction_work"].sum()),
+            "normal_work": float(A["normal_work"].sum()),
+            "energy_to_string": float((A["body_work"] + A["friction_work"] + A["normal_work"]).sum()),
+            "twist_at_release": float(twist[last]),
+            "max_twist": float(np.nanmax(np.abs(twist))) if np.isfinite(twist).any() else None,
+        })
+    else:
+        last, summary["release_time"] = 0, 0.0
+    # fundamental of the bridge force after the release (zero-padded peak near the flexible-string f1)
+    rod = P["rod_derived"]
+    tension = rod.get("tension_force", P["rod_params"]["tension_force"])
+    L = P["rod_params"]["tuned_length"]
+    f_free = np.sqrt(tension * L / (rod["m_node"] * (cfg["node_count"] - 1))) / (2.0 * L)
+    after = np.arange(len(t)) > last
+    if after.sum() > 64:
+        x = bridge[after] - bridge[after].mean()
+        spec = np.abs(np.fft.rfft(x * np.hanning(len(x)), 16 * len(x)))
+        fr = np.fft.rfftfreq(16 * len(x), fdt)
+        band = (fr > 0.7 * f_free) & (fr < 1.3 * f_free)
+        summary["fundamental"] = float(fr[band][np.argmax(spec[band])])
+    summary["flexible_string_f1"] = float(f_free)
+    with open(output_dir / "pluck_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    if on.any():
+        print(f"[{datetime.now()}] Pluck: release at {summary['release_time']*1e3:.3f} ms, displacement "
+              f"({summary['release_displacement_y']*1e3:.3f}, {summary['release_displacement_z']*1e3:.3f}) mm, "
+              f"energy to the string {summary['energy_to_string']*1e3:.4f} mJ")
+    t_rel = summary["release_time"]
+    w = t <= max(3.0 * t_rel, t_rel + 20e-3)
+    c = t <= t_rel + 2.0 * fdt
+    out = [pp.plot_displacement(t[w], disp[w, 1], disp[w, 2], t_rel, "Pick-node displacement",
+                                output_dir / "pluck_displacement.png"),
+           pp.plot_time_series(t, bridge, "Bridge force", "Force (N)", output_dir / "pluck_bridge_force.png")]
+    if on.any():
+        out.append(pp.plot_contact_forces(t[c], A["normal_force"][c], A["friction_force"][c], t_rel,
+                                          "Pick contact forces", output_dir / "pluck_contact_forces.png"))
+        orbit = (t > t_rel) & (t <= t_rel + 20.0 / f_free)
+        out.append(pp.plot_orbit(disp[orbit, 1], disp[orbit, 2], "Pick-node orbit after release (20 periods)",
+                                 output_dir / "pluck_orbit.png"))
+    if np.isfinite(twist).any():
+        out.append(pp.plot_time_series(t[w], twist[w] * 1e3, "Twist at the pick node", "Twist (mrad)",
+                                       output_dir / "pluck_twist.png"))
+    return [str(o) for o in out]
+
+
+def hammer_contact_summary(sim_path, output_dir):
+    """Hammer runs with a curved crown or felt friction: contact angle, stick fraction, friction heat
+    and the twist impulse from the hammer records (p_*.pkl.gz). Writes hammer_contact_summary.json."""
+    sim_path, output_dir = Path(sim_path), Path(output_dir)
+    P = json.load(open(sim_path / "parameters.json"))
+    if P.get("pick_params"):
+        return []
+    files = sorted(sim_path.glob("p_*.pkl.gz"))
+    if not files:
+        return []
+    hammer = []
+    for pf in files:
+        with gzip.open(pf, "rb") as f:
+            hammer.extend(fr[1] for fr in pickle.load(f))
+    summary = {"hammer_crown_radius": P["hammer_params"].get("hammer_crown_radius", 0.0),
+               "hammer_felt_friction": P["hammer_params"].get("hammer_felt_friction", 0.0),
+               "hammer_offset_y": P["hammer_params"].get("hammer_offset_y", 0.0)}
+    if hammer[0][3]:
+        C = np.array([[c[2] for c in h[3]] for h in hammer], np.float64)
+        ic = np.array([[c[0] for c in h[3]] for h in hammer], bool)
+        st = np.array([[c[1] for c in h[3]] for h in hammer], bool)
+        R = P["rod_params"]["core_radius"] + 2.0 * P["rod_params"]["winding_radius"]
+        psi = np.degrees(np.arctan2(C[..., 3], C[..., 4]))[ic]
+        summary.update({
+            "contact_node_frames": int(ic.sum()),
+            "stuck_fraction": float(st[ic].mean()) if ic.any() else None,
+            "contact_angle_deg": [float(psi.min()), float(psi.max())] if ic.any() else None,
+            "max_friction_ratio": float(np.max(np.abs(C[..., 2][ic]) / C[..., 1][ic])) if ic.any() else None,
+            "friction_heat": float(-C[..., 6].sum()),
+            "work_at_felt_surface": float(C[..., 5].sum()),
+            "friction_work_on_hammer": float(sum(h[2] for h in hammer)),
+            # couple -R F_t e_x on each contact edge
+            "twist_impulse": float(-R * C[..., 8].sum()),
+        })
+    with open(output_dir / "hammer_contact_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    return []
+
+
 def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia, K_se, K_bt, inspect_nodes,
                      tension=None, length=None, rod_params=None, uniform_reference=None,
                      relative_orientations=False):
     sim_path = Path(sim_path)
+    if config.get("post_process") in ("bow_only", "pluck_only"):
+        output_dir = sim_path / "plots"
+        output_dir.mkdir(exist_ok=True)
+        generated_images = bow_post_process(sim_path, output_dir) + pluck_post_process(sim_path, output_dir)
+        send_email(email_config, sim_path, run_id, inspect_nodes, generated_images, output_dir)
+        return
     data = extract_data(sim_path, config, m_node, dl, inertia, K_se, K_bt, inspect_nodes, length=length,
                         rod_params=rod_params, uniform_reference=uniform_reference,
                         relative_orientations=relative_orientations)
@@ -811,6 +1066,8 @@ def process_and_plot(sim_path, run_id, config, email_config, m_node, dl, inertia
     del data
     gc.collect()
     generated_images = run_plot_tasks(plot_tasks)
+    generated_images = (list(generated_images) + bow_post_process(sim_path, output_dir)
+                        + pluck_post_process(sim_path, output_dir) + hammer_contact_summary(sim_path, output_dir))
     send_email(email_config, sim_path, run_id, inspect_nodes, generated_images, output_dir)
 
 
@@ -898,7 +1155,7 @@ if __name__ == "__main__":
         m_node=rod["m_node"], dl=rod["dl"],
         inertia=np.array(rod["inertia"]), K_se=np.array(rod["K_se"]), K_bt=np.array(rod["K_bt"]),
         inspect_nodes=inspect_nodes,
-        tension=rod_params.get("tension_force"), length=rod_params.get("tuned_length"),
+        tension=rod.get("tension_force", rod_params.get("tension_force")), length=rod_params.get("tuned_length"),
         rod_params=rod_params, uniform_reference=bool(rod.get("uniform_reference_spacing", False)),
         relative_orientations=rod.get("orientation_representation") == "relative_to_rest",
     )

@@ -17,6 +17,9 @@ pub struct Node {
     _pad3: u32,
     // q0_i^-1 * q0_{i+1}, see the shader
     rest_relative_orientation: [f32; 4],
+    // low part of the displacement (position + position_lo), see the shader's drift_node
+    position_lo: [f32; 3],
+    _pad4: u32,
 }
 
 // The structs are uploaded with bytemuck, so the repr(C) layout must equal the WGSL storage
@@ -30,7 +33,8 @@ const _: () = {
     assert!(offset_of!(Node, reference_curvature) == 48);
     assert!(offset_of!(Node, internal_moment) == 64);
     assert!(offset_of!(Node, rest_relative_orientation) == 80);
-    assert!(size_of::<Node>() == 96);
+    assert!(offset_of!(Node, position_lo) == 96);
+    assert!(size_of::<Node>() == 112);
 };
 
 impl Node {
@@ -51,6 +55,8 @@ impl Node {
             internal_moment: [0.0; 3],
             _pad3: 0,
             rest_relative_orientation: *rest_relative_orientation,
+            position_lo: [0.0; 3],
+            _pad4: 0,
         }
     }
 
@@ -161,7 +167,11 @@ pub struct FDMUniform {
     linear_damping: f32,
     // 0 legacy, 1 variational (see the shader)
     force_law: u32,
-    _pad4: [u32; 3],
+    // Kelvin-Voigt twist-rate damping D3 (N m^2 s), see the shader; 0 disables it
+    twist_rate_damping: f32,
+    // always 0; the shader hides values from its compiler's algebraic rewrites with it (see opaque)
+    opaque_zero: u32,
+    _pad4: u32,
 }
 
 const _: () = {
@@ -173,6 +183,8 @@ const _: () = {
     assert!(offset_of!(FDMUniform, angular_damping) == 96);
     assert!(offset_of!(FDMUniform, linear_damping) == 108);
     assert!(offset_of!(FDMUniform, force_law) == 112);
+    assert!(offset_of!(FDMUniform, twist_rate_damping) == 116);
+    assert!(offset_of!(FDMUniform, opaque_zero) == 120);
     assert!(size_of::<FDMUniform>() == 128);
 };
 
@@ -226,7 +238,9 @@ impl FDMUniform {
             angular_damping: *angular_damping,
             linear_damping,
             force_law,
-            _pad4: [0; 3],
+            twist_rate_damping: 0.0,
+            opaque_zero: 0,
+            _pad4: 0,
         }
     }
 }
@@ -290,6 +304,374 @@ impl Hammer {
     }
 }
 
+pub const MAX_BOW_CONTACTS: usize = 32;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BowContact {
+    pub node: u32,
+    pub weight: f32,
+    pub sticking: u32,
+    pub slip_velocity: f32,
+    pub force: f32,
+    pub impulse: f32,
+    pub bow_work: f32,
+    pub friction_work: f32,
+    pub normal_work: f32,
+    pub temperature: f32,
+    pub heat_power: f32,
+    _pad1: f32,
+}
+
+pub const BOW_SOE_TERMS: usize = 32;
+const BOW_SOE_FLOATS: usize = MAX_BOW_CONTACTS * 2 * BOW_SOE_TERMS;
+const BOW_RING: usize = 65536;
+const BOW_RING_FLOATS: usize = MAX_BOW_CONTACTS * BOW_RING;
+
+/// Thermal friction model parameters (WGSL BowThermal; batches/bowing.thermal_contact).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BowThermal {
+    pub c_over_h: f32,
+    pub conv_coef: f32,
+    pub lam_string: f32,
+    pub lam_bow: f32,
+    pub window: u32,
+    pub f_window: f32,
+    pub terms: u32,
+    _pad0: u32,
+    pub cal_k1: f32,
+    pub cal_k2: f32,
+    pub cal_force: f32,
+    _pad1: f32,
+    pub exact: [f32; 32],
+    pub decay: [f32; BOW_SOE_TERMS],
+    pub weight: [f32; BOW_SOE_TERMS],
+    pub weight_window: [f32; BOW_SOE_TERMS],
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BowFrame {
+    pub normal_force: f32,
+    pub velocity: f32,
+    pub step: u32,
+    _pad: u32,
+    pub contacts: [BowContact; MAX_BOW_CONTACTS],
+}
+
+/// Header and contact list of the WGSL `Bow` storage struct; the output frames follow it.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Bow {
+    model: u32,
+    torsion: u32,
+    contact_count: u32,
+    step: u32,
+    radius: f32,
+    normal_force: f32,
+    velocity: f32,
+    mu_d: f32,
+    mu_a1: f32,
+    mu_v1: f32,
+    mu_a2: f32,
+    mu_v2: f32,
+    start_step: u32,
+    ramp_steps: u32,
+    stop_step: u32,
+    _pad: u32,
+    contacts: [BowContact; MAX_BOW_CONTACTS],
+    thermal: BowThermal,
+}
+
+/// Byte offset of the output frames in the bow buffer: header, contacts and thermal parameters
+/// (struct Bow above), then the sum-of-exponentials states and the temperature rings.
+const BOW_FRAMES_OFFSET: u64 =
+    (std::mem::size_of::<Bow>() + 4 * (BOW_SOE_FLOATS + BOW_RING_FLOATS)) as u64;
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<BowContact>() == 48);
+    assert!(offset_of!(BowFrame, contacts) == 16);
+    assert!(size_of::<BowFrame>() == 1552);
+    assert!(offset_of!(Bow, radius) == 16);
+    assert!(offset_of!(Bow, start_step) == 48);
+    assert!(offset_of!(Bow, contacts) == 64);
+    assert!(offset_of!(Bow, thermal) == 1600);
+    assert!(offset_of!(BowThermal, exact) == 48);
+    assert!(size_of::<BowThermal>() == 560);
+    assert!(size_of::<Bow>() == 2160);
+};
+
+pub const MAX_HAMMER_CONTACTS: usize = 32;
+const MAX_SURFACE_NODES: usize = 1024;
+
+/// Contact record of the pick or of one hammer friction node (WGSL SurfaceContact).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SurfaceContact {
+    pub node: u32,
+    pub sticking: u32,
+    pub in_contact: u32,
+    pub slip_velocity: f32,
+    pub normal_force: f32,
+    pub friction_force: f32,
+    pub normal_y: f32,
+    pub normal_z: f32,
+    pub body_work: f32,
+    pub friction_work: f32,
+    pub normal_work: f32,
+    pub impulse_t: f32,
+}
+
+/// Rigid plectrum (WGSL Pick).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Pick {
+    pub enabled: u32,
+    pub torsion: u32,
+    pub node: u32,
+    pub step: u32,
+    pub radius: f32,
+    pub tip_radius: f32,
+    pub length: f32,
+    pub mu_s: f32,
+    pub mu_d: f32,
+    pub axis_y: f32,
+    pub axis_z: f32,
+    pub tip_y0: f32,
+    pub tip_z: f32,
+    pub velocity: f32,
+    pub start_step: u32,
+    pub ramp_steps: u32,
+    pub first_contact_step: u32,
+    pub last_contact_step: u32,
+    pub max_penetration: f32,
+    pub tip_y: f32,
+    pub contact: SurfaceContact,
+}
+
+/// Hammer contact geometry and felt friction (WGSL HammerFriction).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct HammerFriction {
+    pub enabled: u32,
+    pub torsion: u32,
+    pub count: u32,
+    pub curved: u32,
+    pub radius: f32,
+    pub crown_radius: f32,
+    pub mu_s: f32,
+    pub mu_d: f32,
+    pub hammer_work: f32,
+    pub hammer_displacement: f32,
+    pub hammer_velocity: f32,
+    _pad: f32,
+    pub contacts: [SurfaceContact; MAX_HAMMER_CONTACTS],
+}
+
+/// One output frame of the surface buffer: pick and hammer records.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SurfaceFrame {
+    pub pick: Pick,
+    pub hammer: HammerFriction,
+}
+
+/// Byte offset of the output frames in the surface buffer: pick, hammer friction, then the per-node
+/// felt normals (vec4 each).
+const SURFACE_FRAMES_OFFSET: u64 = (std::mem::size_of::<Pick>()
+    + std::mem::size_of::<HammerFriction>()
+    + 16 * MAX_SURFACE_NODES) as u64;
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<SurfaceContact>() == 48);
+    assert!(offset_of!(Pick, radius) == 16);
+    assert!(offset_of!(Pick, first_contact_step) == 64);
+    assert!(offset_of!(Pick, contact) == 80);
+    assert!(size_of::<Pick>() == 128);
+    assert!(offset_of!(HammerFriction, hammer_work) == 32);
+    assert!(offset_of!(HammerFriction, contacts) == 48);
+    assert!(size_of::<HammerFriction>() == 1584);
+    assert!(size_of::<SurfaceFrame>() == 1712);
+    // the vec4 array must start 16-byte aligned
+    assert!((size_of::<Pick>() + size_of::<HammerFriction>()) % 16 == 0);
+};
+
+impl Pick {
+    pub fn off() -> Self {
+        bytemuck::Zeroable::zeroed()
+    }
+
+    /// Pick at node `node`: capsule of half-thickness tip_radius along the unit axis (y, z) from the
+    /// tip centre (tip_y0, tip_z), face length `length`; moves along +y, starting at start_step with
+    /// a linear speed ramp over ramp_steps to `velocity`. Coulomb friction mu_s / mu_d.
+    pub fn new(
+        node: u32,
+        torsion: bool,
+        radius: f32,
+        tip_radius: f32,
+        length: f32,
+        axis: [f32; 2],
+        tip: [f32; 2],
+        velocity: f32,
+        start_step: u32,
+        ramp_steps: u32,
+        mu_s: f32,
+        mu_d: f32,
+    ) -> Self {
+        assert!(radius > 0.0 && tip_radius > 0.0 && length > 0.0);
+        assert!((axis[0] * axis[0] + axis[1] * axis[1] - 1.0).abs() < 1e-5, "pick axis must be a unit vector");
+        assert!(mu_s >= mu_d && mu_d >= 0.0, "need mu_s >= mu_d >= 0");
+        let mut p = Self::off();
+        p.enabled = 1;
+        p.torsion = torsion as u32;
+        p.node = node;
+        p.radius = radius;
+        p.tip_radius = tip_radius;
+        p.length = length;
+        p.mu_s = mu_s;
+        p.mu_d = mu_d;
+        p.axis_y = axis[0];
+        p.axis_z = axis[1];
+        p.tip_y0 = tip[0];
+        p.tip_z = tip[1];
+        p.tip_y = tip[0];
+        p.velocity = velocity;
+        p.start_step = start_step;
+        p.ramp_steps = ramp_steps;
+        p.contact.node = node;
+        p
+    }
+}
+
+impl HammerFriction {
+    pub fn off() -> Self {
+        bytemuck::Zeroable::zeroed()
+    }
+
+    /// crown_radius > 0: curved crown (contact normal from the geometry), 0: flat. mu_s, mu_d: felt
+    /// friction on the given contact nodes (mu_s = 0 and no nodes: no friction).
+    pub fn new(
+        nodes: &[u32],
+        torsion: bool,
+        radius: f32,
+        crown_radius: f32,
+        mu_s: f32,
+        mu_d: f32,
+    ) -> Self {
+        assert!(nodes.len() <= MAX_HAMMER_CONTACTS);
+        assert!(crown_radius >= 0.0 && radius > 0.0);
+        assert!(mu_s >= mu_d && mu_d >= 0.0, "need mu_s >= mu_d >= 0");
+        let mut h = Self::off();
+        h.enabled = (!nodes.is_empty() && mu_s > 0.0) as u32;
+        h.torsion = torsion as u32;
+        h.count = if h.enabled == 1 { nodes.len() as u32 } else { 0 };
+        h.curved = (crown_radius > 0.0) as u32;
+        h.radius = radius;
+        h.crown_radius = crown_radius;
+        h.mu_s = mu_s;
+        h.mu_d = mu_d;
+        for (c, &n) in h.contacts.iter_mut().zip(nodes) {
+            c.node = n;
+        }
+        h
+    }
+}
+
+impl Bow {
+    /// Bow off: the frame kernel skips every bow phase.
+    pub fn off() -> Self {
+        bytemuck::Zeroable::zeroed()
+    }
+
+    /// model 1: friction curve mu(v) = mu[0] + mu[1] exp(-v / mu[2]) + mu[3] exp(-v / mu[4]).
+    /// Profile (in solver steps): linear rise over ramp_steps from start_step, steady, linear
+    /// fall over ramp_steps from stop_step.
+    pub fn new(
+        model: u32,
+        torsion: bool,
+        nodes: &[u32],
+        weights: &[f32],
+        radius: f32,
+        normal_force: f32,
+        velocity: f32,
+        mu: &[f32; 5],
+        start_step: u32,
+        ramp_steps: u32,
+        stop_step: u32,
+    ) -> Self {
+        assert!(model == 1 || model == 2, "bow model {model} not implemented");
+        assert!(!nodes.is_empty() && nodes.len() <= MAX_BOW_CONTACTS);
+        assert_eq!(nodes.len(), weights.len());
+        assert!(radius > 0.0 && normal_force >= 0.0);
+        assert!(mu[2] > 0.0 && mu[4] > 0.0);
+        let mut contacts: [BowContact; MAX_BOW_CONTACTS] = bytemuck::Zeroable::zeroed();
+        for (c, (&n, &w)) in contacts.iter_mut().zip(nodes.iter().zip(weights)) {
+            c.node = n;
+            c.weight = w;
+            c.sticking = 1; // at rest against a bow that starts at rest
+        }
+        Self {
+            model,
+            torsion: torsion as u32,
+            contact_count: nodes.len() as u32,
+            step: 0,
+            radius,
+            normal_force,
+            velocity,
+            mu_d: mu[0],
+            mu_a1: mu[1],
+            mu_v1: mu[2],
+            mu_a2: mu[3],
+            mu_v2: mu[4],
+            start_step,
+            ramp_steps,
+            stop_step,
+            _pad: 0,
+            contacts,
+            thermal: bytemuck::Zeroable::zeroed(),
+        }
+    }
+}
+
+impl BowThermal {
+    pub fn new(
+        c_over_h: f32,
+        conv_coef: f32,
+        lam_string: f32,
+        lam_bow: f32,
+        window: u32,
+        f_window: f32,
+        exact: &[f32],
+        decay: &[f32],
+        weight: &[f32],
+        weight_window: &[f32],
+        cal: [f32; 3],
+    ) -> Self {
+        assert_eq!(exact.len(), 32);
+        assert!(decay.len() <= BOW_SOE_TERMS && decay.len() == weight.len() && decay.len() == weight_window.len());
+        assert!(window as usize >= 32 && (window as usize) + 34 < BOW_RING);
+        let mut t: BowThermal = bytemuck::Zeroable::zeroed();
+        t.c_over_h = c_over_h;
+        t.conv_coef = conv_coef;
+        t.lam_string = lam_string;
+        t.lam_bow = lam_bow;
+        t.window = window;
+        t.f_window = f_window;
+        t.terms = decay.len() as u32;
+        t.cal_k1 = cal[0];
+        t.cal_k2 = cal[1];
+        t.cal_force = cal[2];
+        t.exact.copy_from_slice(exact);
+        t.decay[..decay.len()].copy_from_slice(decay);
+        t.weight[..weight.len()].copy_from_slice(weight);
+        t.weight_window[..weight_window.len()].copy_from_slice(weight_window);
+        t
+    }
+}
+
 #[derive(Debug)]
 pub enum StateError {
     AdapterRequest,
@@ -338,6 +720,13 @@ pub struct State {
     queue: wgpu::Queue,
     nodes_staging_buffer: wgpu::Buffer,
     edges_staging_buffer: wgpu::Buffer,
+    bow_buffer: wgpu::Buffer,
+    bow_staging_buffer: wgpu::Buffer,
+    bow: Bow,
+    surface_buffer: wgpu::Buffer,
+    surface_staging_buffer: wgpu::Buffer,
+    pick: Pick,
+    hammer_friction: HammerFriction,
     initialized: bool,
     hammer_frames: usize,
 }
@@ -390,6 +779,16 @@ impl State {
         };
         println!("  Frame kernel: one workgroup of {frame_threads} threads");
         let _ = std::io::stdout().flush();
+        // Nine storage buffers per stage (nodes, edges, their outputs, hammer weights, hammer, felt
+        // memory, bow, surface contacts); the WebGPU default guarantees eight.
+        const STORAGE_BUFFERS: u32 = 9;
+        if adapter_limits.max_storage_buffers_per_shader_stage < STORAGE_BUFFERS {
+            return Err(format!(
+                "adapter allows {} storage buffers per shader stage, the solver needs {STORAGE_BUFFERS}",
+                adapter_limits.max_storage_buffers_per_shader_stage
+            )
+            .into());
+        }
 
         let (device, queue) = adapter
             .request_device(
@@ -402,6 +801,7 @@ impl State {
                             max_push_constant_size: 32,
                             max_compute_invocations_per_workgroup: frame_threads,
                             max_compute_workgroup_size_x: frame_threads,
+                            max_storage_buffers_per_shader_stage: STORAGE_BUFFERS,
                             ..wgpu::Limits::default()
                         }
                     },
@@ -506,6 +906,52 @@ impl State {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Bow header and contacts, then chunk_size output frames (WGSL struct Bow).
+        let bow = Bow::off();
+        let bow_frames_size =
+            (std::mem::size_of::<BowFrame>() as u64 * uniforms.chunk_size as u64) as wgpu::BufferAddress;
+        let bow_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bow buffer"),
+            size: BOW_FRAMES_OFFSET + bow_frames_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&bow_buffer, 0, bytemuck::cast_slice(&[bow]));
+        let bow_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bow_frames_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Pick, hammer friction, per-node felt normals, then chunk_size output frames (WGSL Surface).
+        let pick = Pick::off();
+        let hammer_friction = HammerFriction::off();
+        let surface_frames_size = (std::mem::size_of::<SurfaceFrame>() as u64
+            * uniforms.chunk_size as u64) as wgpu::BufferAddress;
+        let surface_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("surface contact buffer"),
+            size: SURFACE_FRAMES_OFFSET + surface_frames_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&surface_buffer, 0, bytemuck::cast_slice(&[pick]));
+        queue.write_buffer(
+            &surface_buffer,
+            std::mem::size_of::<Pick>() as u64,
+            bytemuck::cast_slice(&[hammer_friction]),
+        );
+        let surface_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: surface_frames_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let push_constants = PushConstants {
             current_index: 0,
             future_index: 1,
@@ -601,6 +1047,26 @@ impl State {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
                 label: Some("Compute Bind Group Layout"),
             });
@@ -639,6 +1105,14 @@ impl State {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: memory_integral_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: bow_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: surface_buffer.as_entire_binding(),
                 },
             ],
             label: Some("Compute Bind Group Layout"),
@@ -743,6 +1217,13 @@ impl State {
             nodes_output_buffer,
             nodes_staging_buffer,
             edges_staging_buffer,
+            bow_buffer,
+            bow_staging_buffer,
+            bow,
+            surface_buffer,
+            surface_staging_buffer,
+            pick,
+            hammer_friction,
             push_constants,
             init_pipeline,
             create_reference_pipeline,
@@ -889,6 +1370,12 @@ impl State {
     /// The original multi-pass loop (5 compute passes per solver step), kept as the reference
     /// that `compute` is checked against.
     pub fn compute_reference(&mut self) -> Result<(), Box<dyn Error>> {
+        // The bow phases exist only in the frame kernel.
+        assert!(self.bow.model == 0, "compute_reference does not support the bow");
+        assert!(
+            self.pick.enabled == 0 && self.hammer_friction.enabled == 0,
+            "compute_reference does not support the pick or the felt friction"
+        );
         // The 64 comes from the @workgroup_size(64) inside the shaders
         let num_dispatches = self.fdm_uniform.node_count.div_ceil(64);
 
@@ -1070,6 +1557,171 @@ impl State {
         }
 
         Ok((Vec::new(), Vec::new()))
+    }
+
+    pub fn set_twist_rate_damping(&mut self, twist_rate_damping: f32) -> Result<(), Box<dyn Error>> {
+        self.fdm_uniform.twist_rate_damping = twist_rate_damping;
+        self.write_uniforms()
+    }
+
+    /// Thermal-model parameters for the next set_bow with model 2.
+    pub fn set_bow_thermal(&mut self, thermal: BowThermal) -> Result<(), Box<dyn Error>> {
+        self.bow.thermal = thermal;
+        Ok(())
+    }
+
+    /// Replaces the bow (header and contacts; resets its clock, contact states, temperature
+    /// histories). Keeps the thermal parameters of set_bow_thermal.
+    pub fn set_bow(&mut self, mut bow: Bow) -> Result<(), Box<dyn Error>> {
+        bow.thermal = self.bow.thermal;
+        if bow.model == 2 {
+            assert!(bow.thermal.terms > 0, "set_bow_thermal first");
+            let w0 = bow.contacts[0].weight;
+            // one contact size (and history window) for all contacts
+            assert!(bow.contacts[..bow.contact_count as usize].iter().all(|c| c.weight == w0));
+        }
+        for c in &bow.contacts[..bow.contact_count as usize] {
+            let j = c.node;
+            // node j and edge j must both be dynamic (see the clamp ranges in compute_forces)
+            assert!(
+                j > self.fdm_uniform.clamp_offset
+                    && j + 2 + self.fdm_uniform.clamp_offset < self.fdm_uniform.node_count,
+                "bow contact node {j} too close to an end"
+            );
+        }
+        self.bow = bow;
+        self.queue
+            .write_buffer(&self.bow_buffer, 0, bytemuck::cast_slice(&[self.bow]));
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.clear_buffer(
+            &self.bow_buffer,
+            std::mem::size_of::<Bow>() as u64,
+            Some(BOW_FRAMES_OFFSET - std::mem::size_of::<Bow>() as u64),
+        );
+        self.queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
+    /// The bow output frames of the last chunk (call after save, same chunk).
+    pub fn save_bow(&mut self) -> Result<Vec<BowFrame>, Box<dyn Error>> {
+        let size = self.bow_staging_buffer.size();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(
+            &self.bow_buffer,
+            BOW_FRAMES_OFFSET,
+            &self.bow_staging_buffer,
+            0,
+            size,
+        );
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let slice = self.bow_staging_buffer.slice(..);
+        let (tx, rx) = flume::bounded(1);
+        slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
+        self.device.poll(wgpu::Maintain::wait()).panic_on_timeout();
+        let frames = if let Ok(Ok(())) = rx.recv() {
+            let data = slice.get_mapped_range();
+            let result: Vec<BowFrame> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            self.bow_staging_buffer.unmap();
+            result
+        } else {
+            Vec::new()
+        };
+        Ok(frames)
+    }
+
+    pub fn bow_contact_count(&self) -> usize {
+        self.bow.contact_count as usize
+    }
+
+    fn assert_dynamic_node(&self, j: u32, what: &str) {
+        // node j and edge j must both be dynamic (see the clamp ranges in compute_forces)
+        assert!(
+            j > self.fdm_uniform.clamp_offset
+                && j + 2 + self.fdm_uniform.clamp_offset < self.fdm_uniform.node_count,
+            "{what} node {j} too close to an end"
+        );
+    }
+
+    /// Replaces the pick (resets its clock and contact record).
+    pub fn set_pick(&mut self, pick: Pick) -> Result<(), Box<dyn Error>> {
+        if pick.enabled == 1 {
+            self.assert_dynamic_node(pick.node, "pick");
+            assert!(
+                self.bow.contact_count == 0
+                    || self.bow.contacts[..self.bow.contact_count as usize]
+                        .iter()
+                        .all(|c| c.node != pick.node),
+                "pick and bow on the same node"
+            );
+        }
+        self.pick = pick;
+        // only this header: the GPU advances the other one
+        self.queue
+            .write_buffer(&self.surface_buffer, 0, bytemuck::cast_slice(&[self.pick]));
+        Ok(())
+    }
+
+    /// Replaces the hammer contact geometry and felt friction.
+    pub fn set_hammer_friction(&mut self, h: HammerFriction) -> Result<(), Box<dyn Error>> {
+        if h.enabled == 1 {
+            assert!(
+                self.fdm_uniform.node_count as usize <= MAX_SURFACE_NODES,
+                "felt friction supports at most {MAX_SURFACE_NODES} nodes"
+            );
+            for c in &h.contacts[..h.count as usize] {
+                self.assert_dynamic_node(c.node, "hammer friction");
+            }
+        }
+        self.hammer_friction = h;
+        self.queue.write_buffer(
+            &self.surface_buffer,
+            std::mem::size_of::<Pick>() as u64,
+            bytemuck::cast_slice(&[self.hammer_friction]),
+        );
+        Ok(())
+    }
+
+    /// The pick and hammer friction output frames of the last chunk (call after save, same chunk).
+    pub fn save_surface(&mut self) -> Result<Vec<SurfaceFrame>, Box<dyn Error>> {
+        let size = self.surface_staging_buffer.size();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(
+            &self.surface_buffer,
+            SURFACE_FRAMES_OFFSET,
+            &self.surface_staging_buffer,
+            0,
+            size,
+        );
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let slice = self.surface_staging_buffer.slice(..);
+        let (tx, rx) = flume::bounded(1);
+        slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
+        self.device.poll(wgpu::Maintain::wait()).panic_on_timeout();
+        let frames = if let Ok(Ok(())) = rx.recv() {
+            let data = slice.get_mapped_range();
+            let result: Vec<SurfaceFrame> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            self.surface_staging_buffer.unmap();
+            result
+        } else {
+            Vec::new()
+        };
+        Ok(frames)
+    }
+
+    pub fn hammer_friction_count(&self) -> usize {
+        self.hammer_friction.count as usize
     }
 
     fn write_uniforms(&mut self) -> Result<(), Box<dyn Error>> {

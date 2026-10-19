@@ -202,6 +202,32 @@ def stored_energy(r, quats, dl, K_se, K_bt):
     return W_s.sum(axis=-1) + W_b.sum(axis=-1)
 
 
+def stored_energy_offset(du, p, frames, offsets, rel_rest, dl, K_se, K_bt):
+    """stored_energy evaluated as the shader evaluates strain and curvature: from the offset
+    w = R0^T ref - dl e3 + R0^T du, the deviations p (q = q0 p) and the rest relative rotations
+    rel_rest = q0_i^-1 q0_(i+1) (utils.rest_relative_orientations). Algebraically identical to
+    stored_energy; but stored_energy forms R(q)^T r / dl - e3 from numbers near 1, so the float32
+    norm error of each saved orientation (~6e-8) enters the axial strain and, times the tension,
+    the energy (~2e-8 J per rotated edge on the cello D). Here only small quantities are rounded."""
+    du = np.asarray(du, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    R0 = np.asarray(frames, dtype=np.float64)
+    dl_ = float(dl)
+    w = np.asarray(offsets, dtype=np.float64) + np.einsum('...nk,nkj->...nj', du, R0)
+    sigma = rotate_inv(p, w) / dl_ + rotation_deviation_inv(p)
+    length = np.sqrt(w[..., 0] ** 2 + w[..., 1] ** 2 + (dl_ + w[..., 2]) ** 2)
+    s = (2.0 * dl_ * w[..., 2] + np.sum(w * w, axis=-1)) / (dl_ * (length + dl_))
+    eta = 1.0 + ETA_SLOPE * s
+    W_s = 0.5 * eta ** 2 * np.sum(np.asarray(K_se, np.float64) * sigma * sigma, axis=-1) * dl_
+    r0 = np.asarray(rel_rest, dtype=np.float64)
+    rel = _qmul(_qmul(_qinv(p[..., :-1, :]), r0), p[..., 1:, :])
+    rel = np.where(np.sum(rel * r0, axis=-1, keepdims=True) < 0, -rel, rel)
+    kap = 2.0 / dl_ * _qmul(_qinv(r0), rel)[..., :3]
+    eta_v = 1.0 + ETA_SLOPE * 0.5 * (s[..., :-1] + s[..., 1:])
+    W_b = 0.5 * eta_v ** 4 * np.sum(np.asarray(K_bt, np.float64) * kap * kap, axis=-1) * dl_
+    return W_s.sum(axis=-1) + W_b.sum(axis=-1)
+
+
 def node_forces(f):
     """F_j = f_j - f_{j-1} on interior nodes; zero at the fixed ends."""
     out = np.zeros(f.shape[:-2] + (f.shape[-2] + 1, 3), dtype=f.dtype)
@@ -235,7 +261,7 @@ def dst_parseval(n_interior):
 
 
 def exact_flow(pos, vel, quats, ref, q_rest, dl, m_node, K_se, c_lin=0.0, block=64,
-               force_law="legacy", omega=None, inertia=None, K_bt=None):
+               force_law="legacy", omega=None, inertia=None, K_bt=None, offset_form=None):
     """Longitudinal energy and the transfer power into it, per node/edge.
 
     pos, vel: (F, N, 3) displacement and velocity (x longitudinal); quats:
@@ -252,6 +278,11 @@ def exact_flow(pos, vel, quats, ref, q_rest, dl, m_node, K_se, c_lin=0.0, block=
                                string, whose rest twist energy depends on stretch)
     force_law="variational" evaluates the variational shader force (pass omega (F, N-1, 3),
     the per-edge inertia and K_bt); states B and C have no rotation, so no kinetic term.
+    offset_form=(p, frames, offsets) for runs that store the deviations p (q = q0 p): the edge
+    forces of states A and B are then evaluated as the shader evaluates them (edge_forces_offset,
+    rest frames and offsets from utils). The absolute form R(q)^T r / dl - e3 subtracts numbers
+    near 1, so the float32 norm error of each saved orientation (~1e-7) would enter the axial
+    strain, i.e. about EA * 1e-7 per edge (run 002: 1.3e-2 N rms per node).
     """
     F, N = pos.shape[:2]
     ref = np.asarray(ref, dtype=np.float64)
@@ -305,7 +336,19 @@ def exact_flow(pos, vel, quats, ref, q_rest, dl, m_node, K_se, c_lin=0.0, block=
         Fx_C = np.zeros((b - a, N))
         Fx_C[:, 1:-1] = f_c_edge[:, 1:] - f_c_edge[:, :-1]
         q_r = np.broadcast_to(q_rest, q.shape)
-        if variational:
+        if offset_form is not None:
+            p_dev, frames, offsets = offset_form
+            pa = np.asarray(p_dev[a:b], dtype=np.float64)
+            pb = np.zeros_like(pa)
+            pb[..., 3] = 1.0
+            om = np.asarray(omega[a:b], dtype=np.float64) if variational else None
+            f_B = edge_forces_offset(du, pb, frames, offsets, dl, K_se, force_law=force_law)
+            f_A = edge_forces_offset(du, pa, frames, offsets, dl, K_se, force_law=force_law,
+                                     omega=om, inertia=inertia)
+            if variational:
+                f_B = f_B + bend_stretch_forces(r, q_r, dl, K_bt)
+                f_A = f_A + bend_stretch_forces(r, q, dl, K_bt)
+        elif variational:
             om = np.asarray(omega[a:b], dtype=np.float64)
             f_B = edge_forces(r, q_r, dl, K_se, force_law=force_law) + bend_stretch_forces(r, q_r, dl, K_bt)
             f_A = (edge_forces(r, q, dl, K_se, force_law=force_law, omega=om, inertia=inertia)

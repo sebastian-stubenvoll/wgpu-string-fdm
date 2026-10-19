@@ -210,14 +210,26 @@ def static_axial_equilibrium(ref_spacing, dl, EA, B0, force_law, node_count, tol
 def generate_straight_rod(
     node_count, tuned_length, tension_force, core_radius, winding_radius,
     E_core, G_core, rho_core, E_winding, G_winding, rho_winding, packing_factor, mu, twists,
-    force_law="variational"
+    force_law="variational", torsional_wave_speed=None
 ):
     """force_law: "variational" (force = gradient of the stored energy, including the
-    stretch dependence of the cross-section) or "legacy" (runs before 2026-10-18)."""
+    stretch dependence of the cross-section) or "legacy" (runs before 2026-10-18).
+    torsional_wave_speed (m/s, measured on the string at tension): if given, the torsional
+    stiffness is GJ = c_t^2 rho I_p (rho I_p: the rod's polar inertia per length from core and
+    winding) instead of the core's G J, i.e. the winding's contribution is taken from the
+    measurement. Then torsional_fundamental gives c_t / (2 L)."""
     assert force_law in FORCE_LAWS, force_law
     core_area = np.pi * core_radius**2
     EA = E_core * core_area
-    GJ = G_core * np.pi * core_radius**4 / 2.0
+
+    I_core = rho_core * core_radius**4 / 4.0
+    I_winding = rho_winding * ((core_radius + 2.0 * winding_radius)**4 - core_radius**4) * packing_factor / 4.0
+    I1 = I_core + I_winding
+    I3 = I1 * 2.0
+    if torsional_wave_speed is None:
+        GJ = G_core * (np.pi * core_radius**4 / 2.0)   # same evaluation order as before
+    else:
+        GJ = float(torsional_wave_speed) ** 2 * np.pi * I3
 
     dilatation = rest_stretch(tension_force, EA, force_law, node_count, tuned_length, twists, GJ)
     rest_length = tuned_length / (1 + dilatation)
@@ -228,15 +240,10 @@ def generate_straight_rod(
     winding_mass = float(rho_winding * winding_area * dl * packing_factor)
     mass = core_mass + winding_mass
 
-    I_core = rho_core * core_radius**4 / 4.0
-    I_winding = rho_winding * ((core_radius + 2.0 * winding_radius)**4 - core_radius**4) * packing_factor / 4.0
-    I1 = I_core + I_winding
-    I3 = I1 * 2.0
     inertia = (np.pi * dl * np.array([I1, I1, I3], dtype=np.float32))
 
     alpha = 4.0 / 3.0
     I_c = np.pi * core_radius**4 / 4.0
-    J = np.pi * core_radius**4 / 2.0
     I_w = np.pi * ((core_radius + 2.0 * winding_radius)**4 - core_radius**4) * packing_factor / 4.0
     EI = E_core * I_c + (E_winding * I_w * mu)
 
@@ -244,7 +251,7 @@ def generate_straight_rod(
                      G_core * core_area * alpha,
                      E_core * core_area], dtype=np.float32)
 
-    K_bt = np.array([EI, EI, G_core * J], dtype=np.float32)
+    K_bt = np.array([EI, EI, GJ], dtype=np.float32)
 
     # Edge orientations are stored as the deviation p from the rest orientation
     # q0 (q = q0 * p), so they start at the identity; the rest frame itself is
@@ -272,10 +279,113 @@ def generate_straight_rod(
 
     return nodes, edges, dl, mass, inertia, K_se, K_bt
 
-def damping_coefficients(damping, node_mass, inertia, K_bt=None, dl=None, length=None):
+
+def resolve_rod_params(rod_params, node_count, force_law="variational"):
+    """Copy of rod_params with derived entries filled in.
+
+    "linear_density" (kg/m, of the string at tension): the winding packing factor is solved
+    so that the rod's mass per tuned length equals it. Mass is linear in the packing factor
+    and is conserved under the rest stretch, so the per-node mass m gives m (N - 1) / L
+    per tuned length. The entry is removed and "packing_factor" set; any given packing
+    factor must then be None.
+    """
+    params = dict(rod_params)
+    f_target = params.pop("fundamental_frequency", None)
+    if f_target is not None:
+        # "fundamental_frequency" (Hz, plain strings): the tension is solved so that the flexible-
+        # string fundamental of the rod, sqrt(T / rho_L) / (2 L) with its own mass per tuned length,
+        # equals it; rho_L depends on T only through the rest stretch, so the fixed point converges.
+        assert params.get("tension_force") is None, "give fundamental_frequency or tension_force, not both"
+        assert "linear_density" not in params
+        L = params["tuned_length"]
+        tension = 1.0
+        for _ in range(100):
+            mass = generate_straight_rod(node_count, **{**params, "tension_force": tension}, force_law=force_law)[3]
+            new = mass * (node_count - 1) / L * (2.0 * L * f_target) ** 2
+            if abs(new - tension) <= 1e-12 * new:
+                break
+            tension = new
+        params["tension_force"] = float(new)
+        return params
+    target = params.pop("linear_density", None)
+    if target is None:
+        return params
+    assert params.get("packing_factor") is None, "give linear_density or packing_factor, not both"
+
+    def per_length(phi):
+        mass = generate_straight_rod(node_count, **{**params, "packing_factor": phi}, force_law=force_law)[3]
+        return mass * (node_count - 1) / params["tuned_length"]
+
+    m0, m1 = per_length(0.0), per_length(1.0)
+    phi = (target - m0) / (m1 - m0)
+    assert 0.0 < phi <= 1.0, f"linear density {target} kg/m needs packing factor {phi}"
+    params["packing_factor"] = float(phi)
+    return params
+
+
+def fundamental_frequency(tension_force, node_mass, node_count, length):
+    """f1 = sqrt(T / rho_L) / (2 L) of the flexible string, rho_L = m (N - 1) / L."""
+    rho_L = float(node_mass) * (node_count - 1) / float(length)
+    return np.sqrt(float(tension_force) / rho_L) / (2.0 * float(length))
+
+
+def constant_q_fit(q, f1, length, modes=(1, 10)):
+    """b1, b2 such that the transverse decay rate b1 + b2 k_n^2 (k_n = n pi / L) equals the
+    constant-Q rate pi f_n / Q, f_n = n f1, at the two given mode numbers. Between and
+    beyond them the Q of this two-parameter law differs from q (see damping_q_profile)."""
+    n_a, n_b = modes
+    k_a, k_b = n_a * np.pi / length, n_b * np.pi / length
+    r_a, r_b = np.pi * n_a * f1 / q, np.pi * n_b * f1 / q
+    b2 = (r_b - r_a) / (k_b ** 2 - k_a ** 2)
+    b1 = r_a - b2 * k_a ** 2
+    return float(b1), float(b2)
+
+
+def two_mode_rate_fit(rates, length, modes=(1, 10)):
+    """b1, b2 such that b1 + b2 k_n^2 (k_n = n pi / L) equals the given amplitude decay rates
+    (s^-1) at the two mode numbers."""
+    n_a, n_b = modes
+    k_a, k_b = n_a * np.pi / length, n_b * np.pi / length
+    r_a, r_b = rates
+    b2 = (r_b - r_a) / (k_b ** 2 - k_a ** 2)
+    b1 = r_a - b2 * k_a ** 2
+    return float(b1), float(b2)
+
+
+def valette_q(n, f1, linear_density, tension, EI, length, model):
+    """Quality factor of transverse mode n from the loss model of Valette & Cuesta (Mecanique de la
+    corde vibrante, 1993) in the form used by Issanchou, Bilbao, Le Carrou, Touze & Doare (JSV 393,
+    2017, Eq. 12):
+        1/Q = R / (2 pi mu nu) + 4 pi^2 mu EI delta_ve nu^2 / T^2 + 1/Q_te,
+        R = 2 pi eta_air + 2 pi d sqrt(pi eta_air rho_air nu),
+    with nu the stiff-string frequency n f1 sqrt(1 + B n^2), B = pi^2 EI / (T L^2).
+    model: {"diameter", "delta_ve", "q_te_inv", "eta_air", "rho_air"}."""
+    n = np.asarray(n, dtype=float)
+    B = np.pi ** 2 * EI / (tension * length ** 2)
+    nu = n * f1 * np.sqrt(1.0 + B * n ** 2)
+    mu = float(linear_density)
+    eta, rho_a, d = model["eta_air"], model["rho_air"], model["diameter"]
+    R = 2.0 * np.pi * eta + 2.0 * np.pi * d * np.sqrt(np.pi * eta * rho_a * nu)
+    q_inv = (R / (2.0 * np.pi * mu * nu)
+             + 4.0 * np.pi ** 2 * mu * EI * model["delta_ve"] * nu ** 2 / tension ** 2
+             + model["q_te_inv"])
+    return 1.0 / q_inv, nu
+
+
+def damping_q_profile(b1, b2, f1, length, modes):
+    """Q_n = pi f_n / (b1 + b2 k_n^2) with f_n = n f1."""
+    n = np.asarray(modes, dtype=float)
+    return np.pi * n * f1 / (b1 + b2 * (n * np.pi / length) ** 2)
+
+
+def damping_coefficients(damping, node_mass, inertia, K_bt=None, dl=None, length=None,
+                         tension=None, node_count=None):
     """Viscous damping coefficients for the shader from physical decay rates.
 
     damping: {"b1": s^-1, "b2": m^2/s, "torsion_rate": s^-1}
+      transverse_q  instead of b1, b2: a constant transverse Q, matched at the mode
+                    numbers "q_fit_modes" (default (1, 10)) by constant_q_fit; needs
+                    tension and node_count for the fundamental
       b1            frequency-independent loss; transverse mode n decays at
       b2            ... b1 + b2 k_n^2 (k_n = n pi / L). The tilt damping acts on the
                     slope rate because the frame follows the tangent, i.e. as the
@@ -291,8 +401,31 @@ def damping_coefficients(damping, node_mass, inertia, K_bt=None, dl=None, length
     """
     m = float(node_mass)
     I3 = float(np.ravel(inertia)[2])
-    c_lin = 2.0 * damping["b1"] * m
-    c_tilt = 2.0 * damping["b2"] * m
+    if "torsion_q_fit_modes" in damping:
+        # viscous part of the two-term torsional law (see twist_rate_damping)
+        f_t = torsional_fundamental(K_bt, I3, dl, length)
+        b1_t, _ = constant_q_fit(damping["torsion_q"], f_t, length, tuple(damping["torsion_q_fit_modes"]))
+        c_lin, c_ang = damping_coefficients({k: v for k, v in damping.items()
+                                             if k not in ("torsion_q", "torsion_q_fit_modes")}
+                                            | {"torsion_rate": b1_t},
+                                            node_mass, inertia, K_bt, dl, length, tension, node_count)
+        return c_lin, c_ang
+    if "transverse_q" in damping:
+        f1 = fundamental_frequency(tension, m, node_count, length)
+        b1, b2 = constant_q_fit(damping["transverse_q"], f1, length,
+                                tuple(damping.get("q_fit_modes", (1, 10))))
+    elif "transverse_valette" in damping:
+        # decay rate pi nu_n / Q_n of the Valette model, matched at the fit modes
+        modes = tuple(damping.get("q_fit_modes", (1, 10)))
+        f1 = fundamental_frequency(tension, m, node_count, length)
+        rho_L = m * (node_count - 1) / float(length)
+        q, nu = valette_q(modes, f1, rho_L, tension, float(np.ravel(K_bt)[0]), length,
+                          damping["transverse_valette"])
+        b1, b2 = two_mode_rate_fit(np.pi * nu / q, length, modes)
+    else:
+        b1, b2 = damping["b1"], damping["b2"]
+    c_lin = 2.0 * b1 * m
+    c_tilt = 2.0 * b2 * m
     if "torsion_q" in damping:
         f_t = torsional_fundamental(K_bt, I3, dl, length)
         torsion_rate = np.pi * f_t / damping["torsion_q"]
@@ -300,6 +433,23 @@ def damping_coefficients(damping, node_mass, inertia, K_bt=None, dl=None, length
         torsion_rate = damping["torsion_rate"]
     c_tor = 2.0 * torsion_rate * I3
     return c_lin, (c_tilt, c_tilt, c_tor)
+
+
+def twist_rate_damping(damping, inertia, K_bt, dl, length):
+    """Kelvin-Voigt twist-rate damping D3 (N m^2 s) for the shader (0 if not requested).
+
+    With "torsion_q_fit_modes" the torsional decay rate is b1_t + b2_t k_n^2, matched to the
+    constant torsional Q ("torsion_q") at the two mode numbers like the transverse law
+    (constant_q_fit with the torsional fundamental). The viscous torsion coefficient gives
+    b1_t (damping_coefficients); the moment D3 d(kappa_3)/dt gives b2_t = D3 / (2 rho I_p),
+    rho I_p = I3_edge / dl, so D3 = 2 b2_t I3_edge / dl.
+    """
+    if "torsion_q_fit_modes" not in damping:
+        return 0.0
+    I3 = float(np.ravel(inertia)[2])
+    f_t = torsional_fundamental(K_bt, I3, dl, length)
+    _, b2_t = constant_q_fit(damping["torsion_q"], f_t, length, tuple(damping["torsion_q_fit_modes"]))
+    return 2.0 * b2_t * I3 / float(dl)
 
 
 def torsional_fundamental(K_bt, I3_edge, dl, length):
