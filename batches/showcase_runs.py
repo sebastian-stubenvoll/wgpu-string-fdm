@@ -4,8 +4,9 @@
                             [--no-email]
 
 Scenarios (all: variational force law, two-part displacements, torsion in every contact):
-  piano   run-002 string (wound, 3 rest twists), hysteretic felt hammer at 6 m/s, transverse damping
-          of Bensa et al. (C2) and constant-Q torsional damping (twist-rate term)
+  piano   run-002 string (wound, 3 rest twists), hysteretic felt hammer at 6 m/s striking at 1/8 of
+          the length from the far end, transverse damping of Bensa et al. (C2) and constant-Q
+          torsional damping (twist-rate term)
   guitar  plain steel G3 (D'Addario PL017) plucked by a rigid plectrum with exact Coulomb friction
   cello   cello D (Jargar Classic) bowed with Woodhouse's thermal friction model, 9-node (10.7 mm)
           contact; the bow is lifted at 75 % of the run so the decay is audible
@@ -16,6 +17,8 @@ Each run is analysed in memory per dispatch (no chunk files). Written to OUT/<ti
   <scenario>_energy.png         energy per channel above the rest state (log scale)
   <scenario>_spectrogram.png    transverse bridge force
   <scenario>_bridge_*.wav       bridge force y, z (transverse) and x (longitudinal), 48 kHz, 16 bit
+  <scenario>_excitation_displacement_*.wav
+                                the same for the displacement of the struck / plucked / bowed vertex
   <scenario>_series.npz         the per-frame series behind the figures (and contact records)
   <scenario>/parameters.json    run parameters (SimulationRun.save_metadata)
   summary.json                  per-scenario numbers, wall times and errors
@@ -74,8 +77,13 @@ def dispatches_for(config, seconds):
 def piano_job(seconds):
     config = copy.deepcopy(RUN_002_CONFIG)
     config["damping"] = {**config["damping"], "torsion_q_fit_modes": [1, 10]}
+    # Strike at 1/8 of the speaking length from the far (agraffe) end; the bridge force is read at
+    # edge 0. Pianos strike at 1/7 to 1/9 of the length over most of the compass (Fletcher &
+    # Rossing, The Physics of Musical Instruments, ch. 12). run-002 struck node 25 (1/41).
+    N = config["node_count"]
+    config["hammer_node"] = (N - 1) - int(round((N - 1) / 8))
     config["dispatches"] = dispatches_for(config, seconds)
-    return {"name": "piano", "title": "Hammered piano string (run 002, wound, 3 twists)",
+    return {"name": "piano", "title": "Hammered piano string (run 002 string, wound, 3 twists, struck at 1/8)",
             "run_id": 900, "config": config, "rod": copy.deepcopy(RUN_002_ROD),
             "hammer": copy.deepcopy(RUN_002_HAMMER), "hammer_off_after": 5}
 
@@ -223,22 +231,25 @@ def fundamental(x, fs, f_nominal):
     return float(f[band][np.argmax(S[band])])
 
 
-def write_wavs(name, bridge, fs, out_dir):
+def write_wavs(name, S, fs, out_dir):
+    """Bridge force and excitation-vertex displacement, per component (change from the first
+    frame), high-passed at 20 Hz, resampled to 48 kHz and each normalised to -1 dBFS."""
     files = []
     sos = butter(2, 20.0, btype="highpass", fs=fs, output="sos")
-    for comp, label in ((1, "transverse_y"), (2, "transverse_z"), (0, "longitudinal_x")):
-        x = bridge[:, comp] - bridge[0, comp]
-        x = sosfiltfilt(sos, x)
-        x = resample_poly(x, WAV_RATE // 2000, fs // 2000)          # 50 kHz -> 48 kHz
-        fade = min(len(x), int(0.01 * WAV_RATE))
-        x[-fade:] *= np.linspace(1.0, 0.0, fade)
-        peak = np.max(np.abs(x))
-        if peak == 0.0:
-            continue
-        pcm = np.int16(np.round(x / peak * 0.89 * 32767))             # -1 dBFS
-        path = out_dir / f"{name}_bridge_{label}.wav"
-        wavfile.write(path, WAV_RATE, pcm)
-        files.append(path)
+    for signal, prefix in ((S["bridge"], "bridge"), (S["displacement"], "excitation_displacement")):
+        for comp, label in ((1, "transverse_y"), (2, "transverse_z"), (0, "longitudinal_x")):
+            x = signal[:, comp] - signal[0, comp]
+            x = sosfiltfilt(sos, x)
+            x = resample_poly(x, WAV_RATE // 2000, fs // 2000)          # 50 kHz -> 48 kHz
+            fade = min(len(x), int(0.01 * WAV_RATE))
+            x[-fade:] *= np.linspace(1.0, 0.0, fade)
+            peak = np.max(np.abs(x))
+            if peak == 0.0:
+                continue
+            pcm = np.int16(np.round(x / peak * 0.89 * 32767))             # -1 dBFS
+            path = out_dir / f"{name}_{prefix}_{label}.wav"
+            wavfile.write(path, WAV_RATE, pcm)
+            files.append(path)
     return files
 
 
@@ -371,7 +382,7 @@ def main():
             for make in (lambda: [plot_waveforms(name, job["title"], S, f1, out_dir)],
                          lambda: [plot_energy(name, job["title"], S, out_dir)],
                          lambda: [plot_spectrogram(name, job["title"], S, out_dir)],
-                         lambda: write_wavs(name, S["bridge"], fs, out_dir)):
+                         lambda: write_wavs(name, S, fs, out_dir)):
                 try:
                     files += make()
                 except Exception as e:
@@ -380,6 +391,7 @@ def main():
             keys = [k for k in S if k.startswith("energy_")]
             summary["scenarios"][name] = {
                 "title": job["title"], "wall_minutes": wall / 60, "frames": int(len(S["bridge"])),
+                "excitation_vertex": int(S["excitation_vertex"]),
                 "fundamental_Hz_second_half": f1, "flexible_string_f1_Hz": float(S["f_nominal"]),
                 "energy_above_rest_end_J": {ENERGY_LABELS[k[7:]]: float(S[k][-1]) for k in keys},
                 "energy_above_rest_max_J": float(np.max(sum(S[k] for k in keys))),
