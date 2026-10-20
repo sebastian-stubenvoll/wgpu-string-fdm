@@ -40,6 +40,7 @@ const _: () = {
 impl Node {
     pub fn new(
         position: &[f32; 3],
+        position_lo: &[f32; 3],
         velocity: &[f32; 3],
         reference_curvature: &[f32; 4],
         rest_relative_orientation: &[f32; 4],
@@ -55,17 +56,20 @@ impl Node {
             internal_moment: [0.0; 3],
             _pad3: 0,
             rest_relative_orientation: *rest_relative_orientation,
-            position_lo: [0.0; 3],
+            position_lo: *position_lo,
             _pad4: 0,
         }
     }
 
-    pub fn to_raw(self) -> [[f32; 3]; 4] {
+    /// [position, velocity, internal moment, curvature, position_lo]; the displacement is
+    /// position + position_lo (appended last so the first four keep their old indices).
+    pub fn to_raw(self) -> [[f32; 3]; 5] {
         [
             self.position,
             self.velocity,
             self.internal_moment,
             self.curvature,
+            self.position_lo,
         ]
     }
 }

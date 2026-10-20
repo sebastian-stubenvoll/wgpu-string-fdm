@@ -365,7 +365,7 @@ def exact_flow(pos, vel, quats, ref, q_rest, dl, m_node, K_se, c_lin=0.0, block=
     return out
 
 
-def roundoff_forces(pos, quats, ref, q_rest, frames, offsets, dl, K_se, block=64):
+def roundoff_forces(pos, quats, ref, q_rest, frames, offsets, dl, K_se, block=64, pos_lo=None):
     """Float32 rounding of the node force, for both shader formulations:
     (old, new), each (F, N, 3) = float32 evaluation minus the float64
     evaluation of the same stored float32 state.
@@ -376,6 +376,9 @@ def roundoff_forces(pos, quats, ref, q_rest, frames, offsets, dl, K_se, block=64
          (edge_forces_offset).
     The stored state is float32 in both cases (q resp. p, u, ref, R0, offsets),
     so the float64 reference is the exact force of what the GPU holds.
+    pos_lo: low parts of the two-part displacement (pos is then the high part); the
+    differences are then formed as the shader's node_difference does,
+    (hi_{j+1} - hi_j) + (lo_{j+1} - lo_j) in float32.
     """
     F, N = pos.shape[:2]
     old, new = np.zeros((F, N, 3)), np.zeros((F, N, 3))
@@ -387,17 +390,22 @@ def roundoff_forces(pos, quats, ref, q_rest, frames, offsets, dl, K_se, block=64
         b = min(F, a + block)
         u = np.asarray(pos[a:b], dtype=np.float32)
         du32 = u[:, 1:] - u[:, :-1]
+        du64 = np.diff(u.astype(np.float64), axis=1)
+        if pos_lo is not None:
+            lo = np.asarray(pos_lo[a:b], dtype=np.float32)
+            du32 = du32 + (lo[:, 1:] - lo[:, :-1])
+            du64 = du64 + np.diff(lo.astype(np.float64), axis=1)
         q64 = np.asarray(quats[a:b], dtype=np.float64)
         q32 = q64.astype(np.float32)
         F32 = node_forces(edge_forces(ref32 + du32, q32, dl, K_se, dtype=np.float32))
-        F64 = node_forces(edge_forces(ref32.astype(np.float64) + du32.astype(np.float64),
+        F64 = node_forces(edge_forces(ref32.astype(np.float64) + du64,
                                       q32.astype(np.float64), dl, K_se))
         old[a:b] = F32.astype(np.float64) - F64
 
         p = _qmul(q0_inv, q64)
         p32 = (p / np.linalg.norm(p, axis=-1, keepdims=True)).astype(np.float32)
         F32 = node_forces(edge_forces_offset(du32, p32, frames32, off32, dl, K_se, dtype=np.float32))
-        F64 = node_forces(edge_forces_offset(du32, p32, frames32, off32, dl, K_se))
+        F64 = node_forces(edge_forces_offset(du64, p32, frames32, off32, dl, K_se))
         new[a:b] = F32.astype(np.float64) - F64
     return old, new
 

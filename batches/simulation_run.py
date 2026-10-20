@@ -10,7 +10,8 @@ import numpy as np
 
 from py_wgpu_fdm import Simulation
 from utils import (generate_straight_rod, make_weights, damping_coefficients,
-                   legacy_damping_coefficients, resolve_rod_params, twist_rate_damping)
+                   legacy_damping_coefficients, resolve_rod_params, twist_rate_damping,
+                   split_float32, node_displacement)
 from post_process import process_and_plot
 import bowing
 import plucking
@@ -59,7 +60,8 @@ class SimulationRun:
                          else [self.pick_derived["pick_node"]])
                     np.savez_compressed(self.sim_dir / f"s_{dispatch:06d}.npz",
                                         bridge_force=np.asarray([fr[0][1][1] for fr in edges], np.float32),
-                                        contact_displacement=np.asarray([[fr[i][0] for i in j] for fr in nodes], np.float32),
+                                        contact_displacement=node_displacement(
+                                            np.asarray([[fr[i] for i in j] for fr in nodes], np.float32)),
                                         contact_velocity=np.asarray([[fr[i][1] for i in j] for fr in nodes], np.float32))
                     nodes = edges = None
                 if bow_frames is not None:
@@ -164,8 +166,12 @@ class SimulationRun:
         # Rust prints the selected GPU adapter on its own stdout; flush ours
         # first so the two streams don't interleave when output is redirected.
         sys.stdout.flush()
+        # Initial displacements (float64) as the shader's two-part displacement
+        u_hi, u_lo = split_float32([n[0] for n in nodes])
+        nodes = [(hi, *n[1:]) for hi, n in zip(u_hi, nodes)]
         self.sim = Simulation(
             nodes=nodes,
+            displacement_lo=u_lo.tolist(),
             edges=edges,
             hammer_weights=weights,
             **{k: v for k, v in self.hammer_params.items() if k not in HAMMER_CONTACT_KEYS},

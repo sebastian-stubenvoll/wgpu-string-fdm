@@ -20,6 +20,25 @@ def reference_vectors(node_count, tuned_length, legacy=False):
     return ref
 
 
+def split_float32(x):
+    """x (float64) as the unevaluated sum hi + lo of two float32, the shader's two-part
+    displacement: hi = fl32(x), lo = fl32(x - hi) (x - hi is exact in float64)."""
+    x = np.asarray(x, dtype=np.float64)
+    hi = x.astype(np.float32)
+    return hi, (x - hi).astype(np.float32)
+
+
+def node_displacement(nodes):
+    """Displacement (..., 3) float64 from saved node records (..., K, 3), i.e. Simulation.save()
+    rows [position, velocity, internal moment, curvature, position_lo]: position + position_lo.
+    Runs saved before the low part was exported have K = 4 and give the high part only."""
+    nodes = np.asarray(nodes)
+    u = nodes[..., 0, :].astype(np.float64)
+    if nodes.shape[-2] > 4:
+        u += nodes[..., 4, :]
+    return u
+
+
 def quat_mul(q1, q2):
     """Hamilton product of quaternions (x, y, z, w), broadcasting over leading axes."""
     x1, y1, z1, w1 = np.moveaxis(np.asarray(q1, dtype=np.float64), -1, 0)

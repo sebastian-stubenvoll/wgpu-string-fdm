@@ -17,6 +17,7 @@ mod py_wgpu_fdm {
     #[pymethods]
     impl Simulation {
         #[new]
+        #[pyo3(signature = (nodes, edges, hammer_weights, oversampling_factor, chunk_size, dt, dx, mass, stiffness_se, stiffness_bt, inertia, clamp_offset, linear_damping, angular_damping, force_law, hammer_displacement, hammer_velocity, hammer_mass, hammer_stiffness, hammer_exponent, hammer_hysteresis_factor, hammer_relaxation_time, hammer_offset_y, displacement_lo=None))]
         fn new(
             // (position, velocity, reference orientation, rest relative orientation)
             nodes: Vec<([f32; 3], [f32; 3], [f32; 4], [f32; 4])>,
@@ -45,10 +46,22 @@ mod py_wgpu_fdm {
             hammer_hysteresis_factor: f32,
             hammer_relaxation_time: f32,
             hammer_offset_y: f32,
+            // low parts of the node displacements (the displacement is position + displacement_lo,
+            // see the shader's drift_node); zeros if omitted
+            displacement_lo: Option<Vec<[f32; 3]>>,
         ) -> PyResult<Self> {
+            let displacement_lo = displacement_lo.unwrap_or_else(|| vec![[0.0; 3]; nodes.len()]);
+            if displacement_lo.len() != nodes.len() {
+                return Err(PyValueError::new_err(format!(
+                    "displacement_lo has {} entries, nodes {}",
+                    displacement_lo.len(),
+                    nodes.len()
+                )));
+            }
             let nodes: Vec<gpu_bindings::Node> = nodes
                 .iter()
-                .map(|n| gpu_bindings::Node::new(&n.0, &n.1, &n.2, &n.3))
+                .zip(displacement_lo.iter())
+                .map(|(n, lo)| gpu_bindings::Node::new(&n.0, lo, &n.1, &n.2, &n.3))
                 .collect();
 
             let edges: Vec<gpu_bindings::Edge> = edges
@@ -111,7 +124,7 @@ mod py_wgpu_fdm {
 
         fn save(
             &mut self,
-        ) -> PyResult<(Vec<Vec<[[f32; 3]; 4]>>, Vec<Vec<([f32; 4], [[f32; 3]; 3])>>)> {
+        ) -> PyResult<(Vec<Vec<[[f32; 3]; 5]>>, Vec<Vec<([f32; 4], [[f32; 3]; 3])>>)> {
             let (node_frames, edge_frames) = self
                 .state
                 .save()
@@ -123,7 +136,7 @@ mod py_wgpu_fdm {
                     nodes
                         .into_iter()
                         .map(gpu_bindings::Node::to_raw)
-                        .collect::<Vec<[[f32; 3]; 4]>>()
+                        .collect::<Vec<[[f32; 3]; 5]>>()
                 })
                 .collect();
 

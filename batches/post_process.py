@@ -40,7 +40,7 @@ from plots.dispersion import (modal_projection, kspace_grid, kspace_projection, 
                               StreamingKOmegaSpectra, StreamingCrossSpectrum, finalize_dispersion,
                               find_resonances, plot_dispersion)
 from utils import (reference_vectors, rest_orientations, rest_frames, reference_offsets,
-                   quat_mul)
+                   quat_mul, node_displacement)
 from plots.gallery import write_gallery
 
 # Dispersion analysis: modes kept per frame and Welch segment length (frames).
@@ -75,8 +75,9 @@ def _process_single_chunk(args):
     with gzip.open(ef, "rb") as f:
         e_chunk = pickle.load(f)
 
-    # Whole chunk as arrays: nodes (F, N, 4, 3) = [displacement, velocity,
-    # node[2], curvature]; edges: quaternions (F, N, 4) and vectors (F, N, 3, 3)
+    # Whole chunk as arrays: nodes (F, N, 5, 3) = [displacement (high part), velocity,
+    # node[2], curvature, displacement low part] (4 rows for runs before the low part was
+    # saved); edges: quaternions (F, N, 4) and vectors (F, N, 3, 3)
     # = [angular velocity, ., strain]. The last edge is the ghost edge.
     nodes = np.asarray(n_chunk, dtype=np.float32)
     quats = np.asarray([[e[0] for e in frame] for frame in e_chunk], dtype=np.float32)
@@ -90,7 +91,12 @@ def _process_single_chunk(args):
     evecs = np.asarray([[e[1] for e in frame] for frame in e_chunk], dtype=np.float32)
     del n_chunk, e_chunk
     n_frames, node_count = nodes.shape[:2]
-    pos, vel, curv = nodes[:, :, 0], nodes[:, :, 1], nodes[:, :, 3]
+    # Displacement as the shader holds it, hi + lo (float64); pos_hi / pos_lo for the
+    # float32 rounding diagnostic, which repeats the shader's own arithmetic.
+    pos = node_displacement(nodes)
+    pos_hi = nodes[:, :, 0]
+    pos_lo = nodes[:, :, 4] if nodes.shape[2] > 4 else None
+    vel, curv = nodes[:, :, 1], nodes[:, :, 3]
     omega, strain = evecs[:, :-1, 0], evecs[:, :-1, 2]          # real edges 0..N-2
 
     # Inspected nodes (edge index clamped to the last edge, as before).
@@ -112,7 +118,7 @@ def _process_single_chunk(args):
                    grid["k"], node_count, L)
 
     # Optional full-field transverse (Y,Z) displacement for the transient plots.
-    field = pos[:, :, 1:3].copy() if capture_field else None
+    field = pos[:, :, 1:3].astype(np.float32) if capture_field else None
 
     # Edge stretch exactly as the shader computes it: e = |r| / dl, where r is
     # the edge's reference vector (the pre-stretched spacing, exactly as handed
@@ -162,8 +168,8 @@ def _process_single_chunk(args):
     offset_form = None if p_dev is None else (p_dev, reference["frames"], reference["offsets"])
     fl = exact_flow(pos, vel, q_e, ref_vecs, q_rest, dl, m_node, K_se_d, c_lin, force_law=law,
                     omega=omega, inertia=I_d, K_bt=K_bt_d, offset_form=offset_form)
-    d_old, d_new = roundoff_forces(pos, q_e, ref_vecs, q_rest, reference["frames"],
-                                   reference["offsets"], dl, K_se_d)
+    d_old, d_new = roundoff_forces(pos_hi, q_e, ref_vecs, q_rest, reference["frames"],
+                                   reference["offsets"], dl, K_se_d, pos_lo=pos_lo)
     # The formulation the run actually used is the one whose rounding matters.
     d_round, d_other = (d_new, d_old) if reference["relative"] else (d_old, d_new)
     d_round, d_other = d_round[:, 1:-1], d_other[:, 1:-1]
@@ -922,7 +928,7 @@ def pluck_post_process(sim_path, output_dir):
         del e_chunk
         with gzip.open(sim_path / pf.name.replace("p_", "n_"), "rb") as f:
             n_chunk = pickle.load(f)
-        disp.extend(fr[j][0] for fr in n_chunk)
+        disp.extend(node_displacement(np.asarray([fr[j] for fr in n_chunk], np.float32)))
         del n_chunk
     A = plucking.pick_arrays(frames)
     bridge, disp, twist = np.asarray(bridge, np.float64), np.asarray(disp, np.float64), np.asarray(twist)

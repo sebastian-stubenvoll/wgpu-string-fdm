@@ -350,7 +350,7 @@ fn init(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let current = (c.current * uniforms.node_count) + global_id.x;
     let future = (c.future * uniforms.node_count) + global_id.x;
     if (global_id.x < uniforms.node_count - 1) {
-        let r = edges[current].reference_vector + (nodes[current + 1].displacement - nodes[current].displacement);
+        let r = edges[current].reference_vector + node_difference(current);
     }
 }
 
@@ -520,12 +520,13 @@ fn compute_forces_body(gid: u32, current_base: u32, future_base: u32) {
             // Felt compression along the contact normal. Flat crown: along +z. Curved crown (radius
             // R_c across the string, centred hammer_offset_y beside it): reach - |c_s - c_h| with
             // reach = R_c + R, written so that no two numbers of size reach are subtracted.
+            let rel = node_offset(current, vec3<f32>(0.0, c.hammer_offset_y, hammer.displacement));
             var normal = vec2<f32>(0.0, 1.0);
-            var compression = hammer.displacement - nodes[current].displacement.z;
+            var compression = -rel.z;
             if (surface.hammer.curved == 1u) {
                 let reach = surface.hammer.crown_radius + surface.hammer.radius;
-                let dy = nodes[current].displacement.y - c.hammer_offset_y;
-                let dz = nodes[current].displacement.z - hammer.displacement;
+                let dy = rel.y;
+                let dz = rel.z;
                 let dist = sqrt(dy * dy + (dz + reach) * (dz + reach));
                 compression = -(dy * dy + dz * (dz + 2.0 * reach)) / (dist + reach);
                 normal = vec2<f32>(dy, dz + reach) / dist;
@@ -602,18 +603,10 @@ fn compute_forces_body(gid: u32, current_base: u32, future_base: u32) {
 
         let damping_torque = - uniforms.angular_damping * edges[current].angular_velocity;
 
-        var difference: vec3<f32>;
-        var average: vec3<f32>;
-        if (global_id.x == 0) {
-            difference = nodes[current].internal_moment;
-            average = 0.5 * uniforms.dl * cross(nodes[current].curvature, nodes[current].internal_moment);
-        } else if (global_id.x == uniforms.node_count - 2) {
-            difference = - nodes[current- 1].internal_moment;
-            average = 0.5 * uniforms.dl * cross(nodes[current- 1].curvature, nodes[current- 1].internal_moment);
-        } else {
-            difference = nodes[current].internal_moment - nodes[current- 1].internal_moment;
-            average = 0.5 * uniforms.dl * (cross(nodes[current].curvature, nodes[current].internal_moment) + cross(nodes[current- 1].curvature, nodes[current- 1].internal_moment));
-        }
+        // The end edges 0 and N-2 are clamped (never integrated), so every edge here lies between two
+        // bending regions and the interior difference and average apply.
+        let difference = nodes[current].internal_moment - nodes[current- 1].internal_moment;
+        let average = 0.5 * uniforms.dl * (cross(nodes[current].curvature, nodes[current].internal_moment) + cross(nodes[current- 1].curvature, nodes[current- 1].internal_moment));
 
         let eta = 1.0 - 0.3 * offset_stretch(w, offset_length(w));
         let inertia_dyn = uniforms.inertia * eta * eta;
@@ -998,9 +991,9 @@ fn pick_contact_body(current_base: u32, future_base: u32) {
     let v_pick = vec2<f32>(pick_step_velocity(step), 0.0);
     surface.pick.tip_y = tip.x;
 
-    let centre = nodes[cur].displacement.yz;
-    let along = clamp(dot(centre - tip, axis), 0.0, surface.pick.length);
-    let rel = centre - (tip + along * axis);
+    let centre_from_tip = node_offset(cur, vec3<f32>(0.0, tip)).yz;
+    let along = clamp(dot(centre_from_tip, axis), 0.0, surface.pick.length);
+    let rel = centre_from_tip - along * axis;
     let dist = length(rel);
     let gap = dist - (surface.pick.radius + surface.pick.tip_radius);
     let n = rel / dist;
@@ -1277,6 +1270,13 @@ fn edge_offset(i: u32) -> vec3<f32> {
 fn node_difference(i: u32) -> vec3<f32> {
     return (nodes[i + 1].displacement - nodes[i].displacement)
         + (nodes[i + 1].displacement_lo - nodes[i].displacement_lo);
+}
+
+// u_i - p for a point p held as a single f32 (hammer crown, pick tip), from the two-part
+// displacement in the same way: the high part minus p is rounded at the size of the difference,
+// then the low part is added.
+fn node_offset(i: u32, p: vec3<f32>) -> vec3<f32> {
+    return (nodes[i].displacement - p) + nodes[i].displacement_lo;
 }
 
 // x itself, but opaque to the shader compiler: WGSL cannot mark arithmetic exact, and the driver's
